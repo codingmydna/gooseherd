@@ -504,7 +504,6 @@ impl CliSession {
             .emit_hook(goose::hooks::HookEvent::SessionEnd, &self.session_id)
             .await;
 
-        output::clear_status_bar();
         if result.is_ok() {
             println!(
                 "\n  {} {}",
@@ -1756,9 +1755,8 @@ impl CliSession {
             pct
         );
         if let Ok(mut cache) = self.completion_cache.write() {
-            cache.status_line = Some(status_line.clone());
+            cache.status_line = Some(status_line);
         }
-        output::set_status_info(status_line);
 
         Ok(())
     }
