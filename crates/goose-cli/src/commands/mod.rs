@@ -1,6 +1,7 @@
 pub mod configure;
 pub mod doctor;
 pub mod gateway;
+pub mod herd;
 pub mod info;
 pub mod plugin;
 pub mod project;
