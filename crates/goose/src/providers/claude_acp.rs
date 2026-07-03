@@ -60,17 +60,31 @@ impl ProviderDef for ClaudeAcpProvider {
                 .with_npm()
                 .resolve(CLAUDE_ACP_BINARY)?;
             let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
+            let plan_explore = config
+                .get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")
+                .unwrap_or(false);
 
-            let mode_mapping = HashMap::from([
-                // Closest to "autonomous": bypassPermissions skips confirmations.
-                (GooseMode::Auto, "bypassPermissions".to_string()),
-                // Claude Code's default matches "ask before risky actions".
-                (GooseMode::Approve, "default".to_string()),
-                // acceptEdits auto-accepts file edits but still prompts for risky ops.
-                (GooseMode::SmartApprove, "acceptEdits".to_string()),
-                // Plan mode disables tool execution, aligning with chat-only intent.
-                (GooseMode::Chat, "plan".to_string()),
-            ]);
+            let mode_mapping = if plan_explore {
+                // Plan-Explore: pin the session to Claude Code's plan mode as a
+                // second write barrier; goose's kind-based policy is the first.
+                HashMap::from([
+                    (GooseMode::Auto, "plan".to_string()),
+                    (GooseMode::Approve, "plan".to_string()),
+                    (GooseMode::SmartApprove, "plan".to_string()),
+                    (GooseMode::Chat, "plan".to_string()),
+                ])
+            } else {
+                HashMap::from([
+                    // Closest to "autonomous": bypassPermissions skips confirmations.
+                    (GooseMode::Auto, "bypassPermissions".to_string()),
+                    // Claude Code's default matches "ask before risky actions".
+                    (GooseMode::Approve, "default".to_string()),
+                    // acceptEdits auto-accepts file edits but still prompts for risky ops.
+                    (GooseMode::SmartApprove, "acceptEdits".to_string()),
+                    // Plan mode disables tool execution, aligning with chat-only intent.
+                    (GooseMode::Chat, "plan".to_string()),
+                ])
+            };
 
             let provider_config = AcpProviderConfig {
                 command: resolved_command,
@@ -85,6 +99,7 @@ impl ProviderDef for ClaudeAcpProvider {
                 model_config_option_id: None,
                 mode_mapping,
                 notification_callback: None,
+                plan_explore,
             };
 
             let metadata = Self::metadata();

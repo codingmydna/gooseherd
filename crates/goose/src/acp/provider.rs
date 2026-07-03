@@ -17,7 +17,7 @@ use async_stream::try_stream;
 use futures::future::BoxFuture;
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content as RmcpContent, Role, Tool};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -60,6 +60,12 @@ pub struct AcpProviderConfig {
     pub model_config_option_id: Option<String>,
     pub mode_mapping: HashMap<GooseMode, String>,
     pub notification_callback: Option<Arc<dyn Fn(SessionNotification) + Send + Sync>>,
+    /// Plan-Explore policy: auto-answer permission requests by tool kind —
+    /// approve read/search/fetch/think (incl. subagent exploration), reject
+    /// edit/delete/move. Execute is rejected unless GOOSE_PLAN_ALLOW_EXEC.
+    /// Gives planner/reviewer sessions full read-only exploration on any
+    /// ACP agent without relying on the agent's own mode semantics.
+    pub plan_explore: bool,
 }
 
 enum ClientRequest {
@@ -143,6 +149,7 @@ pub struct AcpProvider {
     name: String,
     goose_mode: Arc<Mutex<GooseMode>>,
     mode_mapping: HashMap<GooseMode, String>,
+    plan_explore: bool,
 
     session: AcpSession,
 
@@ -230,6 +237,7 @@ impl AcpProvider {
         let (tx, rx) = mpsc::channel(32);
         let (init_tx, init_rx) = oneshot::channel();
         let mode_mapping = config.mode_mapping.clone();
+        let plan_explore = config.plan_explore;
         let model_config_option_id = config.model_config_option_id.clone();
         let applied_model = config.model_config_option_id.as_ref().and_then(|id| {
             config
@@ -274,6 +282,7 @@ impl AcpProvider {
             name,
             goose_mode: goose_mode_shared,
             mode_mapping,
+            plan_explore,
             session,
             pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
             pending_tool_updates,
@@ -502,12 +511,17 @@ impl Provider for AcpProvider {
             .lock()
             .map_err(|_| ProviderError::RequestFailed("goose_mode lock poisoned".into()))?;
 
-        let reject_all_tools = goose_mode == GooseMode::Chat;
+        let reject_all_tools = goose_mode == GooseMode::Chat && !self.plan_explore;
         let model_name = model_config.model_name.clone();
+        let plan_explore = self.plan_explore;
+        let plan_allow_exec = crate::config::Config::global()
+            .get_param::<bool>("GOOSE_PLAN_ALLOW_EXEC")
+            .unwrap_or(false);
 
         Ok(Box::pin(try_stream! {
             let mut suppress_text = false;
-            let mut rejected_tool_calls: HashSet<String> = HashSet::new();
+            // id → tool name, so denial messages can say what was denied.
+            let mut rejected_tool_calls: HashMap<String, String> = HashMap::new();
             // Stable id+timestamp per contiguous run so Desktop coalesces chunks into one bubble.
             let mut text_run: Option<(String, i64)> = None;
             let mut thought_run: Option<(String, i64)> = None;
@@ -540,7 +554,7 @@ impl Provider for AcpProvider {
                         thought_run = None;
                         if reject_all_tools {
                             suppress_text = true;
-                            rejected_tool_calls.insert(id);
+                            rejected_tool_calls.insert(id, name);
                         } else {
                             let mut params = CallToolRequestParams::new(name);
                             if let Some(serde_json::Value::Object(map)) = raw_input {
@@ -571,17 +585,19 @@ impl Provider for AcpProvider {
                     } => {
                         text_run = None;
                         thought_run = None;
-                        if rejected_tool_calls.remove(&id) {
+                        if let Some(denied_name) = rejected_tool_calls.remove(&id) {
                             // In chat mode no tool_request was emitted (suppressed at
                             // ToolCallStart), so surface a plain text message. In other
                             // modes a tool_request WAS emitted, so pair it with an error
                             // tool_response so downstream consumers see the rejection.
+                            let denial_text =
+                                format!("Tool call denied by read-only policy: {}", denied_name);
                             if reject_all_tools {
                                 let message = Message::assistant()
-                                    .with_text("Tool call was denied.");
+                                    .with_text(&denial_text);
                                 yield (Some(message), None);
                             } else {
-                                let denial = vec![RmcpContent::text("Tool call was denied.")];
+                                let denial = vec![RmcpContent::text(denial_text)];
                                 let result = CallToolResult::error(denial);
                                 let message =
                                     Message::user().with_tool_response(id, Ok(result));
@@ -602,9 +618,17 @@ impl Provider for AcpProvider {
                     AcpUpdate::PermissionRequest { request, response_tx } => {
                         text_run = None;
                         thought_run = None;
-                        if let Some(decision) = permission_decision_from_mode(goose_mode) {
+                        let auto_decision = if plan_explore {
+                            Some(plan_explore_decision(&request, plan_allow_exec))
+                        } else {
+                            permission_decision_from_mode(goose_mode)
+                        };
+                        if let Some(decision) = auto_decision {
                             if decision.should_record_rejection() {
-                                rejected_tool_calls.insert(request.tool_call.tool_call_id.0.to_string());
+                                rejected_tool_calls.insert(
+                                    request.tool_call.tool_call_id.0.to_string(),
+                                    request.tool_call.fields.title.clone().unwrap_or_else(|| "Tool".to_string()),
+                                );
                             }
                             let _ = response_tx.send(map_permission_response(&request, decision));
                             continue;
@@ -631,7 +655,10 @@ impl Provider for AcpProvider {
 
                         let decision = PermissionDecision::from(confirmation.permission);
                         if decision.should_record_rejection() {
-                            rejected_tool_calls.insert(request.tool_call.tool_call_id.0.to_string());
+                            rejected_tool_calls.insert(
+                                    request.tool_call.tool_call_id.0.to_string(),
+                                    request.tool_call.fields.title.clone().unwrap_or_else(|| "Tool".to_string()),
+                                );
                         }
                         let _ = response_tx.send(map_permission_response(&request, decision));
                     }
@@ -1563,6 +1590,23 @@ fn resolve_mode(
     }
 }
 
+/// Plan-Explore policy: judge a permission request by the tool's ACP kind.
+/// Reads, searches, fetches, thinking, and subagent exploration are approved;
+/// anything that mutates files is rejected. Execute follows `allow_exec`.
+fn plan_explore_decision(
+    request: &RequestPermissionRequest,
+    allow_exec: bool,
+) -> PermissionDecision {
+    match request.tool_call.fields.kind {
+        Some(ToolKind::Edit) | Some(ToolKind::Delete) | Some(ToolKind::Move) => {
+            PermissionDecision::RejectOnce
+        }
+        Some(ToolKind::SwitchMode) => PermissionDecision::RejectOnce,
+        Some(ToolKind::Execute) if !allow_exec => PermissionDecision::RejectOnce,
+        _ => PermissionDecision::AllowOnce,
+    }
+}
+
 fn permission_decision_from_mode(goose_mode: GooseMode) -> Option<PermissionDecision> {
     match goose_mode {
         GooseMode::Auto => Some(PermissionDecision::AllowOnce),
@@ -1597,6 +1641,7 @@ mod tests {
                 name: "acp-test".to_string(),
                 goose_mode: Arc::new(Mutex::new(GooseMode::Auto)),
                 mode_mapping: HashMap::new(),
+                plan_explore: false,
                 session: AcpSession {
                     id: SessionId::new("test-session"),
                     response: NewSessionResponse::new("test-session"),

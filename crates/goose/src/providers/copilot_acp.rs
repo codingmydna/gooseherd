@@ -95,6 +95,7 @@ impl ProviderDef for CopilotAcpProvider {
                 model_config_option_id: Some("model".to_string()),
                 mode_mapping,
                 notification_callback: None,
+                plan_explore: false,
             };
 
             let metadata = Self::metadata();

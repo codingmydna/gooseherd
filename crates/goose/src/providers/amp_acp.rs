@@ -81,6 +81,7 @@ impl ProviderDef for AmpAcpProvider {
                 model_config_option_id: None,
                 mode_mapping,
                 notification_callback: None,
+                plan_explore: false,
             };
 
             let metadata = Self::metadata();
