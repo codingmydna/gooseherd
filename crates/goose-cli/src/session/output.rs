@@ -541,6 +541,17 @@ fn print_tool_output(text: &str) {
         print!("{}", text);
         return;
     }
+    let is_diff = looks_like_diff(text);
+    let print_line = |line: &str| {
+        let styled = if is_diff && line.starts_with('+') {
+            style(line).green()
+        } else if is_diff && line.starts_with('-') {
+            style(line).red()
+        } else {
+            style(line).dim()
+        };
+        println!("    {}", styled);
+    };
     let max_lines = if get_show_full_tool_output() {
         usize::MAX
     } else {
@@ -549,13 +560,13 @@ fn print_tool_output(text: &str) {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= max_lines {
         for line in &lines {
-            println!("    {}", style(line).dim());
+            print_line(line);
         }
     } else {
         let head = max_lines / 2;
         let tail = max_lines - head;
         for line in &lines[..head] {
-            println!("    {}", style(line).dim());
+            print_line(line);
         }
         println!(
             "    {}",
@@ -567,9 +578,25 @@ fn print_tool_output(text: &str) {
             .italic()
         );
         for line in &lines[lines.len() - tail..] {
-            println!("    {}", style(line).dim());
+            print_line(line);
         }
     }
+}
+
+/// Heuristic: treat tool output as a diff when it carries unified-diff file
+/// headers, or when it mixes `+` and `-` prefixed lines. Requiring both signs
+/// avoids repainting markdown bullet lists as removals.
+fn looks_like_diff(text: &str) -> bool {
+    let mut has_addition = false;
+    let mut has_removal = false;
+    for line in text.lines() {
+        if line.starts_with("+++ ") || line.starts_with("--- ") {
+            return true;
+        }
+        has_addition |= line.starts_with('+');
+        has_removal |= line.starts_with('-');
+    }
+    has_addition && has_removal
 }
 
 fn is_shell_tool_name(name: &str) -> bool {
@@ -1516,6 +1543,22 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::env;
+
+    #[test]
+    fn looks_like_diff_detects_headers_and_mixed_signs() {
+        assert!(looks_like_diff(
+            "--- /tmp/a.txt\n+++ /tmp/a.txt\n- old\n+ new\n"
+        ));
+        assert!(looks_like_diff("+++ /tmp/new.txt\n+ created\n"));
+        assert!(looks_like_diff("- removed\n+ added\n"));
+    }
+
+    #[test]
+    fn looks_like_diff_ignores_plain_text_and_bullet_lists() {
+        assert!(!looks_like_diff("regular tool output\nwith lines\n"));
+        assert!(!looks_like_diff("- first bullet\n- second bullet\n"));
+        assert!(!looks_like_diff("+ only additions without context"));
+    }
 
     #[test]
     fn test_short_paths_unchanged() {

@@ -1,8 +1,8 @@
 use agent_client_protocol::schema::v1::{
-    ClientCapabilities, CloseSessionRequest, ContentBlock, ContentChunk, EnvVariable, HttpHeader,
-    ImageContent, InitializeRequest, InitializeResponse, McpCapabilities, McpServer, McpServerHttp,
-    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ClientCapabilities, CloseSessionRequest, ContentBlock, ContentChunk, Diff as AcpDiff,
+    EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse, McpCapabilities,
+    McpServer, McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModeResponse, StopReason,
@@ -1414,14 +1414,7 @@ fn acp_tool_call_content_to_rmcp(
                     }
                 },
                 ToolCallContent::Diff(diff) => {
-                    let path = diff.path.display();
-                    let body = match diff.old_text.as_deref() {
-                        Some(old) => {
-                            format!("--- {path}\n{old}\n+++ {path}\n{}", diff.new_text)
-                        }
-                        None => format!("+++ {path}\n{}", diff.new_text),
-                    };
-                    out.push(RmcpContent::text(body));
+                    out.push(RmcpContent::text(acp_diff_to_text(&diff)));
                 }
                 ToolCallContent::Terminal(terminal) => {
                     out.push(RmcpContent::text(format!(
@@ -1443,6 +1436,26 @@ fn acp_tool_call_content_to_rmcp(
         }
     }
     out
+}
+
+/// Render an ACP `Diff` as unified-diff-style text (`--- `/`+++ ` file headers,
+/// `- `/`+ ` line prefixes) so terminal renderers that colorize diff lines can
+/// display file edits from ACP agents as red/green instead of a bare header.
+fn acp_diff_to_text(diff: &AcpDiff) -> String {
+    let path = diff.path.display();
+    let mut body = String::new();
+    if let Some(old) = diff.old_text.as_deref() {
+        body.push_str(&format!("--- {path}\n+++ {path}\n"));
+        for line in old.lines() {
+            body.push_str(&format!("- {line}\n"));
+        }
+    } else {
+        body.push_str(&format!("+++ {path}\n"));
+    }
+    for line in diff.new_text.lines() {
+        body.push_str(&format!("+ {line}\n"));
+    }
+    body
 }
 
 fn build_action_required_message(request: &RequestPermissionRequest) -> Option<Message> {
@@ -2123,6 +2136,29 @@ mod tests {
             serialized[3].contains("base64data"),
             "image data lost: {serialized:?}"
         );
+    }
+
+    #[test]
+    fn acp_diff_to_text_prefixes_old_and_new_lines() {
+        let diff =
+            AcpDiff::new("/tmp/file.txt", "line one\nline two\n").old_text("line one\nold line\n");
+
+        let text = acp_diff_to_text(&diff);
+
+        assert_eq!(
+            text,
+            "--- /tmp/file.txt\n+++ /tmp/file.txt\n- line one\n- old line\n+ line one\n+ line two\n"
+        );
+    }
+
+    #[test]
+    fn acp_diff_to_text_new_file_has_only_additions() {
+        let diff = AcpDiff::new("/tmp/new.txt", "created\n");
+
+        let text = acp_diff_to_text(&diff);
+
+        assert_eq!(text, "+++ /tmp/new.txt\n+ created\n");
+        assert!(!text.contains("---"), "new files should have no old side");
     }
 
     #[test]
