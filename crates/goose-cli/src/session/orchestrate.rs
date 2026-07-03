@@ -108,7 +108,13 @@ pub(super) async fn build_role_provider(
     Ok((provider, model_config))
 }
 
-fn git_evidence() -> String {
+struct Evidence {
+    text: String,
+    full: String,
+    truncated: bool,
+}
+
+fn git_evidence() -> Evidence {
     let mut evidence = String::new();
     for args in [
         &["status", "--short"][..],
@@ -125,9 +131,20 @@ fn git_evidence() -> String {
         }
     }
     if evidence.is_empty() {
-        "No git changes detected (not a git repository, or working tree clean).".to_string()
-    } else {
-        safe_truncate(&evidence, EVIDENCE_CHAR_LIMIT)
+        let text =
+            "No git changes detected (not a git repository, or working tree clean).".to_string();
+        return Evidence {
+            full: text.clone(),
+            text,
+            truncated: false,
+        };
+    }
+    let text = safe_truncate(&evidence, EVIDENCE_CHAR_LIMIT);
+    let truncated = text.len() < evidence.len();
+    Evidence {
+        text,
+        full: evidence,
+        truncated,
     }
 }
 
@@ -141,6 +158,47 @@ fn parse_verdict_approved(review: &str) -> bool {
 
 fn phase_banner(text: &str) {
     println!("{}", console::style(format!("― {} ―", text)).cyan().bold());
+}
+
+/// Distilled Fable 5 operating procedure, injected into roles served by bare
+/// API/local providers. ACP agents ship their own co-trained harness and
+/// don't need it.
+const FABLE5_PLAYBOOK: &str = include_str!("../../../../profiles/fable5-playbook.md");
+
+fn is_acp_provider(provider_name: &str) -> bool {
+    provider_name.ends_with("-acp")
+}
+
+fn role_system_prompt(base: &str, role: &RoleConfig) -> String {
+    if is_acp_provider(&role.provider_name) {
+        base.to_string()
+    } else {
+        format!("{}\n\n# Operating playbook\n\n{}", base, FABLE5_PLAYBOOK)
+    }
+}
+
+/// Write an orchestration artifact under <working_dir>/.goose-orch/<run_id>/.
+fn persist_artifact(working_dir: &str, run_id: &str, name: &str, content: &str) {
+    let dir = std::path::Path::new(working_dir)
+        .join(".goose-orch")
+        .join(run_id);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join(name), content);
+    }
+}
+
+fn warn_truncated(what: &str, full_len: usize, run_id: &str) {
+    println!(
+        "  {}",
+        console::style(format!(
+            "⚠ {} truncated ({} chars → {}k limit) — full copy in .goose-orch/{}/",
+            what,
+            full_len,
+            EVIDENCE_CHAR_LIMIT / 1000,
+            run_id
+        ))
+        .yellow()
+    );
 }
 
 /// Run a role completion with live streaming render (tool calls, thinking,
@@ -414,10 +472,11 @@ impl CliSession {
             "{}\n\n---\n\nTask:\n{}\n\nWorking directory: {}",
             PLAN_SYSTEM_PROMPT, task, working_dir
         ));
+        let planner_system = role_system_prompt(PLAN_SYSTEM_PROMPT, planner_role);
         let (plan_text, plan_usage) = stream_role_completion(
             &planner,
             &planner_model,
-            PLAN_SYSTEM_PROMPT,
+            &planner_system,
             plan_request,
             &self.session_id,
             self.debug,
@@ -437,6 +496,12 @@ impl CliSession {
             planner_context_limit,
             phase_started.elapsed().as_millis() as u64,
             None,
+        );
+
+        persist_artifact(&working_dir, &run_id, "plan.md", &plan_text);
+        println!(
+            "  {}",
+            console::style(format!("artifacts → .goose-orch/{}/", run_id)).dim()
         );
 
         let (reviewer, reviewer_model) = if reviewer_role == planner_role {
@@ -460,9 +525,14 @@ impl CliSession {
             )
             .await?;
 
+        let implementer_playbook = if is_acp_provider(&implementer_role.provider_name) {
+            String::new()
+        } else {
+            format!("\n\n# Operating playbook\n\n{}", FABLE5_PLAYBOOK)
+        };
         let mut instruction = format!(
-            "You are the implementer in a plan/implement/review workflow. Execute the plan below for the task. Modify files and run verification with your tools. When done, report what you changed and how you verified it.\n\nTask:\n{}\n\nPlan:\n{}",
-            task, plan_text
+            "You are the implementer in a plan/implement/review workflow. Execute the plan below for the task. Modify files and run verification with your tools. When done, report what you changed and how you verified it.{}\n\nTask:\n{}\n\nPlan:\n{}",
+            implementer_playbook, task, plan_text
         );
 
         for cycle in 1..=max_cycles {
@@ -532,26 +602,52 @@ impl CliSession {
                 .find(|m| m.role == rmcp::model::Role::Assistant)
                 .map(|m| m.as_concat_text())
                 .unwrap_or_default();
+            persist_artifact(
+                &working_dir,
+                &run_id,
+                &format!("report-c{}.md", cycle),
+                &implementer_report,
+            );
+            if implementer_report.len() > EVIDENCE_CHAR_LIMIT {
+                warn_truncated("implementer report", implementer_report.len(), &run_id);
+            }
+            let evidence = git_evidence();
+            persist_artifact(
+                &working_dir,
+                &run_id,
+                &format!("evidence-c{}.diff", cycle),
+                &evidence.full,
+            );
+            if evidence.truncated {
+                warn_truncated("git evidence", evidence.full.len(), &run_id);
+            }
             let review_request = Message::user().with_text(format!(
                 "{}\n\n---\n\nTask:\n{}\n\nPlan:\n{}\n\nGit evidence:\n{}\n\nImplementer report:\n{}\n\nWorking directory: {}",
                 REVIEW_SYSTEM_PROMPT,
                 task,
                 plan_text,
-                git_evidence(),
+                evidence.text,
                 safe_truncate(&implementer_report, EVIDENCE_CHAR_LIMIT),
                 working_dir
             ));
             output::show_thinking();
+            let reviewer_system = role_system_prompt(REVIEW_SYSTEM_PROMPT, reviewer_role);
             let (review_text, review_usage) = stream_role_completion(
                 &reviewer,
                 &reviewer_model,
-                REVIEW_SYSTEM_PROMPT,
+                &reviewer_system,
                 review_request,
                 &self.session_id,
                 self.debug,
             )
             .await?;
             output::hide_thinking();
+            persist_artifact(
+                &working_dir,
+                &run_id,
+                &format!("review-c{}.md", cycle),
+                &review_text,
+            );
             let approved = parse_verdict_approved(&review_text);
             let verdict = if approved {
                 "APPROVED"
