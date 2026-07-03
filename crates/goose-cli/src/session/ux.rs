@@ -33,11 +33,29 @@ fn section(title: &str) {
     println!("{}", style(title).cyan().bold());
 }
 
+/// Claude Code's own default model (from ~/.claude/settings.json), used to
+/// annotate what claude-acp's "default" alias actually resolves to.
+fn claude_default_model() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let content = std::fs::read_to_string(format!("{}/.claude/settings.json", home)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value.get("model")?.as_str().map(|s| s.to_string())
+}
+
+fn annotate_model(provider: &str, model: &str) -> String {
+    if provider == "claude-acp" && model == "default" {
+        if let Some(resolved) = claude_default_model() {
+            return format!("{} {}", model, style(format!("(→ {})", resolved)).dim());
+        }
+    }
+    model.to_string()
+}
+
 fn role_desc(role: &RoleConfig) -> String {
     let mut desc = format!(
         "{}/{}  {}",
         role.provider_name,
-        role.model,
+        annotate_model(&role.provider_name, &role.model),
         style(format!("[{}]", conn_kind(&role.provider_name))).dim()
     );
     match role.effort.as_deref() {
@@ -147,7 +165,10 @@ impl CliSession {
                 style(format!("[{}]", conn_kind(&provider_name))).dim()
             ),
         );
-        kv("model", &model_config.model_name);
+        kv(
+            "model",
+            &annotate_model(&provider_name, &model_config.model_name),
+        );
         kv(
             "effort",
             &effort
