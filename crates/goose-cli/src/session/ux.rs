@@ -126,12 +126,18 @@ impl CliSession {
             );
             Ok(())
         } else {
+            let position = {
+                let mut q = self.queued_inputs.lock().unwrap();
+                q.push(cmd.to_string());
+                q.len()
+            };
             println!(
                 "\n  {}",
-                style(
-                    "agent is running — plain input is ignored; use /btw <question> for a side question"
-                )
-                .dim()
+                style(format!(
+                    "✔ queued (#{}) — will be sent when the current turn finishes · /btw for an immediate side question",
+                    position
+                ))
+                .cyan()
             );
             Ok(())
         };

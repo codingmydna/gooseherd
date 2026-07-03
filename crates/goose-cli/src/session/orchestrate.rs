@@ -143,6 +143,55 @@ fn phase_banner(text: &str) {
     println!("{}", console::style(format!("― {} ―", text)).cyan().bold());
 }
 
+/// Run a role completion with live streaming render (tool calls, thinking,
+/// text appear as they happen — same visibility as the main agent loop),
+/// returning the concatenated assistant text and the final usage report.
+async fn stream_role_completion(
+    provider: &Arc<dyn Provider>,
+    model_config: &goose_providers::model::ModelConfig,
+    system: &str,
+    request: Message,
+    session_id: &str,
+    debug: bool,
+) -> Result<(String, Option<ProviderUsage>)> {
+    use futures::StreamExt;
+
+    let mut stream = goose::session_context::with_session_id(
+        Some(session_id.to_string()),
+        provider.stream(model_config, system, &[request], &[]),
+    )
+    .await?;
+
+    let mut buffer = super::streaming_buffer::MarkdownBuffer::new();
+    let mut thinking_header_shown = false;
+    let mut text = String::new();
+    let mut usage: Option<ProviderUsage> = None;
+
+    while let Some(next) = stream.next().await {
+        let (message, message_usage) = next?;
+        if let Some(message) = message {
+            for content in &message.content {
+                if let goose::conversation::message::MessageContent::Text(t) = content {
+                    text.push_str(&t.text);
+                }
+            }
+            output::hide_thinking();
+            output::render_message_streaming(
+                &message,
+                &mut buffer,
+                &mut thinking_header_shown,
+                debug,
+            );
+        }
+        if message_usage.is_some() {
+            usage = message_usage;
+        }
+    }
+    output::flush_markdown_buffer_current_theme(&mut buffer);
+    output::reset_response_bullet();
+    Ok((text, usage))
+}
+
 struct PhaseMeta<'a> {
     session_id: &'a str,
     run_id: &'a str,
@@ -365,13 +414,16 @@ impl CliSession {
             "{}\n\n---\n\nTask:\n{}\n\nWorking directory: {}",
             PLAN_SYSTEM_PROMPT, task, working_dir
         ));
-        let (plan_message, plan_usage) = goose::session_context::with_session_id(
-            Some(self.session_id.clone()),
-            planner.complete(&planner_model, PLAN_SYSTEM_PROMPT, &[plan_request], &[]),
+        let (plan_text, plan_usage) = stream_role_completion(
+            &planner,
+            &planner_model,
+            PLAN_SYSTEM_PROMPT,
+            plan_request,
+            &self.session_id,
+            self.debug,
         )
         .await?;
         output::hide_thinking();
-        output::render_message(&plan_message, self.debug);
         // Captured after the completion so the ACP adapter has reported the
         // session's real context size (a model fingerprint).
         let planner_context_limit = planner.get_context_limit(&planner_model).await.ok();
@@ -381,12 +433,11 @@ impl CliSession {
             0,
             "planner",
             planner_role,
-            Some(&plan_usage),
+            plan_usage.as_ref(),
             planner_context_limit,
             phase_started.elapsed().as_millis() as u64,
             None,
         );
-        let plan_text = plan_message.as_concat_text();
 
         let (reviewer, reviewer_model) = if reviewer_role == planner_role {
             (Arc::clone(&planner), planner_model.clone())
@@ -491,19 +542,16 @@ impl CliSession {
                 working_dir
             ));
             output::show_thinking();
-            let (review_message, review_usage) = goose::session_context::with_session_id(
-                Some(self.session_id.clone()),
-                reviewer.complete(
-                    &reviewer_model,
-                    REVIEW_SYSTEM_PROMPT,
-                    &[review_request],
-                    &[],
-                ),
+            let (review_text, review_usage) = stream_role_completion(
+                &reviewer,
+                &reviewer_model,
+                REVIEW_SYSTEM_PROMPT,
+                review_request,
+                &self.session_id,
+                self.debug,
             )
             .await?;
             output::hide_thinking();
-            output::render_message(&review_message, self.debug);
-            let review_text = review_message.as_concat_text();
             let approved = parse_verdict_approved(&review_text);
             let verdict = if approved {
                 "APPROVED"
@@ -518,7 +566,7 @@ impl CliSession {
                 cycle,
                 "reviewer",
                 reviewer_role,
-                Some(&review_usage),
+                review_usage.as_ref(),
                 None,
                 phase_started.elapsed().as_millis() as u64,
                 Some(verdict),

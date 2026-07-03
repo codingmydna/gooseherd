@@ -182,6 +182,9 @@ pub struct CliSession {
     retry_config: Option<RetryConfig>,
     output_format: String,
     stats: bool,
+    /// Plain messages typed while a turn was streaming; sent automatically
+    /// once the current turn finishes.
+    queued_inputs: std::sync::Mutex<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +289,7 @@ impl CliSession {
             retry_config,
             output_format,
             stats,
+            queued_inputs: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -533,6 +537,23 @@ impl CliSession {
         history_manager.load(&mut editor);
 
         loop {
+            // Messages typed while the previous turn was streaming go first.
+            while let Some(queued) = {
+                let mut q = self.queued_inputs.lock().unwrap();
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            } {
+                println!("\n{} {}", console::style("▶ queued:").cyan().bold(), queued);
+                self.push_message(Message::user().with_text(&queued));
+                output::show_thinking();
+                self.process_agent_response(true, CancellationToken::default())
+                    .await?;
+                output::hide_thinking();
+            }
+
             self.display_context_usage().await?;
 
             let conversation_strings: Vec<String> = self
