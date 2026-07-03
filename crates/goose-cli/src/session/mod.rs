@@ -35,6 +35,7 @@ use goose::permission::PermissionConfirmation;
 use goose::providers::base::Provider;
 use goose::providers::base::ProviderUsage;
 use goose::utils::safe_truncate;
+pub use orchestrate::OrchOutcome;
 
 use anyhow::{Context, Result};
 use completion::GooseCompleter;
@@ -664,7 +665,7 @@ impl CliSession {
             }
             InputResult::Orchestrate(task) => {
                 history.save(editor);
-                if let Err(e) = self.handle_orchestrate(task).await {
+                if let Err(e) = self.handle_orchestrate(task, None, true).await {
                     output::render_error(&e.to_string());
                 }
             }

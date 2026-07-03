@@ -34,6 +34,13 @@ VERDICT: REVISE
 
 If REVISE, follow with a numbered list of concrete, actionable defects (file, problem, required fix). Only demand changes for real problems; do not invent nitpicks."#;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchOutcome {
+    Approved,
+    MaxCycles,
+    Aborted,
+}
+
 #[derive(Clone, PartialEq)]
 pub(super) struct RoleConfig {
     pub(super) provider_name: String,
@@ -352,13 +359,18 @@ fn record_phase(
 }
 
 impl CliSession {
-    pub(super) async fn handle_orchestrate(&mut self, task: String) -> Result<()> {
+    pub(crate) async fn handle_orchestrate(
+        &mut self,
+        task: String,
+        max_cycles_override: Option<u32>,
+        interactive: bool,
+    ) -> Result<OrchOutcome> {
         let task = task.trim().to_string();
         if task.is_empty() {
             output::render_error(
                 "Usage: /orch <task> — plan with the planner model, implement with the implementer model, review with the reviewer model until approved.",
             );
-            return Ok(());
+            return Ok(OrchOutcome::Aborted);
         }
 
         let config = Config::global();
@@ -367,10 +379,14 @@ impl CliSession {
         let planner_role = roles.planner;
         let reviewer_role = roles.reviewer;
         let implementer_role = roles.implementer;
-        let max_cycles = config
-            .get_param::<u32>(MAX_CYCLES_KEY)
-            .ok()
+        let max_cycles = max_cycles_override
             .filter(|n| *n >= 1)
+            .or_else(|| {
+                config
+                    .get_param::<u32>(MAX_CYCLES_KEY)
+                    .ok()
+                    .filter(|n| *n >= 1)
+            })
             .unwrap_or(DEFAULT_MAX_CYCLES);
 
         println!(
@@ -396,6 +412,7 @@ impl CliSession {
                 &reviewer_role,
                 &implementer_role,
                 max_cycles,
+                interactive,
             )
             .await;
 
@@ -427,6 +444,7 @@ impl CliSession {
         outcome
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_orchestration(
         &mut self,
         task: &str,
@@ -434,7 +452,8 @@ impl CliSession {
         reviewer_role: &RoleConfig,
         implementer_role: &RoleConfig,
         max_cycles: u32,
-    ) -> Result<()> {
+        interactive: bool,
+    ) -> Result<OrchOutcome> {
         let config = Config::global();
         let working_dir = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -548,7 +567,7 @@ impl CliSession {
                 .unwrap_or_default();
             self.push_message(Message::user().with_text(&instruction));
             output::show_thinking();
-            self.process_agent_response(true, CancellationToken::default())
+            self.process_agent_response(interactive, CancellationToken::default())
                 .await?;
             output::hide_thinking();
             let usage_after = self
@@ -675,7 +694,7 @@ impl CliSession {
                         .green()
                         .bold()
                 );
-                return Ok(());
+                return Ok(OrchOutcome::Approved);
             }
             if cycle == max_cycles {
                 println!(
@@ -687,13 +706,13 @@ impl CliSession {
                     .yellow()
                     .bold()
                 );
-                return Ok(());
+                return Ok(OrchOutcome::MaxCycles);
             }
             instruction = format!(
                 "The reviewer did not approve the implementation. Address every item in the review feedback below, then re-verify and report.\n\nReview feedback:\n{}",
                 review_text
             );
         }
-        Ok(())
+        Ok(OrchOutcome::MaxCycles)
     }
 }

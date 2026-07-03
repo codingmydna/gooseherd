@@ -971,6 +971,24 @@ enum Command {
         model_opts: ModelOptions,
     },
 
+    /// Run the plan → implement → review orchestration headlessly
+    #[command(
+        about = "Run the multi-model plan → implement → review loop headlessly",
+        long_about = "Runs the same plan → implement → review orchestration as the /orch slash command, without an interactive session. Exits 0 when the reviewer approves the implementation, 1 otherwise."
+    )]
+    Orch {
+        /// Task to orchestrate
+        #[arg(short = 't', long = "text", help = "Task to orchestrate")]
+        text: String,
+
+        /// Maximum implement/review cycles before giving up
+        #[arg(
+            long = "max-cycles",
+            help = "Maximum implement/review cycles before giving up (default: GOOSE_ORCH_MAX_CYCLES or 3)"
+        )]
+        max_cycles: Option<u32>,
+    },
+
     /// Recipe utilities for validation and deeplinking
     #[command(about = "Recipe utilities for validation and deeplinking")]
     Recipe {
@@ -1344,6 +1362,7 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Project {}) => "project",
         Some(Command::Projects) => "projects",
         Some(Command::Run { .. }) => "run",
+        Some(Command::Orch { .. }) => "orch",
         Some(Command::Gateway { .. }) => "gateway",
         Some(Command::Schedule { .. }) => "schedule",
         #[cfg(feature = "update")]
@@ -1932,6 +1951,23 @@ async fn handle_run_command(
     }
 }
 
+async fn handle_orch_command(text: String, max_cycles: Option<u32>) -> Result<()> {
+    let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
+    let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
+
+    let mut session = build_session(SessionBuilderConfig {
+        session_id,
+        ..Default::default()
+    })
+    .await;
+
+    let outcome = session.handle_orchestrate(text, max_cycles, false).await?;
+    if outcome != crate::session::OrchOutcome::Approved {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 async fn handle_gateway_command(command: GatewayCommand) -> Result<()> {
     use crate::commands::gateway;
 
@@ -2304,6 +2340,7 @@ pub async fn cli() -> anyhow::Result<()> {
             )
             .await
         }
+        Some(Command::Orch { text, max_cycles }) => handle_orch_command(text, max_cycles).await,
         Some(Command::Gateway { command }) => handle_gateway_command(command).await,
         Some(Command::Schedule { command }) => handle_schedule_command(command).await,
         #[cfg(feature = "update")]
