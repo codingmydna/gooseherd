@@ -10,6 +10,68 @@ use strum::VariantNames;
 
 use super::{CompletionCache, HintStatus};
 
+/// Slash commands with one-line descriptions, used for both Tab completion
+/// and the inline typing hint.
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/exit", "Exit the session"),
+    ("/quit", "Exit the session"),
+    ("/help", "Show available commands"),
+    ("/?", "Show available commands"),
+    ("/t", "Toggle or set theme (light/dark/ansi)"),
+    ("/extension", "Add a stdio extension"),
+    ("/builtin", "Add builtin extensions by name"),
+    ("/prompts", "List available prompts"),
+    ("/prompt", "Get prompt info or run a prompt"),
+    ("/mode", "Set goose mode (auto/approve/smart_approve/chat)"),
+    ("/model", "Show or switch the current model"),
+    ("/recipe", "Generate a recipe from this session"),
+    ("/skills", "List or load skills"),
+    ("/status", "Session status: model, roles, subagents, usage"),
+    ("/usage", "Token usage and cost for this session"),
+    ("/stats", "Orch run statistics and model verification"),
+    ("/orch", "Plan → implement → review loop across models"),
+    ("/roles", "Show or change orchestration roles/effort"),
+    ("/btw", "Side question in the background, history untouched"),
+    ("/plan", "Enter plan mode"),
+    ("/endplan", "Exit plan mode"),
+    ("/compact", "Compact the conversation to free context"),
+    ("/clear", "Clear the conversation history"),
+    ("/r", "Toggle full tool output"),
+    ("/edit", "Compose the message in your editor"),
+];
+
+fn slash_command_hint(line: &str) -> Option<String> {
+    let (token, has_args) = match line.split_once(' ') {
+        Some((cmd, _)) => (cmd, true),
+        None => (line, false),
+    };
+    if has_args {
+        return match SLASH_COMMANDS.iter().find(|(c, _)| *c == token) {
+            Some((_, desc)) => Some(format!("   ✓ {}", desc)),
+            None => Some("   ✗ unknown command".to_string()),
+        };
+    }
+    let matches: Vec<&(&str, &str)> = SLASH_COMMANDS
+        .iter()
+        .filter(|(c, _)| c.starts_with(token))
+        .collect();
+    if let Some((_, desc)) = matches.iter().find(|(c, _)| *c == token) {
+        return Some(format!("   ✓ {}", desc));
+    }
+    match matches.len() {
+        0 => Some("   ✗ unknown command".to_string()),
+        1 => {
+            let (cmd, desc) = matches[0];
+            let remainder = cmd.strip_prefix(token).unwrap_or("");
+            Some(format!("{} — {}", remainder, desc))
+        }
+        _ => {
+            let names: Vec<&str> = matches.iter().take(6).map(|(c, _)| *c).collect();
+            Some(format!("   {}", names.join(" ")))
+        }
+    }
+}
+
 /// Completer for goose CLI commands
 pub struct GooseCompleter {
     pub completion_cache: Arc<std::sync::RwLock<CompletionCache>>,
@@ -152,29 +214,11 @@ impl GooseCompleter {
 
     /// Complete slash commands
     fn complete_slash_commands(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
-        // Define available slash commands
-        let commands = [
-            "/exit",
-            "/quit",
-            "/help",
-            "/?",
-            "/t",
-            "/extension",
-            "/builtin",
-            "/prompts",
-            "/prompt",
-            "/mode",
-            "/model",
-            "/recipe",
-            "/skills",
-            "/status",
-        ];
-
         // Find commands that match the prefix
-        let matching_commands: Vec<Pair> = commands
+        let matching_commands: Vec<Pair> = SLASH_COMMANDS
             .iter()
-            .filter(|cmd| cmd.starts_with(line))
-            .map(|cmd| Pair {
+            .filter(|(cmd, _)| cmd.starts_with(line))
+            .map(|(cmd, _)| Pair {
                 display: cmd.to_string(),
                 replacement: format!("{} ", cmd), // Add a space after the command
             })
@@ -440,6 +484,9 @@ impl Hinter for GooseCompleter {
         }
 
         if !line.is_empty() {
+            if line.starts_with('/') && _pos == line.len() {
+                return slash_command_hint(line);
+            }
             return None;
         }
 
@@ -452,7 +499,13 @@ impl Hinter for GooseCompleter {
             }
             HintStatus::Default => {
                 let newline_key = super::input::get_newline_key().to_ascii_uppercase();
-                Some(format!("Enter to send · Ctrl+{} newline", newline_key))
+                match &cache.status_line {
+                    Some(status) => Some(format!(
+                        "{} · Enter to send · Ctrl+{} newline",
+                        status, newline_key
+                    )),
+                    None => Some(format!("Enter to send · Ctrl+{} newline", newline_key)),
+                }
             }
         }
     }

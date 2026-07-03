@@ -79,6 +79,22 @@ thread_local! {
     static SHOW_FULL_TOOL_OUTPUT: RefCell<bool> = RefCell::new(
         Config::global().get_param::<bool>("GOOSE_SHOW_FULL_OUTPUT").unwrap_or(false)
     );
+    static RESPONSE_BULLET_SHOWN: RefCell<bool> = const { RefCell::new(false) };
+}
+
+/// Reset the per-response bullet so the next assistant text block gets a fresh `●`.
+pub fn reset_response_bullet() {
+    RESPONSE_BULLET_SHOWN.with(|s| *s.borrow_mut() = false);
+}
+
+fn print_response_bullet_once() {
+    RESPONSE_BULLET_SHOWN.with(|s| {
+        let mut shown = s.borrow_mut();
+        if !*shown {
+            println!("\n{}", style("●").white().bold());
+            *shown = true;
+        }
+    });
 }
 
 pub fn set_theme(theme: Theme) {
@@ -290,12 +306,14 @@ pub fn render_message_streaming(
 
         match content {
             MessageContent::Text(text) => {
+                print_response_bullet_once();
                 if let Some(safe_content) = buffer.push(&text.text) {
                     print_markdown(&safe_content, theme);
                 }
             }
             MessageContent::ToolRequest(req) => {
                 flush_markdown_buffer(buffer, theme);
+                reset_response_bullet();
                 render_tool_request(req, theme, debug);
             }
             MessageContent::ToolResponse(resp) => {
@@ -547,15 +565,33 @@ fn print_tool_output(text: &str) {
         20
     };
     let lines: Vec<&str> = text.lines().collect();
+    let is_diff = looks_like_diff(&lines);
+    let prefix = |i: usize| if i == 0 { "  ⎿ " } else { "    " };
+    let styled = |line: &str| -> String {
+        let styled = if is_diff {
+            if line.starts_with('+') {
+                style(line).green()
+            } else if line.starts_with('-') {
+                style(line).red()
+            } else if line.starts_with("@@") {
+                style(line).cyan()
+            } else {
+                style(line).dim()
+            }
+        } else {
+            style(line).dim()
+        };
+        styled.to_string()
+    };
     if lines.len() <= max_lines {
-        for line in &lines {
-            println!("    {}", style(line).dim());
+        for (i, line) in lines.iter().enumerate() {
+            println!("{}{}", prefix(i), styled(line));
         }
     } else {
         let head = max_lines / 2;
         let tail = max_lines - head;
-        for line in &lines[..head] {
-            println!("    {}", style(line).dim());
+        for (i, line) in lines[..head].iter().enumerate() {
+            println!("{}{}", prefix(i), styled(line));
         }
         println!(
             "    {}",
@@ -567,9 +603,27 @@ fn print_tool_output(text: &str) {
             .italic()
         );
         for line in &lines[lines.len() - tail..] {
-            println!("    {}", style(line).dim());
+            println!("    {}", styled(line));
         }
     }
+}
+
+/// Heuristic: color +/- lines only when the output actually looks like a diff,
+/// so markdown bullets ("- item") don't light up red.
+fn looks_like_diff(lines: &[&str]) -> bool {
+    let has_marker = lines
+        .iter()
+        .any(|l| l.starts_with("@@") || l.starts_with("+++") || l.starts_with("---"));
+    if has_marker {
+        return true;
+    }
+    let plus = lines
+        .iter()
+        .any(|l| l.starts_with('+') && !l.starts_with("++"));
+    let minus = lines
+        .iter()
+        .any(|l| l.starts_with('-') && !l.starts_with("--") && !l.starts_with("- "));
+    plus && minus
 }
 
 fn is_shell_tool_name(name: &str) -> bool {
@@ -687,7 +741,12 @@ fn render_text_editor_request(call: &CallToolRequestParams, debug: bool) {
             );
         }
 
-        if let Some(args) = &call.arguments {
+        let old_str = args.get("old_str").and_then(|v| v.as_str());
+        let new_str = args.get("new_str").and_then(|v| v.as_str());
+        let file_text = args.get("file_text").and_then(|v| v.as_str());
+        if old_str.is_some() || new_str.is_some() || file_text.is_some() {
+            print_edit_diff(old_str, new_str.or(file_text), debug);
+        } else {
             let mut other_args = serde_json::Map::new();
             for (k, v) in args {
                 if k != "path" {
@@ -700,6 +759,34 @@ fn render_text_editor_request(call: &CallToolRequestParams, debug: bool) {
         }
     }
     println!();
+}
+
+/// Render old/new edit content as a Claude-Code-style red/green mini diff.
+fn print_edit_diff(old: Option<&str>, new: Option<&str>, debug: bool) {
+    let cap = if debug || get_show_full_tool_output() {
+        usize::MAX
+    } else {
+        12
+    };
+    for (content, sign) in [(old, '-'), (new, '+')] {
+        let Some(content) = content else { continue };
+        let total = content.lines().count();
+        for (i, line) in content.lines().enumerate() {
+            if i >= cap {
+                let hidden = format!("{} … ({} more lines, /r to show all)", sign, total - cap);
+                let hidden = style(hidden).dim().italic();
+                println!("    {}", hidden);
+                break;
+            }
+            let rendered = format!("{} {}", sign, line);
+            let rendered = if sign == '-' {
+                style(rendered).red()
+            } else {
+                style(rendered).green()
+            };
+            println!("    {}", rendered);
+        }
+    }
 }
 
 fn render_shell_request(call: &CallToolRequestParams, debug: bool) {
@@ -939,17 +1026,16 @@ fn render_subagent_tool_graph(subagent_id: &str, tool_graph: &[Value]) {
 fn print_tool_header(call: &CallToolRequestParams) {
     let (tool, extension) = split_tool_name(&call.name);
     let tool_header = if extension.is_empty() {
-        format!("  {} {}", style("▸").dim(), style(&tool).dim())
+        format!("{} {}", style("●").cyan(), style(&tool).bold())
     } else {
         format!(
-            "  {} {} {}",
-            style("▸").dim(),
-            style(&tool).dim(),
-            style(extension).magenta().dim(),
+            "{} {} {}",
+            style("●").cyan(),
+            style(&tool).bold(),
+            style(format!("({})", extension)).dim(),
         )
     };
     println!();
-    println!("  {}", style("─".repeat(40)).dim());
     println!("{}", tool_header);
 }
 

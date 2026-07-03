@@ -23,6 +23,12 @@ pub enum InputResult {
     Model(Option<String>),
     Plan(PlanCommandOptions),
     EndPlan,
+    Orchestrate(String),
+    Status,
+    UsageInfo,
+    Btw(String),
+    Roles(Option<String>),
+    Stats,
     Clear,
     Recipe(Option<String>),
     Compact,
@@ -201,6 +207,11 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_MODEL_WITH_SPACE: &str = "/model ";
     const CMD_PLAN: &str = "/plan";
     const CMD_ENDPLAN: &str = "/endplan";
+    const CMD_ORCH: &str = "/orch";
+    const CMD_STATUS: &str = "/status";
+    const CMD_USAGE: &str = "/usage";
+    const CMD_BTW: &str = "/btw";
+    const CMD_ROLES: &str = "/roles";
     const CMD_CLEAR: &str = "/clear";
     const CMD_RECIPE: &str = "/recipe";
     const CMD_COMPACT: &str = "/compact";
@@ -281,6 +292,19 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
             parse_plan_command(s.get(CMD_PLAN.len()..).unwrap_or("").trim().to_string())
         }
         s if s == CMD_ENDPLAN => Some(InputResult::EndPlan),
+        s if s == CMD_ORCH || s.starts_with(&format!("{CMD_ORCH} ")) => Some(
+            InputResult::Orchestrate(s.get(CMD_ORCH.len()..).unwrap_or("").trim().to_string()),
+        ),
+        s if s == CMD_STATUS => Some(InputResult::Status),
+        s if s == CMD_USAGE => Some(InputResult::UsageInfo),
+        "/stats" => Some(InputResult::Stats),
+        s if s == CMD_BTW || s.starts_with(&format!("{CMD_BTW} ")) => Some(InputResult::Btw(
+            s.get(CMD_BTW.len()..).unwrap_or("").trim().to_string(),
+        )),
+        s if s == CMD_ROLES => Some(InputResult::Roles(None)),
+        s if s.starts_with(&format!("{CMD_ROLES} ")) => Some(InputResult::Roles(Some(
+            s.get(CMD_ROLES.len()..).unwrap_or("").trim().to_string(),
+        ))),
         s if s == CMD_CLEAR => Some(InputResult::Clear),
         s if s.starts_with(CMD_RECIPE) => parse_recipe_command(s),
         s if s == CMD_COMPACT => Some(InputResult::Compact),
@@ -417,6 +441,12 @@ fn print_help() {
 /mode <name> - Set the goose mode to use ({modes})
 /model [name] - Show the current model, or switch models for this session while keeping the same provider
 /plan <message_text> -  Enters 'plan' mode with optional message. Create a plan based on the current messages and asks user if they want to act on it.
+/orch <task> - Run the task through a plan/implement/review loop: planner model plans, implementer model executes, reviewer model reviews until approved (GOOSE_PLANNER_*, GOOSE_IMPLEMENTER_*, GOOSE_REVIEWER_* config)
+/status - Show session status: provider/model/effort/connection type, orchestration roles, subagent config, token usage
+/usage - Show token usage and cost for this session
+/stats - Orchestration run statistics: per-role/model tokens, durations, verdicts, reported-model verification
+/btw <question> - Ask a side question (answered by the planner model) without adding it to the session history
+/roles [role=provider/model ...] - Show or change /orch role assignments in-session (also effort=<level>, cycles=<n>)
                         If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.
                         To warm up goose before using '/plan', we recommend setting '/mode approve' & putting appropriate context into goose.
                         The model is used based on $GOOSE_PLANNER_PROVIDER and $GOOSE_PLANNER_MODEL environment variables.

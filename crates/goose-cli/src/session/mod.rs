@@ -4,10 +4,13 @@ pub mod editor;
 mod elicitation;
 mod export;
 mod input;
+mod ledger;
+mod orchestrate;
 mod output;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
+mod ux;
 
 use crate::session::task_execution_display::{
     format_task_execution_notification, TASK_EXECUTION_NOTIFICATION_TYPE,
@@ -192,6 +195,7 @@ pub struct CompletionCache {
     pub prompt_info: HashMap<String, output::PromptInfo>,
     pub last_updated: Instant,
     pub hint_status: HintStatus,
+    pub status_line: Option<String>,
 }
 
 impl CompletionCache {
@@ -201,6 +205,7 @@ impl CompletionCache {
             prompt_info: HashMap::new(),
             last_updated: Instant::now(),
             hint_status: HintStatus::Default,
+            status_line: None,
         }
     }
 }
@@ -623,6 +628,40 @@ impl CliSession {
             InputResult::EndPlan => {
                 self.run_mode = RunMode::Normal;
                 output::render_exit_plan_mode();
+            }
+            InputResult::Orchestrate(task) => {
+                history.save(editor);
+                if let Err(e) = self.handle_orchestrate(task).await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::Status => {
+                if let Err(e) = self.handle_status().await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::UsageInfo => {
+                if let Err(e) = self.handle_usage().await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::Stats => {
+                if let Err(e) = self.handle_stats().await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::Btw(question) => {
+                history.save(editor);
+                let printer = editor.create_external_printer().ok();
+                if let Err(e) = self.handle_btw(question, printer).await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::Roles(spec) => {
+                history.save(editor);
+                if let Err(e) = self.handle_roles(spec).await {
+                    output::render_error(&e.to_string());
+                }
             }
             InputResult::Clear => {
                 history.save(editor);
@@ -1371,6 +1410,7 @@ impl CliSession {
 
         if !is_json_mode && !is_stream_json_mode {
             output::flush_markdown_buffer_current_theme(&mut markdown_buffer);
+            output::reset_response_bullet();
         }
 
         if is_json_mode {
@@ -1612,7 +1652,7 @@ impl CliSession {
             .get_goose_provider()
             .unwrap_or_else(|_| "unknown".to_string());
 
-        match self.get_session().await {
+        let total_tokens = match self.get_session().await {
             Ok(metadata) => {
                 let total_tokens = metadata.usage.total_tokens.unwrap_or(0) as usize;
 
@@ -1625,10 +1665,30 @@ impl CliSession {
                         &metadata.usage,
                     );
                 }
+                total_tokens
             }
             Err(_) => {
                 output::display_context_usage(0, context_limit);
+                0
             }
+        };
+
+        // Keep the input-line hint status in sync (rendered by GooseCompleter).
+        let mode = self.agent.goose_mode().await;
+        let pct = if context_limit > 0 {
+            (total_tokens * 100) / context_limit
+        } else {
+            0
+        };
+        let status_line = format!(
+            "{}/{} · {} · ctx {}%",
+            provider.get_name(),
+            model_config.model_name,
+            mode,
+            pct
+        );
+        if let Ok(mut cache) = self.completion_cache.write() {
+            cache.status_line = Some(status_line);
         }
 
         Ok(())
