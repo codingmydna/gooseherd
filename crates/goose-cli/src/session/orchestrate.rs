@@ -165,6 +165,21 @@ fn phase_banner(text: &str) {
 /// don't need it.
 const FABLE5_PLAYBOOK: &str = include_str!("../../../../profiles/fable5-playbook.md");
 
+/// The embedded playbook, or the file GOOSE_PLAYBOOK_PATH points at —
+/// letting users refine their own playbook without forking the repo.
+fn playbook_text() -> String {
+    if let Ok(path) = Config::global().get_param::<String>("GOOSE_PLAYBOOK_PATH") {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => return content,
+            Err(e) => output::render_error(&format!(
+                "GOOSE_PLAYBOOK_PATH ({}) unreadable, using embedded playbook: {}",
+                path, e
+            )),
+        }
+    }
+    FABLE5_PLAYBOOK.to_string()
+}
+
 fn is_acp_provider(provider_name: &str) -> bool {
     provider_name.ends_with("-acp")
 }
@@ -173,7 +188,7 @@ fn role_system_prompt(base: &str, role: &RoleConfig) -> String {
     if is_acp_provider(&role.provider_name) {
         base.to_string()
     } else {
-        format!("{}\n\n# Operating playbook\n\n{}", base, FABLE5_PLAYBOOK)
+        format!("{}\n\n# Operating playbook\n\n{}", base, playbook_text())
     }
 }
 
@@ -528,7 +543,7 @@ impl CliSession {
         let implementer_playbook = if is_acp_provider(&implementer_role.provider_name) {
             String::new()
         } else {
-            format!("\n\n# Operating playbook\n\n{}", FABLE5_PLAYBOOK)
+            format!("\n\n# Operating playbook\n\n{}", playbook_text())
         };
         let mut instruction = format!(
             "You are the implementer in a plan/implement/review workflow. Execute the plan below for the task. Modify files and run verification with your tools. When done, report what you changed and how you verified it.{}\n\nTask:\n{}\n\nPlan:\n{}",
