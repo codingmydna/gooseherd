@@ -29,6 +29,7 @@ pub enum InputResult {
     Btw(String),
     Roles(Option<String>),
     Stats,
+    Arena(String),
     Clear,
     Recipe(Option<String>),
     Compact,
@@ -312,6 +313,9 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_STATUS => Some(InputResult::Status),
         s if s == CMD_USAGE => Some(InputResult::UsageInfo),
         "/stats" => Some(InputResult::Stats),
+        s if s == "/arena" || s.starts_with("/arena ") => Some(InputResult::Arena(
+            s.get("/arena".len()..).unwrap_or("").trim().to_string(),
+        )),
         s if s == CMD_BTW || s.starts_with(&format!("{CMD_BTW} ")) => Some(InputResult::Btw(
             s.get(CMD_BTW.len()..).unwrap_or("").trim().to_string(),
         )),
@@ -459,6 +463,7 @@ fn print_help() {
 /status - Show session status: provider/model/effort/connection type, orchestration roles, subagent config, token usage
 /usage - Show token usage and cost for this session
 /stats - Orchestration run statistics: per-role/model tokens, durations, verdicts, reported-model verification
+/arena [lineup=provider/model,...] <task> - Run the same task on each contestant in isolated git worktrees, then blind-judge the diffs (GOOSE_ARENA_LINEUP, GOOSE_ARENA_TIMEOUT_SECS)
 /btw <question> - Ask a side question (answered by the planner model) without adding it to the session history
 /roles [role=provider/model ...] - Show or change /orch role assignments in-session (also effort=<level>, cycles=<n>)
                         If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.

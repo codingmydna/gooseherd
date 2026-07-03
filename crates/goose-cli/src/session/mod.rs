@@ -1,3 +1,4 @@
+mod arena;
 mod builder;
 mod completion;
 pub mod editor;
@@ -648,6 +649,12 @@ impl CliSession {
             }
             InputResult::Stats => {
                 if let Err(e) = self.handle_stats().await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::Arena(args) => {
+                history.save(editor);
+                if let Err(e) = self.handle_arena(args).await {
                     output::render_error(&e.to_string());
                 }
             }

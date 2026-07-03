@@ -29,6 +29,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/status", "Session status: model, roles, subagents, usage"),
     ("/usage", "Token usage and cost for this session"),
     ("/stats", "Orch run statistics and model verification"),
+    (
+        "/arena",
+        "Same task, N models, isolated worktrees, blind judge",
+    ),
     ("/orch", "Plan → implement → review loop across models"),
     ("/roles", "Show or change orchestration roles/effort"),
     ("/btw", "Side question in the background, history untouched"),
