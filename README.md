@@ -1,61 +1,120 @@
-> **🦆 goose has moved!** This project has moved from `block/goose` to the [Agentic AI Foundation (AAIF)](https://aaif.io/) at the Linux Foundation. Some links and references are still being updated — please bear with us during the transition.
+# gooseherd
 
-<div align="center">
+A gooseherd tends geese. This one tends AI models.
 
-# goose
+gooseherd is a fork of [goose](https://github.com/aaif-goose/goose) that turns it
+into a multi-model orchestrator: a frontier model plans and reviews, a cheaper
+model does the implementation, and every step is measured so you can see who
+actually did what.
 
-_your native open source AI agent — desktop app, CLI, and API — for code, workflows, and everything in between_
+The starting observation is simple. Coding-agent subscriptions don't mix —
+Claude Code drives Anthropic models, Codex drives OpenAI models, and each one
+is excellent inside its own harness. goose already speaks to both of them over
+ACP. What was missing was a layer that makes them work *together* on one task,
+with a paper trail.
 
-<p align="center">
-  <a href="https://opensource.org/licenses/Apache-2.0"
-    ><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
-  <a href="https://discord.gg/goose-oss"
-    ><img src="https://img.shields.io/discord/1287729918100246654?logo=discord&logoColor=white&label=Join+Us&color=blueviolet" alt="Discord"></a>
-  <a href="https://github.com/aaif-goose/goose/actions/workflows/ci.yml"
-     ><img src="https://img.shields.io/github/actions/workflow/status/aaif-goose/goose/ci.yml?branch=main" alt="CI"></a>
-  <a href="https://insights.linuxfoundation.org/project/goose"><img src="https://insights.linuxfoundation.org/api/badge/health-score?project=goose"></a>
-  <a href="https://repology.org/project/goose-cli/versions"><img src="https://repology.org/badge/tiny-repos/goose-cli.svg" alt="Packaging status"></a>
-</p>
-</div>
+## What it adds on top of goose
 
-goose is a general-purpose AI agent that runs on your machine. Not just for code — use it for research, writing, automation, data analysis, or anything you need to get done.
+**`/orch <task>`** — a plan → implement → review loop across different models.
+The planner (say, Claude via your Claude Code subscription) explores the repo
+read-only and writes a plan with acceptance criteria. The implementer (say,
+GPT via your Codex subscription, or a local model) executes it with full tool
+access. The reviewer checks the diff against the plan and either approves or
+sends it back, up to N cycles.
 
-A native desktop app for macOS, Linux, and Windows. A full CLI for terminal workflows. An API to embed it anywhere. Built in Rust for performance and portability.
-
-goose works with 15+ providers — Anthropic, OpenAI, Google, Ollama, OpenRouter, Azure, Bedrock, and more. Use API keys or your existing Claude, ChatGPT, or Gemini subscriptions via [ACP](https://goose-docs.ai/docs/guides/acp-providers). Connect to 70+ extensions via the [Model Context Protocol](https://modelcontextprotocol.io/) open standard.
-
-goose is part of the [Agentic AI Foundation (AAIF)](https://aaif.io/) at the Linux Foundation.
-
-# Get started
-
-**[Download the desktop app](https://goose-docs.ai/docs/getting-started/installation)** for macOS, Linux, and Windows.
-
-Or install the CLI:
-
-```bash
-curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash
+```
+― phase: plan · claude-acp/default ―
+  ⎿ plan done · model default · in 14993 / out 2485 · 59.1s
+― phase: implement (cycle 1/3) · codex-acp/gpt-5.5 ―
+  ⎿ implement done · model gpt-5.5 · in 915 / out 613 · 188.0s
+― phase: review (cycle 1/3) · claude-acp/default ―
+VERDICT: APPROVED
+  ⎿ review done · model default · in 2 / out 224 · 6.7s · APPROVED
 ```
 
-# Quick links
-- [Quickstart](https://goose-docs.ai/docs/quickstart)
-- [Installation](https://goose-docs.ai/docs/getting-started/installation)
-- [Tutorials](https://goose-docs.ai/docs/category/tutorials)
-- [Documentation](https://goose-docs.ai/docs/category/getting-started)
-- [Governance](https://github.com/aaif-goose/goose/blob/main/GOVERNANCE.md)
-- [Custom Distributions](https://github.com/aaif-goose/goose/blob/main/CUSTOM_DISTROS.md) — build your own goose distro with preconfigured providers, extensions, and branding
+**Plan-Explore permission policy** — the planner and reviewer run as full
+agents but cannot write. Instead of goose's all-or-nothing modes, permission
+requests are judged by ACP tool kind: reads, searches, and parallel subagent
+exploration are approved; edits, deletes, and moves are rejected. This works
+for any ACP agent, with the agent's own restrictions (Claude Code plan mode,
+Codex read-only sandbox) kept as a second barrier.
 
-## Need help?
-- [Diagnostics & Reporting](https://goose-docs.ai/docs/troubleshooting/diagnostics-and-reporting)
-- [Known Issues](https://goose-docs.ai/docs/troubleshooting/known-issues)
+**`/arena`** — run the same task on several models at once, each in its own
+detached git worktree, then have the reviewer blind-judge the diffs:
 
-# a little goose humor 🪿
+```
+arena results
+  A-codex-acp      codex-acp/gpt-5.5   failed/timeout  900s
+  B-claude-acp     claude-acp/default  completed        48s  2 files changed, 29 insertions(+)
 
-> Why did the developer choose goose as their AI agent?
-> 
-> Because it always helps them "migrate" their code to production! 🚀
+RANKING: B-claude-acp > A-codex-acp
+```
 
-# goose around with us
-- [Discord](https://discord.gg/goose-oss)
-- [YouTube](https://www.youtube.com/@goose-oss)
-- [LinkedIn](https://www.linkedin.com/company/goose-oss)
-- [Twitter/X](https://x.com/goose_oss)
+Worktrees are kept afterwards so you can inspect every attempt yourself.
+
+**A run ledger and `/stats`** — every orchestration phase is appended to
+`orch_ledger.jsonl`: configured model vs. the model the provider actually
+reported, tokens, durations, verdicts, and the session's advertised context
+limit (a useful fingerprint for catching silent model downgrades —
+`GOOSE_<ROLE>_EXPECT_MODEL` warns when the reported model doesn't match).
+
+**Quality-of-life commands** — `/status` (roles, connection type, effort,
+usage), `/usage`, `/roles` (change role assignments without leaving the
+session), `/btw` (ask a side question in the background without touching the
+session history), a copy-pasteable resume command on exit, slash-command
+typing hints, per-role reasoning effort, and Claude-Code-style tool rendering
+(diff coloring, edit previews, response bullets).
+
+## Setup
+
+You need Rust, plus the ACP adapters for whichever subscriptions you want to
+drive:
+
+```sh
+npm install -g @agentclientprotocol/claude-agent-acp   # Claude Code subscription
+npm install -g @agentclientprotocol/codex-acp          # ChatGPT/Codex subscription
+
+cargo build --release -p goose-cli
+cp target/release/goose ~/.local/bin/goose
+```
+
+Log in once with each vendor's own CLI (`claude`, `codex login`) — gooseherd
+inherits those sessions and never needs API keys for them. API-key and local
+providers (ollama, openrouter, …) work exactly as in upstream goose and can be
+assigned to any role.
+
+A minimal `~/.config/goose/config.yaml` for the split-role setup:
+
+```yaml
+GOOSE_PROVIDER: claude-acp
+GOOSE_MODEL: default
+GOOSE_PLANNER_PROVIDER: claude-acp
+GOOSE_PLANNER_MODEL: default
+GOOSE_REVIEWER_PROVIDER: claude-acp
+GOOSE_REVIEWER_MODEL: default
+GOOSE_IMPLEMENTER_PROVIDER: codex-acp
+GOOSE_IMPLEMENTER_MODEL: gpt-5.5
+GOOSE_ORCH_MAX_CYCLES: 3
+```
+
+Then, inside `goose session`:
+
+```
+/orch add input validation to the /login handler and cover it with tests
+```
+
+## Caveats
+
+This is a young fork, developed and tested on macOS. The orchestration loop,
+arena, ledger, and permission policy all work end-to-end, but expect rough
+edges — particularly around terminal rendering and headless runs of vendor
+CLIs that ship their own plugins. Issues and PRs are welcome; so is telling me
+the whole idea is wrong, if you can show your ledger.
+
+## Credits and license
+
+Built on [goose](https://github.com/aaif-goose/goose) by Block and the AAIF
+community (upstream README: [README.upstream.md](README.upstream.md)).
+Apache-2.0, same as upstream. Not affiliated with Block, AAIF, Anthropic, or
+OpenAI. Model subscriptions are governed by their vendors' terms — this
+project only drives the vendors' own CLIs.
