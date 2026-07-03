@@ -506,6 +506,14 @@ impl CliSession {
                 console::style("●").red(),
                 console::style(format!("session closed · {}", &self.session_id)).dim()
             );
+            println!(
+                "  {}",
+                console::style(format!(
+                    "resume with: goose session --resume --session-id {}",
+                    &self.session_id
+                ))
+                .cyan()
+            );
         }
 
         result
