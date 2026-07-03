@@ -81,12 +81,66 @@ thread_local! {
     );
     static RESPONSE_BULLET_SHOWN: RefCell<bool> = const { RefCell::new(false) };
     static THINKING_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
+    static STATUS_INFO: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Spinner label showing which model is currently in control
 /// (e.g. "claude-acp/default working…"). None falls back to fun messages.
 pub fn set_thinking_context(context: Option<String>) {
     THINKING_CONTEXT.with(|c| *c.borrow_mut() = context);
+    redraw_status_bar();
+}
+
+/// Session summary shown in the pinned bottom status bar
+/// (provider/model · mode · ctx %). Set once per turn.
+pub fn set_status_info(info: String) {
+    STATUS_INFO.with(|c| *c.borrow_mut() = Some(info));
+    redraw_status_bar();
+}
+
+/// Redraw the bottom-pinned status bar. Uses a DECSTBM scroll region so the
+/// last terminal row never scrolls: output (and the input prompt) live in
+/// rows 1..h-1, the bar owns row h. Re-applied on every redraw, which also
+/// adapts to window resizes.
+pub fn redraw_status_bar() {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let term = console::Term::stdout();
+    let (rows, cols) = term.size();
+    if rows < 6 || cols < 20 {
+        return;
+    }
+    let info = STATUS_INFO.with(|c| c.borrow().clone());
+    let Some(info) = info else { return };
+    let phase = get_thinking_context().unwrap_or_else(|| "ready".to_string());
+    let mut text = format!(" {} · {}", info, phase);
+    let budget = cols as usize - 1;
+    if console::measure_text_width(&text) > budget {
+        text = console::truncate_str(&text, budget, "…").to_string();
+    }
+    let pad = budget.saturating_sub(console::measure_text_width(&text));
+    let bar = style(format!("{}{}", text, " ".repeat(pad)))
+        .color256(252)
+        .on_color256(236);
+    print!(
+        "\x1b7\x1b[1;{}r\x1b[{};1H\x1b[2K{}\x1b8",
+        rows - 1,
+        rows,
+        bar
+    );
+    let _ = std::io::stdout().flush();
+}
+
+/// Remove the status bar and give the last row back to the scroll region.
+pub fn clear_status_bar() {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let term = console::Term::stdout();
+    let (rows, _cols) = term.size();
+    print!("\x1b7\x1b[{};1H\x1b[2K\x1b[r\x1b8", rows);
+    let _ = std::io::stdout().flush();
 }
 
 fn get_thinking_context() -> Option<String> {
