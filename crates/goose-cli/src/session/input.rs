@@ -151,6 +151,20 @@ pub fn get_input(
         rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
     );
 
+    // Shift+Enter → newline. Terminals can't distinguish Shift+Enter from
+    // Enter by default; these cover the two ways it becomes distinguishable:
+    // ESC+CR (Alt/Meta-Enter, and what iTerm2/VS Code/Windows Terminal send
+    // when configured like Claude Code's /terminal-setup) and the kitty
+    // keyboard protocol's modifier-aware Enter (kitty/WezTerm/Ghostty/foot).
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Enter, rustyline::Modifiers::ALT),
+        rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
+    );
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Enter, rustyline::Modifiers::SHIFT),
+        rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
+    );
+
     editor.bind_sequence(
         rustyline::KeyEvent(rustyline::KeyCode::Char('c'), rustyline::Modifiers::CTRL),
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
