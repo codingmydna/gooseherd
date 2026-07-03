@@ -29,6 +29,7 @@ struct Contestant {
     provider: String,
     model: String,
     worktree: PathBuf,
+    log_path: PathBuf,
     duration_secs: f64,
     exit_ok: bool,
     diff: String,
@@ -44,6 +45,12 @@ fn parse_lineup(spec: &str) -> Vec<(String, String)> {
                 .map(|(p, m)| (p.trim().to_string(), m.trim().to_string()))
         })
         .collect()
+}
+
+fn log_stdio(path: &std::path::Path) -> (std::process::Stdio, std::process::Stdio) {
+    std::fs::File::create(path)
+        .and_then(|file| file.try_clone().map(|clone| (file.into(), clone.into())))
+        .unwrap_or_else(|_| (std::process::Stdio::null(), std::process::Stdio::null()))
 }
 
 fn git(dir: &std::path::Path, args: &[&str]) -> Result<String> {
@@ -158,8 +165,10 @@ impl CliSession {
             let model = model.clone();
             let worktree_c = worktree.clone();
             let label_c = label.clone();
+            let log_path = arena_root.join(format!("{}.log", label));
             let handle = tokio::spawn(async move {
                 let started = Instant::now();
+                let (stdout_log, stderr_log) = log_stdio(&log_path);
                 let child = tokio::process::Command::new(&goose_bin)
                     .args(["run", "--no-session", "-t", &prompt])
                     .current_dir(&worktree_c)
@@ -167,8 +176,8 @@ impl CliSession {
                     .env("GOOSE_MODEL", &model)
                     .env("GOOSE_MODE", "auto")
                     .env("GOOSE_ACP_PLAN_EXPLORE", "false")
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stdout(stdout_log)
+                    .stderr(stderr_log)
                     .spawn();
                 let exit_ok = match child {
                     Ok(mut child) => {
@@ -193,6 +202,7 @@ impl CliSession {
                     provider,
                     model,
                     worktree_c,
+                    log_path,
                     started.elapsed(),
                     exit_ok,
                 )
@@ -207,7 +217,7 @@ impl CliSession {
         output::show_thinking();
         let mut contestants = Vec::new();
         for handle in handles {
-            let (label, provider, model, worktree, elapsed, exit_ok) = handle.await?;
+            let (label, provider, model, worktree, log_path, elapsed, exit_ok) = handle.await?;
             let diff = git(&worktree, &["diff", "HEAD"]).unwrap_or_default();
             let untracked =
                 git(&worktree, &["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
@@ -223,6 +233,7 @@ impl CliSession {
                 provider,
                 model,
                 worktree,
+                log_path,
                 duration_secs: elapsed.as_secs_f64(),
                 exit_ok,
                 diff: safe_truncate(&full_diff, DIFF_CHAR_LIMIT),
@@ -255,6 +266,13 @@ impl CliSession {
                 "",
                 style(format!("↳ {}", c.worktree.display())).dim()
             );
+            if !c.exit_ok {
+                println!(
+                    "  {:<16} {}",
+                    "",
+                    style(format!("↳ log: {}", c.log_path.display())).dim()
+                );
+            }
         }
 
         // Blind judging by the reviewer role.
