@@ -60,16 +60,29 @@ impl ProviderDef for CodexAcpProvider {
                 .resolve(CODEX_ACP_PROVIDER_NAME)?;
             let env = vec![];
             let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
+            let plan_explore = config
+                .get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")
+                .unwrap_or(false);
             let mcp_servers = extension_configs_to_mcp_servers(&extensions);
 
             // fixed goose mode via -c overrides until session/set-mode works
-            let (approval_policy, sandbox_mode) = map_goose_mode(goose_mode);
+            let (approval_policy, sandbox_mode) = if plan_explore {
+                // Plan-Explore: read-only sandbox blocks writes; permission
+                // requests are answered by goose's kind-based policy.
+                ("on-request", "read-only")
+            } else {
+                map_goose_mode(goose_mode)
+            };
             let mut args = vec![
                 "-c".to_string(),
                 format!("approval_policy={approval_policy}"),
                 "-c".to_string(),
                 format!("sandbox_mode={sandbox_mode}"),
             ];
+
+            if let Ok(effort) = config.get_param::<String>("GOOSE_CODEX_REASONING_EFFORT") {
+                args.extend(["-c".to_string(), format!("model_reasoning_effort={effort}")]);
+            }
 
             // Codex sandbox blocks network by default. Enable it when HTTP MCP
             // servers are configured so codex-acp can connect to them.
@@ -83,11 +96,12 @@ impl ProviderDef for CodexAcpProvider {
                 ]);
             }
 
+            // codex-acp advertises: read-only, agent, agent-full-access.
             // Chat and Approve both map to "read-only".
             let mode_mapping = HashMap::from([
-                (GooseMode::Auto, "full-access".to_string()),
+                (GooseMode::Auto, "agent-full-access".to_string()),
                 (GooseMode::Approve, "read-only".to_string()),
-                (GooseMode::SmartApprove, "auto".to_string()),
+                (GooseMode::SmartApprove, "agent".to_string()),
                 (GooseMode::Chat, "read-only".to_string()),
             ]);
 
@@ -104,6 +118,7 @@ impl ProviderDef for CodexAcpProvider {
                 model_config_option_id: None,
                 mode_mapping,
                 notification_callback: None,
+                plan_explore,
             };
 
             let metadata = Self::metadata();
