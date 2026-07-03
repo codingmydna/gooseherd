@@ -29,6 +29,7 @@ pub enum InputResult {
     Btw(String),
     Roles(Option<String>),
     Stats,
+    Preset(Option<String>),
     Arena(String),
     Clear,
     Recipe(Option<String>),
@@ -87,6 +88,44 @@ impl rustyline::ConditionalEventHandler for CtrlCHandler {
 
             Some(rustyline::Cmd::Repaint)
         }
+    }
+}
+
+struct PresetCycler {
+    completion_cache: Arc<std::sync::RwLock<CompletionCache>>,
+}
+
+impl rustyline::ConditionalEventHandler for PresetCycler {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: u16,
+        _positive: bool,
+        _ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        let presets = super::ux::load_presets();
+        let flash = if presets.is_empty() {
+            "no presets yet — save one with /preset save <name>".to_string()
+        } else {
+            let names: Vec<&String> = presets.keys().collect();
+            let active = Config::global()
+                .get_param::<String>("GOOSE_ACTIVE_PRESET")
+                .unwrap_or_default();
+            let idx = names
+                .iter()
+                .position(|n| **n == active)
+                .map(|i| (i + 1) % names.len())
+                .unwrap_or(0);
+            let next = names[idx].clone();
+            match super::ux::apply_preset(&next) {
+                Ok(spec) => format!("preset → {} · {}", next, spec),
+                Err(e) => format!("preset error: {}", e),
+            }
+        };
+        if let Ok(mut cache) = self.completion_cache.write() {
+            cache.flash = Some(flash);
+        }
+        Some(rustyline::Cmd::Repaint)
     }
 }
 
@@ -167,11 +206,22 @@ pub fn get_input(
     );
 
     editor.bind_sequence(
-        rustyline::KeyEvent(rustyline::KeyCode::Char('c'), rustyline::Modifiers::CTRL),
-        rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
+        rustyline::KeyEvent(rustyline::KeyCode::BackTab, rustyline::Modifiers::NONE),
+        rustyline::EventHandler::Conditional(Box::new(PresetCycler {
+            completion_cache: completion_cache.clone(),
+        })),
     );
 
-    let input = match editor.readline("> ") {
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Char('c'), rustyline::Modifiers::CTRL),
+        rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache.clone()))),
+    );
+
+    let readline_result = editor.readline("> ");
+    if let Ok(mut cache) = completion_cache.write() {
+        cache.flash = None;
+    }
+    let input = match readline_result {
         Ok(text) => text,
         Err(e) => match e {
             rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
@@ -313,6 +363,10 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_STATUS => Some(InputResult::Status),
         s if s == CMD_USAGE => Some(InputResult::UsageInfo),
         "/stats" => Some(InputResult::Stats),
+        "/preset" => Some(InputResult::Preset(None)),
+        s if s.starts_with("/preset ") => Some(InputResult::Preset(Some(
+            s.get("/preset".len()..).unwrap_or("").trim().to_string(),
+        ))),
         s if s == "/arena" || s.starts_with("/arena ") => Some(InputResult::Arena(
             s.get("/arena".len()..).unwrap_or("").trim().to_string(),
         )),
@@ -466,6 +520,7 @@ fn print_help() {
 /arena [lineup=provider/model,...] <task> - Run the same task on each contestant in isolated git worktrees, then blind-judge the diffs (GOOSE_ARENA_LINEUP, GOOSE_ARENA_TIMEOUT_SECS)
 /btw <question> - Ask a side question (answered by the planner model) without adding it to the session history
 /roles [role=provider/model ...] - Show or change /orch role assignments in-session (also effort=<level>, cycles=<n>)
+/preset [save <name> | <name> | delete <name>] - Save/apply/delete role presets; bare /preset opens a picker. Shift+Tab cycles presets at the prompt
                         If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.
                         To warm up goose before using '/plan', we recommend setting '/mode approve' & putting appropriate context into goose.
                         The model is used based on $GOOSE_PLANNER_PROVIDER and $GOOSE_PLANNER_MODEL environment variables.

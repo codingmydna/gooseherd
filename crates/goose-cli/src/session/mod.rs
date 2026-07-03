@@ -201,6 +201,7 @@ pub struct CompletionCache {
     pub last_updated: Instant,
     pub hint_status: HintStatus,
     pub status_line: Option<String>,
+    pub flash: Option<String>,
 }
 
 impl CompletionCache {
@@ -211,6 +212,7 @@ impl CompletionCache {
             last_updated: Instant::now(),
             hint_status: HintStatus::Default,
             status_line: None,
+            flash: None,
         }
     }
 }
@@ -678,6 +680,12 @@ impl CliSession {
             }
             InputResult::Stats => {
                 if let Err(e) = self.handle_stats().await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::Preset(args) => {
+                history.save(editor);
+                if let Err(e) = self.handle_preset(args).await {
                     output::render_error(&e.to_string());
                 }
             }

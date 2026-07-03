@@ -68,6 +68,108 @@ fn role_desc(role: &RoleConfig) -> String {
     desc
 }
 
+/// Apply a whitespace-separated roles spec ("planner=prov/model
+/// implementer.effort=high cycles=2"). Returns human-readable errors for
+/// tokens that could not be applied. Synchronous so key bindings can use it.
+pub(super) fn apply_roles_spec(spec: &str) -> Vec<String> {
+    let config = Config::global();
+    let mut errors = Vec::new();
+    for token in spec.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            errors.push(format!(
+                "Invalid assignment '{}'. Use role=provider/model, <role>.effort=<level>, or cycles=<n>.",
+                token
+            ));
+            continue;
+        };
+        let result: std::result::Result<(), String> = match key {
+            "planner" | "implementer" | "reviewer" => match value.split_once('/') {
+                Some((provider, model)) => {
+                    let upper = key.to_uppercase();
+                    config
+                        .set_param(&format!("GOOSE_{}_PROVIDER", upper), provider)
+                        .and_then(|_| config.set_param(&format!("GOOSE_{}_MODEL", upper), model))
+                        .map_err(|e| e.to_string())
+                }
+                None => Err(format!("Invalid value '{}'. Use {}=<provider>/<model>.", value, key)),
+            },
+            "planner.effort" | "implementer.effort" | "reviewer.effort" | "effort" => {
+                let role = key.strip_suffix(".effort").unwrap_or("implementer");
+                let mut r = config
+                    .set_param(&format!("GOOSE_{}_EFFORT", role.to_uppercase()), value)
+                    .map_err(|e| e.to_string());
+                // codex-acp reads reasoning effort through its own -c flag,
+                // so mirror the implementer effort there as well.
+                if r.is_ok() && role == "implementer" {
+                    r = config
+                        .set_param("GOOSE_CODEX_REASONING_EFFORT", value)
+                        .map_err(|e| e.to_string());
+                }
+                r
+            }
+            "cycles" => match value.parse::<u32>() {
+                Ok(n) if n >= 1 => config
+                    .set_param("GOOSE_ORCH_MAX_CYCLES", n)
+                    .map_err(|e| e.to_string()),
+                _ => Err("cycles must be a positive integer".to_string()),
+            },
+            _ => Err(format!(
+                "Unknown key '{}'. Valid: planner, implementer, reviewer, <role>.effort, effort, cycles.",
+                key
+            )),
+        };
+        if let Err(e) = result {
+            errors.push(e);
+        }
+    }
+    errors
+}
+
+/// Serialize the currently resolved roles into a spec string /preset can store.
+pub(super) fn current_roles_spec() -> Result<String> {
+    let roles = resolve_all_roles()?;
+    let mut parts = Vec::new();
+    for (name, role) in [
+        ("planner", &roles.planner),
+        ("implementer", &roles.implementer),
+        ("reviewer", &roles.reviewer),
+    ] {
+        parts.push(format!("{}={}/{}", name, role.provider_name, role.model));
+        if let Some(effort) = &role.effort {
+            parts.push(format!("{}.effort={}", name, effort));
+        }
+    }
+    Ok(parts.join(" "))
+}
+
+pub(super) type PresetMap = std::collections::BTreeMap<String, String>;
+
+pub(super) fn load_presets() -> PresetMap {
+    Config::global()
+        .get_param::<PresetMap>("GOOSE_ROLE_PRESETS")
+        .unwrap_or_default()
+}
+
+pub(super) fn save_presets(presets: &PresetMap) -> Result<()> {
+    Config::global().set_param("GOOSE_ROLE_PRESETS", presets)?;
+    Ok(())
+}
+
+/// Apply a named preset. Returns its spec on success. Synchronous so the
+/// Shift+Tab cycler can call it from a key binding.
+pub(super) fn apply_preset(name: &str) -> std::result::Result<String, String> {
+    let presets = load_presets();
+    let Some(spec) = presets.get(name) else {
+        return Err(format!("Unknown preset '{}'", name));
+    };
+    let errors = apply_roles_spec(spec);
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    let _ = Config::global().set_param("GOOSE_ACTIVE_PRESET", name);
+    Ok(spec.clone())
+}
+
 fn print_roles_table() {
     match resolve_all_roles() {
         Ok(roles) => {
@@ -452,51 +554,100 @@ impl CliSession {
         Ok(())
     }
 
+    pub(super) async fn handle_preset(&self, args: Option<String>) -> Result<()> {
+        let args = args.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let mut presets = load_presets();
+
+        match args.as_deref() {
+            Some(rest) if rest.starts_with("save ") || rest == "save" => {
+                let name = rest.strip_prefix("save").unwrap_or("").trim();
+                if name.is_empty() {
+                    output::render_error("Usage: /preset save <name>");
+                    return Ok(());
+                }
+                let spec = current_roles_spec()?;
+                presets.insert(name.to_string(), spec.clone());
+                save_presets(&presets)?;
+                let _ = Config::global().set_param("GOOSE_ACTIVE_PRESET", name);
+                println!(
+                    "\n  {} {}",
+                    style(format!("✔ preset '{}' saved:", name)).green(),
+                    style(spec).dim()
+                );
+            }
+            Some(rest) if rest.starts_with("delete ") => {
+                let name = rest.strip_prefix("delete").unwrap_or("").trim();
+                if presets.remove(name).is_some() {
+                    save_presets(&presets)?;
+                    println!(
+                        "\n  {}",
+                        style(format!("✔ preset '{}' deleted", name)).green()
+                    );
+                } else {
+                    output::render_error(&format!("Unknown preset '{}'", name));
+                }
+            }
+            Some(name) => match apply_preset(name) {
+                Ok(_) => {
+                    println!(
+                        "\n  {}",
+                        style(format!("✔ preset '{}' applied", name)).green()
+                    );
+                    print_roles_table();
+                }
+                Err(e) => output::render_error(&e),
+            },
+            None => {
+                if presets.is_empty() {
+                    println!(
+                        "\n  {}",
+                        style("No presets yet. Save the current roles with: /preset save <name>")
+                            .dim()
+                    );
+                    return Ok(());
+                }
+                let active = Config::global()
+                    .get_param::<String>("GOOSE_ACTIVE_PRESET")
+                    .unwrap_or_default();
+                if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                    let mut select =
+                        cliclack::select("Pick a preset (Shift+Tab cycles at the prompt)");
+                    for (name, spec) in &presets {
+                        let label = if *name == active {
+                            format!("{} (active)", name)
+                        } else {
+                            name.clone()
+                        };
+                        select = select.item(name.clone(), label, safe_truncate(spec, 60));
+                    }
+                    if let Ok(choice) = select.interact() {
+                        match apply_preset(&choice) {
+                            Ok(_) => {
+                                println!(
+                                    "\n  {}",
+                                    style(format!("✔ preset '{}' applied", choice)).green()
+                                );
+                                print_roles_table();
+                            }
+                            Err(e) => output::render_error(&e),
+                        }
+                    }
+                } else {
+                    for (name, spec) in &presets {
+                        kv(name, spec);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn handle_roles(&self, spec: Option<String>) -> Result<()> {
-        let config = Config::global();
         let spec = spec.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
         if let Some(spec) = spec {
-            for token in spec.split_whitespace() {
-                let Some((key, value)) = token.split_once('=') else {
-                    output::render_error(&format!(
-                        "Invalid assignment '{}'. Use role=provider/model, effort=<level>, or cycles=<n>.",
-                        token
-                    ));
-                    continue;
-                };
-                match key {
-                    "planner" | "implementer" | "reviewer" => {
-                        let Some((provider, model)) = value.split_once('/') else {
-                            output::render_error(&format!(
-                                "Invalid value '{}'. Use {}=<provider>/<model>.",
-                                value, key
-                            ));
-                            continue;
-                        };
-                        let upper = key.to_uppercase();
-                        config.set_param(&format!("GOOSE_{}_PROVIDER", upper), provider)?;
-                        config.set_param(&format!("GOOSE_{}_MODEL", upper), model)?;
-                    }
-                    "planner.effort" | "implementer.effort" | "reviewer.effort" | "effort" => {
-                        let role = key.strip_suffix(".effort").unwrap_or("implementer");
-                        config
-                            .set_param(&format!("GOOSE_{}_EFFORT", role.to_uppercase()), value)?;
-                        // codex-acp reads reasoning effort through its own -c flag,
-                        // so mirror the implementer effort there as well.
-                        if role == "implementer" {
-                            config.set_param("GOOSE_CODEX_REASONING_EFFORT", value)?;
-                        }
-                    }
-                    "cycles" => match value.parse::<u32>() {
-                        Ok(n) if n >= 1 => config.set_param("GOOSE_ORCH_MAX_CYCLES", n)?,
-                        _ => output::render_error("cycles must be a positive integer"),
-                    },
-                    _ => output::render_error(&format!(
-                        "Unknown key '{}'. Valid: planner, implementer, reviewer, <role>.effort, effort, cycles.",
-                        key
-                    )),
-                }
+            for err in apply_roles_spec(&spec) {
+                output::render_error(&err);
             }
         }
 

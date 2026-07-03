@@ -35,6 +35,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/orch", "Plan → implement → review loop across models"),
     ("/roles", "Show or change orchestration roles/effort"),
+    ("/preset", "Save/apply role presets; Shift+Tab cycles"),
     ("/btw", "Side question in the background, history untouched"),
     ("/plan", "Enter plan mode"),
     ("/endplan", "Exit plan mode"),
@@ -492,6 +493,10 @@ impl Hinter for GooseCompleter {
                 return slash_command_hint(line);
             }
             return None;
+        }
+
+        if let Some(flash) = &cache.flash {
+            return Some(flash.clone());
         }
 
         match cache.hint_status {
