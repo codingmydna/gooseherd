@@ -103,6 +103,42 @@ Then, inside `goose session`:
 /orch add input validation to the /login handler and cover it with tests
 ```
 
+## Coming from Claude Code or Codex CLI
+
+Most of what your hands already know keeps working. The mapping:
+
+| You're used to | Here |
+|---|---|
+| `claude` / `codex` | `goose session` |
+| `claude --resume <id>` | `goose session --resume --session-id <id>` (printed on every exit) |
+| `claude --continue` | `goose session -r` |
+| Plan mode / read-only exploration | automatic for the planner and reviewer roles in `/orch` |
+| `/compact`, `/clear`, `/model` | same commands |
+| Shift+Tab mode cycling | Shift+Tab cycles role presets (`/preset save <name>` first) |
+| `/cost`, `/context` | `/usage`, `/status`, `/stats` |
+| Side questions without derailing the session | `/btw <question>` |
+| CLAUDE.md / AGENTS.md project memory | AGENTS.md and .goosehints work as before (upstream goose behavior) |
+
+Your existing vendor logins are reused as-is — if `claude` and `codex` work in
+your terminal, gooseherd's ACP providers work too. Skills and plugins you
+installed for those CLIs also load, because the actual vendor CLI is what runs
+under the hood.
+
+Run `goose herd` for a first-time checkup that verifies logins and adapters
+and offers to write the recommended role config.
+
+## Troubleshooting
+
+- `could not resolve command 'claude-agent-acp'` — the adapter isn't
+  installed: `npm install -g @agentclientprotocol/claude-agent-acp` (and make
+  sure `claude` itself is logged in). Same pattern for `codex-acp`.
+- An /arena contestant times out with no changes — check its log at
+  `.goose-arena/<label>.log`; vendor-CLI plugins that prompt interactively are
+  the usual suspect in headless runs.
+- The planner "can't do anything" — its session is read-only by design; it
+  can read, search, and spawn read-only subagents, but edits and shell are
+  denied (`GOOSE_PLAN_ALLOW_EXEC: true` relaxes shell).
+
 ## Caveats
 
 This is a young fork, developed and tested on macOS. The orchestration loop,
