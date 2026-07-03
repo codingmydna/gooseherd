@@ -65,8 +65,65 @@ fn print_roles_table() {
     }
 }
 
+/// ExternalPrinter substitute for contexts where rustyline isn't active
+/// (live commands issued while a turn is streaming).
+pub(super) struct StdoutPrinter;
+
+impl rustyline::ExternalPrinter for StdoutPrinter {
+    fn print(&mut self, msg: String) -> rustyline::Result<()> {
+        print!("{}", msg);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        Ok(())
+    }
+}
+
 impl CliSession {
-    pub(super) async fn handle_status(&mut self) -> Result<()> {
+    /// Dispatch a slash command typed while a turn is streaming. Read-only
+    /// commands only; anything else gets a hint instead of mutating state
+    /// mid-turn.
+    pub(super) async fn handle_live_command(&self, line: &str) {
+        let cmd = line.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        output::hide_thinking();
+        let result = if cmd == "/status" {
+            self.handle_status().await
+        } else if cmd == "/stats" {
+            self.handle_stats().await
+        } else if cmd == "/usage" {
+            self.handle_usage().await
+        } else if cmd == "/roles" {
+            self.handle_roles(None).await
+        } else if let Some(q) = cmd.strip_prefix("/btw") {
+            self.handle_btw(q.trim().to_string(), Some(StdoutPrinter))
+                .await
+        } else if cmd.starts_with('/') {
+            println!(
+                "\n  {}",
+                style(
+                    "live commands while the agent runs: /status /stats /usage /roles /btw <question>"
+                )
+                .dim()
+            );
+            Ok(())
+        } else {
+            println!(
+                "\n  {}",
+                style(
+                    "agent is running — plain input is ignored; use /btw <question> for a side question"
+                )
+                .dim()
+            );
+            Ok(())
+        };
+        if let Err(e) = result {
+            output::render_error(&e.to_string());
+        }
+        output::show_thinking();
+    }
+
+    pub(super) async fn handle_status(&self) -> Result<()> {
         let config = Config::global();
         let provider = self.agent.provider().await?;
         let provider_name = provider.get_name().to_string();
@@ -149,7 +206,7 @@ impl CliSession {
         Ok(())
     }
 
-    pub(super) async fn handle_usage(&mut self) -> Result<()> {
+    pub(super) async fn handle_usage(&self) -> Result<()> {
         let session = self.get_session().await?;
         println!();
         section("usage (this session)");
@@ -174,7 +231,7 @@ impl CliSession {
         Ok(())
     }
 
-    pub(super) async fn handle_btw<P>(&mut self, question: String, printer: Option<P>) -> Result<()>
+    pub(super) async fn handle_btw<P>(&self, question: String, printer: Option<P>) -> Result<()>
     where
         P: rustyline::ExternalPrinter + Send + 'static,
     {
@@ -260,7 +317,7 @@ impl CliSession {
         Ok(())
     }
 
-    pub(super) async fn handle_stats(&mut self) -> Result<()> {
+    pub(super) async fn handle_stats(&self) -> Result<()> {
         let records = ledger::read_all();
         if records.is_empty() {
             println!(
@@ -368,7 +425,7 @@ impl CliSession {
         Ok(())
     }
 
-    pub(super) async fn handle_roles(&mut self, spec: Option<String>) -> Result<()> {
+    pub(super) async fn handle_roles(&self, spec: Option<String>) -> Result<()> {
         let config = Config::global();
         let spec = spec.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 

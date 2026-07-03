@@ -80,6 +80,17 @@ thread_local! {
         Config::global().get_param::<bool>("GOOSE_SHOW_FULL_OUTPUT").unwrap_or(false)
     );
     static RESPONSE_BULLET_SHOWN: RefCell<bool> = const { RefCell::new(false) };
+    static THINKING_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Spinner label showing which model is currently in control
+/// (e.g. "claude-acp/default working…"). None falls back to fun messages.
+pub fn set_thinking_context(context: Option<String>) {
+    THINKING_CONTEXT.with(|c| *c.borrow_mut() = context);
+}
+
+fn get_thinking_context() -> Option<String> {
+    THINKING_CONTEXT.with(|c| c.borrow().clone())
 }
 
 /// Reset the per-response bullet so the next assistant text block gets a fresh `●`.
@@ -141,8 +152,10 @@ pub struct ThinkingIndicator {
 impl ThinkingIndicator {
     pub fn show(&mut self) {
         let spinner = cliclack::spinner();
-        let hint = style("(Ctrl+C to interrupt)").dim();
-        if Config::global()
+        let hint = style("(Ctrl+C to interrupt · /status /stats /btw work while running)").dim();
+        if let Some(context) = get_thinking_context() {
+            spinner.start(format!("{}  {}", context, hint));
+        } else if Config::global()
             .get_param("RANDOM_THINKING_MESSAGES")
             .unwrap_or(true)
         {
@@ -469,7 +482,7 @@ pub fn goose_mode_message(text: &str) {
 fn should_show_thinking() -> bool {
     Config::global()
         .get_param::<bool>("GOOSE_CLI_SHOW_THINKING")
-        .unwrap_or(false)
+        .unwrap_or(true)
         && std::io::stdout().is_terminal()
 }
 

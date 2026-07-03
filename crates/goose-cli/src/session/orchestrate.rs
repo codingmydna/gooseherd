@@ -16,7 +16,7 @@ const EVIDENCE_CHAR_LIMIT: usize = 30_000;
 const PLAN_SYSTEM_PROMPT: &str = r#"You are the planning lead in a two-model workflow. A separate implementer model will execute your plan with file-editing and shell tools. Your session is read-only: you can explore the working directory but cannot modify anything.
 
 Produce a concrete, step-by-step implementation plan for the given task:
-- Explore ONLY by reading files directly (read/list/grep). Subagent delegation, task spawning, and shell commands WILL BE DENIED by policy — do not attempt them, and do not retry denied calls.
+- Explore freely: read files, search, and delegate read-only subagent explorations (in parallel when useful). File modifications will be denied by policy; shell commands are denied unless the session allows them — do not retry denied calls.
 - List the files to create or modify and what changes each needs.
 - Define acceptance criteria and how the implementer should verify the result (commands to run, expected output).
 - Keep the plan focused; do not attempt to implement the changes yourself.
@@ -348,7 +348,14 @@ impl CliSession {
             task,
         };
 
-        phase_banner("phase: plan");
+        phase_banner(&format!(
+            "phase: plan · {}/{}",
+            planner_role.provider_name, planner_role.model
+        ));
+        output::set_thinking_context(Some(format!(
+            "planner {}/{} working…",
+            planner_role.provider_name, planner_role.model
+        )));
         let phase_started = Instant::now();
         let (planner, planner_model) = build_role_provider(planner_role).await?;
         output::show_thinking();
@@ -409,8 +416,8 @@ impl CliSession {
 
         for cycle in 1..=max_cycles {
             phase_banner(&format!(
-                "phase: implement (cycle {}/{})",
-                cycle, max_cycles
+                "phase: implement (cycle {}/{}) · {}/{}",
+                cycle, max_cycles, implementer_role.provider_name, implementer_role.model
             ));
             let phase_started = Instant::now();
             let usage_before = self
@@ -457,7 +464,14 @@ impl CliSession {
                 None,
             );
 
-            phase_banner(&format!("phase: review (cycle {}/{})", cycle, max_cycles));
+            phase_banner(&format!(
+                "phase: review (cycle {}/{}) · {}/{}",
+                cycle, max_cycles, reviewer_role.provider_name, reviewer_role.model
+            ));
+            output::set_thinking_context(Some(format!(
+                "reviewer {}/{} working…",
+                reviewer_role.provider_name, reviewer_role.model
+            )));
             let phase_started = Instant::now();
             let implementer_report = self
                 .messages

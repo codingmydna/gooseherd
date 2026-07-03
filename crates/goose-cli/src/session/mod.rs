@@ -5,6 +5,7 @@ mod elicitation;
 mod export;
 mod input;
 mod ledger;
+mod live_input;
 mod orchestrate;
 mod output;
 pub mod streaming_buffer;
@@ -1204,6 +1205,19 @@ impl CliSession {
             .last()
             .ok_or_else(|| anyhow::anyhow!("No user message"))?;
 
+        if interactive {
+            if let (Ok(provider), Ok(model_config)) = (
+                self.agent.provider().await,
+                self.agent.model_config_for_session(&self.session_id).await,
+            ) {
+                output::set_thinking_context(Some(format!(
+                    "{}/{} working…",
+                    provider.get_name(),
+                    model_config.model_name
+                )));
+            }
+        }
+
         let cancel_token_interrupt = cancel_token.clone();
         let handle = tokio::spawn(async move {
             if ctrl_c().await.is_ok() {
@@ -1229,6 +1243,15 @@ impl CliSession {
         let run_started = Instant::now();
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
+
+        // Live slash commands while the turn streams (/status, /stats, /btw…).
+        let mut live_stdin = if interactive {
+            live_input::LiveStdin::enable()
+        } else {
+            None
+        };
+        let mut live_tick = tokio::time::interval(std::time::Duration::from_millis(150));
+        live_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         use futures::StreamExt;
         loop {
@@ -1405,8 +1428,16 @@ impl CliSession {
                     }
                     break;
                 }
+                _ = live_tick.tick(), if live_stdin.is_some() => {
+                    if let Some(ls) = live_stdin.as_mut() {
+                        while let Some(line) = ls.poll_line() {
+                            self.handle_live_command(&line).await;
+                        }
+                    }
+                }
             }
         }
+        drop(live_stdin);
 
         if !is_json_mode && !is_stream_json_mode {
             output::flush_markdown_buffer_current_theme(&mut markdown_buffer);
