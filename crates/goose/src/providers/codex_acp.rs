@@ -57,7 +57,15 @@ impl ProviderDef for CodexAcpProvider {
             // with_npm() includes npm global bin dir (desktop app PATH may not)
             let resolved_command = SearchPaths::builder()
                 .with_npm()
-                .resolve(CODEX_ACP_PROVIDER_NAME)?;
+                .resolve(CODEX_ACP_PROVIDER_NAME)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "{CODEX_ACP_PROVIDER_NAME} not found — install it with: \
+                         npm install -g @agentclientprotocol/codex-acp \
+                         (requires an active Codex login: run `codex login` once). \
+                         Then run `goose herd` to verify your setup."
+                    )
+                })?;
             let env = vec![];
             let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
             let mcp_servers = extension_configs_to_mcp_servers(&extensions);

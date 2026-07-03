@@ -58,7 +58,15 @@ impl ProviderDef for ClaudeAcpProvider {
             // with_npm() includes npm global bin dir (desktop app PATH may not)
             let resolved_command = SearchPaths::builder()
                 .with_npm()
-                .resolve(CLAUDE_ACP_BINARY)?;
+                .resolve(CLAUDE_ACP_BINARY)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "{CLAUDE_ACP_BINARY} not found — install it with: \
+                         npm install -g @agentclientprotocol/claude-agent-acp \
+                         (requires an active Claude Code login: run `claude` once). \
+                         Then run `goose herd` to verify your setup."
+                    )
+                })?;
             let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
 
             let mode_mapping = HashMap::from([

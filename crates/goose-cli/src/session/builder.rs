@@ -591,25 +591,13 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
                         fallback_model_config,
                     ),
                     Err(e2) => {
-                        output::render_error(&format!(
-                        "Error {}.\n\
-                        Please check your system keychain and run 'goose configure' again.\n\
-                        If your system is unable to use the keyring, please try setting secret key(s) via environment variables.\n\
-                        For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors",
-                        e2
-                    ));
+                        render_provider_create_error(&e2);
                         process::exit(1);
                     }
                 }
             }
             Err(e) => {
-                output::render_error(&format!(
-                "Error {}.\n\
-                Please check your system keychain and run 'goose configure' again.\n\
-                If your system is unable to use the keyring, please try setting secret key(s) via environment variables.\n\
-                For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors",
-                e
-            ));
+                render_provider_create_error(&e);
                 process::exit(1);
             }
         };
@@ -690,6 +678,24 @@ fn is_provider_unavailable_error(e: &anyhow::Error) -> bool {
     msg.contains("is not set")
         || msg.contains("not configured")
         || msg.contains("Configuration value not found")
+}
+
+// Errors that already carry install/login instructions (e.g. a missing ACP
+// adapter binary) should be shown as-is; the keychain hint only applies to
+// missing secrets.
+fn render_provider_create_error(e: &anyhow::Error) {
+    let msg = e.to_string();
+    if msg.contains("npm install -g") {
+        output::render_error(&msg);
+    } else {
+        output::render_error(&format!(
+            "Error {}.\n\
+            Please check your system keychain and run 'goose configure' again.\n\
+            If your system is unable to use the keyring, please try setting secret key(s) via environment variables.\n\
+            For more info, see: https://goose-docs.ai/docs/troubleshooting/#keychainkeyring-errors",
+            e
+        ));
+    }
 }
 
 #[cfg(test)]
