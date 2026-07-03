@@ -1281,7 +1281,11 @@ impl CliSession {
         let mut last_usage: Option<ProviderUsage> = None;
 
         // Live slash commands while the turn streams (/status, /stats, /btw…).
-        let mut live_stdin = if interactive {
+        let mut live_stdin = if interactive
+            && Config::global()
+                .get_param::<bool>("GOOSE_LIVE_INPUT")
+                .unwrap_or(false)
+        {
             live_input::LiveStdin::enable()
         } else {
             None

@@ -152,7 +152,7 @@ pub struct ThinkingIndicator {
 impl ThinkingIndicator {
     pub fn show(&mut self) {
         let spinner = cliclack::spinner();
-        let hint = style("(Ctrl+C to interrupt · /status /stats /btw work while running)").dim();
+        let hint = style("(Ctrl+C to interrupt)").dim();
         if let Some(context) = get_thinking_context() {
             spinner.start(format!("{}  {}", context, hint));
         } else if Config::global()
