@@ -36,6 +36,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/orch", "Plan → implement → review loop across models"),
     ("/roles", "Show or change orchestration roles/effort"),
     ("/preset", "Save/apply role presets; Shift+Tab cycles"),
+    ("/init", "Analyze the repo and write AGENTS.md"),
+    ("/remember", "Append a note to .goosehints project memory"),
     ("/btw", "Side question in the background, history untouched"),
     ("/plan", "Enter plan mode"),
     ("/endplan", "Exit plan mode"),

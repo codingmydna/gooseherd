@@ -690,6 +690,28 @@ impl CliSession {
                     output::render_error(&e.to_string());
                 }
             }
+            InputResult::Bash(cmd) => {
+                history.save(editor);
+                if let Err(e) = self.handle_bash(cmd).await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::InitProject => {
+                history.save(editor);
+                self.push_message(Message::user().with_text(
+                    "Analyze this repository and write an AGENTS.md file at the repo root (improve the existing one if present). Include: how to build/test/lint (real commands verified from the repo's config files), the directory structure that matters, code conventions you can infer, and any non-obvious gotchas. Keep it under 60 lines — terse, factual, no marketing. Then show me what you wrote.",
+                ));
+                output::show_thinking();
+                self.process_agent_response(true, CancellationToken::default())
+                    .await?;
+                output::hide_thinking();
+            }
+            InputResult::Remember(note) => {
+                history.save(editor);
+                if let Err(e) = self.handle_remember(note).await {
+                    output::render_error(&e.to_string());
+                }
+            }
             InputResult::Arena(args) => {
                 history.save(editor);
                 if let Err(e) = self.handle_arena(args).await {

@@ -117,6 +117,9 @@ Most of what your hands already know keeps working. The mapping:
 | Shift+Tab mode cycling | Shift+Tab cycles role presets (`/preset save <name>` first) |
 | `/cost`, `/context` | `/usage`, `/status`, `/stats` |
 | Side questions without derailing the session | `/btw <question>` |
+| `!command` shell passthrough | same — `!command`, output joins the context |
+| `/init` writing CLAUDE.md | `/init` writes AGENTS.md |
+| `#note` quick memory | `/remember <note>` → .goosehints |
 | CLAUDE.md / AGENTS.md project memory | AGENTS.md and .goosehints work as before (upstream goose behavior) |
 
 Your existing vendor logins are reused as-is — if `claude` and `codex` work in

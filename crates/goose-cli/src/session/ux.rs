@@ -554,6 +554,62 @@ impl CliSession {
         Ok(())
     }
 
+    pub(super) async fn handle_bash(&mut self, cmd: String) -> Result<()> {
+        println!("{} {}", style("$").cyan().bold(), style(&cmd).bold());
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stdout.trim().is_empty() {
+            print!("{}", stdout);
+        }
+        if !stderr.trim().is_empty() {
+            eprint!("{}", stderr);
+        }
+        let code = out.status.code().unwrap_or(-1);
+        println!(
+            "  {}",
+            style(format!(
+                "(exit {} · output added to conversation context)",
+                code
+            ))
+            .dim()
+        );
+        let mut combined = format!("{}{}", stdout, stderr);
+        combined = safe_truncate(&combined, 8_000);
+        self.push_message(Message::user().with_text(format!(
+            "I ran this shell command myself:\n$ {}\n(exit {})\n```\n{}\n```\nNo response needed — this is context for our conversation.",
+            cmd, code, combined
+        )));
+        Ok(())
+    }
+
+    pub(super) async fn handle_remember(&self, note: String) -> Result<()> {
+        let note = note.trim().to_string();
+        if note.is_empty() {
+            output::render_error("Usage: /remember <note> — appends to this project's .goosehints");
+            return Ok(());
+        }
+        let path = std::path::Path::new(".goosehints");
+        let mut content = std::fs::read_to_string(path).unwrap_or_default();
+        if content.is_empty() {
+            content.push_str("# Project notes\n");
+        }
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&format!("- {}\n", note));
+        std::fs::write(path, content)?;
+        println!(
+            "\n  {} {}",
+            style("✔ remembered in .goosehints:").green(),
+            style(note).dim()
+        );
+        Ok(())
+    }
+
     pub(super) async fn handle_preset(&self, args: Option<String>) -> Result<()> {
         let args = args.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         let mut presets = load_presets();

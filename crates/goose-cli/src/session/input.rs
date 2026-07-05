@@ -30,6 +30,9 @@ pub enum InputResult {
     Roles(Option<String>),
     Stats,
     Preset(Option<String>),
+    Bash(String),
+    InitProject,
+    Remember(String),
     Arena(String),
     Clear,
     Recipe(Option<String>),
@@ -235,6 +238,13 @@ pub fn get_input(
         editor.add_history_entry(input.as_str())?;
     }
 
+    // Shell passthrough: !<command> runs directly, output joins the context.
+    if let Some(cmd) = input.trim().strip_prefix('!') {
+        if !cmd.trim().is_empty() {
+            return Ok(InputResult::Bash(cmd.trim().to_string()));
+        }
+    }
+
     // Handle non-slash commands first
     if !input.starts_with('/') {
         let trimmed = input.trim();
@@ -364,6 +374,10 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_USAGE => Some(InputResult::UsageInfo),
         "/stats" => Some(InputResult::Stats),
         "/preset" => Some(InputResult::Preset(None)),
+        "/init" => Some(InputResult::InitProject),
+        s if s == "/remember" || s.starts_with("/remember ") => Some(InputResult::Remember(
+            s.get("/remember".len()..).unwrap_or("").trim().to_string(),
+        )),
         s if s.starts_with("/preset ") => Some(InputResult::Preset(Some(
             s.get("/preset".len()..).unwrap_or("").trim().to_string(),
         ))),
@@ -521,6 +535,9 @@ fn print_help() {
 /btw <question> - Ask a side question (answered by the planner model) without adding it to the session history
 /roles [role=provider/model ...] - Show or change /orch role assignments in-session (also effort=<level>, cycles=<n>)
 /preset [save <name> | <name> | delete <name>] - Save/apply/delete role presets; bare /preset opens a picker. Shift+Tab cycles presets at the prompt
+/init - Analyze this repository and write (or improve) AGENTS.md
+/remember <note> - Append a note to this project's .goosehints memory
+!<command> - Run a shell command directly; its output is added to the conversation context
                         If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.
                         To warm up goose before using '/plan', we recommend setting '/mode approve' & putting appropriate context into goose.
                         The model is used based on $GOOSE_PLANNER_PROVIDER and $GOOSE_PLANNER_MODEL environment variables.
