@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::{ledger, output, CliSession};
+use super::{ledger, output, plan_exemplars, CliSession};
 
 const MAX_CYCLES_KEY: &str = "GOOSE_ORCH_MAX_CYCLES";
 const PHASE_IDLE_TIMEOUT_KEY: &str = "GOOSE_ORCH_PHASE_IDLE_TIMEOUT_SECS";
@@ -719,6 +719,8 @@ fn record_gate_phase(
         task_preview: safe_truncate(meta.task, 120),
         permission_policy: None,
         permission_denials: None,
+        plan_exemplars_injected: None,
+        plan_exemplar_run_ids: None,
     });
 }
 
@@ -929,6 +931,7 @@ fn record_phase(
     elapsed_ms: u64,
     verdict: Option<&str>,
     policy: Option<&PhasePolicySummary>,
+    exemplar_injection: Option<&plan_exemplars::PlanExemplarInjection>,
 ) {
     let reported_model = usage.map(|u| u.model.clone());
     let (input_tokens, output_tokens) = usage
@@ -1014,6 +1017,9 @@ fn record_phase(
         permission_policy: policy.map(|policy| policy.name.clone()),
         permission_denials: policy.map(|policy| policy.denials),
         task_preview: safe_truncate(meta.task, 120),
+        plan_exemplars_injected: exemplar_injection.map(|injection| injection.injected),
+        plan_exemplar_run_ids: exemplar_injection
+            .map(|injection| injection.selected_run_ids.clone()),
     });
 }
 
@@ -1184,6 +1190,8 @@ impl CliSession {
         } else {
             Some(orch_phase_idle_timeout())
         };
+        let plan_exemplar_injection =
+            plan_exemplars::build_injection(task, &planner_role.provider_name);
 
         output::set_active_role_status(Some(output::ActiveRoleStatus {
             role: output::ActiveRole::Planner,
@@ -1191,8 +1199,10 @@ impl CliSession {
         }));
         phase_banner(
             &format!(
-                "phase: plan · {}/{}",
-                planner_role.provider_name, planner_role.model
+                "phase: plan · {}/{}{}",
+                planner_role.provider_name,
+                planner_role.model,
+                plan_exemplar_injection.banner_fragment()
             ),
             output::ActiveRole::Planner,
         );
@@ -1206,10 +1216,15 @@ impl CliSession {
         output::show_thinking();
         // ACP providers wrap full agent CLIs that may not receive our system prompt,
         // so the role instructions are embedded in the user message as well.
-        let plan_request = Message::user().with_text(format!(
+        let mut plan_request_text = format!(
             "{}\n\n---\n\nTask:\n{}\n\nWorking directory: {}",
             PLAN_SYSTEM_PROMPT, task, working_dir
-        ));
+        );
+        if let Some(prompt_section) = &plan_exemplar_injection.prompt_section {
+            plan_request_text.push_str("\n\n---\n\n");
+            plan_request_text.push_str(prompt_section);
+        }
+        let plan_request = Message::user().with_text(plan_request_text);
         let planner_system = role_system_prompt(PLAN_SYSTEM_PROMPT, planner_role);
         let (plan_text, plan_usage) = if let Some(timeout) = role_idle_timeout {
             stream_role_completion_with_idle_timeout(
@@ -1251,6 +1266,7 @@ impl CliSession {
             phase_started.elapsed().as_millis() as u64,
             None,
             None,
+            Some(&plan_exemplar_injection),
         );
 
         persist_artifact(&workspace.original_dir, &run_id, "plan.md", &plan_text);
@@ -1377,6 +1393,7 @@ impl CliSession {
                     phase_started.elapsed().as_millis() as u64,
                     None,
                     Some(&policy_summary),
+                    None,
                 );
 
                 if gates.is_empty() {
@@ -1526,9 +1543,22 @@ impl CliSession {
                 phase_started.elapsed().as_millis() as u64,
                 Some(verdict),
                 None,
+                None,
             );
 
             if approved {
+                plan_exemplars::archive_approved_plan(
+                    true,
+                    &plan_exemplars::ArchiveRequest {
+                        run_id: &run_id,
+                        task,
+                        plan_text: &plan_text,
+                        planner_provider: &planner_role.provider_name,
+                        planner_model: &planner_role.model,
+                        planner_context_limit,
+                        approved_at_ms: ledger::now_ms(),
+                    },
+                );
                 println!(
                     "{}",
                     console::style("orchestrate: reviewer approved the implementation.")

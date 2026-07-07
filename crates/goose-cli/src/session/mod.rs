@@ -9,6 +9,7 @@ mod ledger;
 mod live_input;
 mod orchestrate;
 mod output;
+mod plan_exemplars;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
