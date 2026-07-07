@@ -799,6 +799,27 @@ enum RecipeCommand {
 }
 
 #[derive(Subcommand)]
+enum WorktreeCommand {
+    /// Create a named worktree and branch
+    #[command(about = "Create a named worktree and branch")]
+    New {
+        #[arg(help = "Worktree name, used for .goose/worktrees/<name>")]
+        name: String,
+
+        #[arg(long, help = "Branch name to create instead of <name>-<YYYYMMDD>")]
+        branch: Option<String>,
+    },
+
+    /// List goose-managed worktrees
+    #[command(about = "List goose-managed worktrees")]
+    List,
+
+    /// Remove clean or merged goose-managed worktrees after confirmation
+    #[command(about = "Remove clean or merged goose-managed worktrees after confirmation")]
+    Prune,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Configure goose settings
     #[command(about = "Configure goose settings")]
@@ -946,6 +967,13 @@ enum Command {
     /// Open the last project directory
     #[command(about = "Open the last project directory", visible_alias = "p")]
     Project {},
+
+    /// Manage isolated git worktrees for parallel Goose sessions
+    #[command(about = "Manage isolated git worktrees for parallel Goose sessions")]
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
 
     /// List recent project directories
     #[command(about = "List recent project directories", visible_alias = "ps")]
@@ -1366,6 +1394,7 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Serve { .. }) => "serve",
         Some(Command::Session { .. }) => "session",
         Some(Command::Project {}) => "project",
+        Some(Command::Worktree { .. }) => "worktree",
         Some(Command::Projects) => "projects",
         Some(Command::Run { .. }) => "run",
         Some(Command::Orch { .. }) => "orch",
@@ -2323,6 +2352,7 @@ pub async fn cli() -> anyhow::Result<()> {
             handle_project_default()?;
             Ok(())
         }
+        Some(Command::Worktree { command }) => handle_worktree_subcommand(command),
         Some(Command::Projects) => {
             handle_projects_interactive()?;
             Ok(())
@@ -2422,6 +2452,16 @@ pub async fn cli() -> anyhow::Result<()> {
     }
 }
 
+fn handle_worktree_subcommand(command: WorktreeCommand) -> Result<()> {
+    match command {
+        WorktreeCommand::New { name, branch } => {
+            crate::commands::worktree::handle_new(name, branch)
+        }
+        WorktreeCommand::List => crate::commands::worktree::handle_list(),
+        WorktreeCommand::Prune => crate::commands::worktree::handle_prune(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2489,6 +2529,33 @@ mod tests {
                 command: SkillsCommand::List,
             }) => {}
             _ => panic!("expected skills list command"),
+        }
+    }
+
+    #[test]
+    fn worktree_new_accepts_branch_option() {
+        let cli = Cli::try_parse_from([
+            "goose",
+            "worktree",
+            "new",
+            "alpha",
+            "--branch",
+            "topic/alpha",
+        ])
+        .expect("parse failed");
+
+        match cli.command {
+            Some(Command::Worktree {
+                command:
+                    WorktreeCommand::New {
+                        name,
+                        branch: Some(branch),
+                    },
+            }) => {
+                assert_eq!(name, "alpha");
+                assert_eq!(branch, "topic/alpha");
+            }
+            _ => panic!("expected worktree new command"),
         }
     }
 

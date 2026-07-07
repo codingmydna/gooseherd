@@ -1,10 +1,12 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use console::style;
 use goose::config::Config;
 use goose::conversation::message::Message;
 use goose::utils::safe_truncate;
 use std::path::PathBuf;
 use std::time::Instant;
+
+use crate::worktree;
 
 use super::orchestrate::{build_role_provider, resolve_all_roles, RoleConfig};
 use super::{output, CliSession};
@@ -53,21 +55,6 @@ fn log_stdio(path: &std::path::Path) -> (std::process::Stdio, std::process::Stdi
         .unwrap_or_else(|_| (std::process::Stdio::null(), std::process::Stdio::null()))
 }
 
-fn git(dir: &std::path::Path, args: &[&str]) -> Result<String> {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
 impl CliSession {
     pub(super) async fn handle_arena(&mut self, args: String) -> Result<()> {
         let args = args.trim().to_string();
@@ -79,13 +66,14 @@ impl CliSession {
         }
 
         let config = Config::global();
-        let repo_root = match git(&std::env::current_dir()?, &["rev-parse", "--show-toplevel"]) {
-            Ok(root) => PathBuf::from(root.trim()),
-            Err(_) => {
-                output::render_error("/arena requires a git repository (worktree isolation).");
-                return Ok(());
-            }
-        };
+        let repo_root =
+            match worktree::git(&std::env::current_dir()?, &["rev-parse", "--show-toplevel"]) {
+                Ok(root) => PathBuf::from(root.trim()),
+                Err(_) => {
+                    output::render_error("/arena requires a git repository (worktree isolation).");
+                    return Ok(());
+                }
+            };
 
         let (lineup_spec, task) = if let Some(rest) = args.strip_prefix("lineup=") {
             let Some((lineup, task)) = rest.split_once(' ') else {
@@ -121,7 +109,9 @@ impl CliSession {
         );
 
         let goose_bin = std::env::current_exe()?;
-        let base_commit = git(&repo_root, &["rev-parse", "HEAD"])?.trim().to_string();
+        let base_commit = worktree::git(&repo_root, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
         let arena_root = repo_root.join(ARENA_DIR);
         std::fs::create_dir_all(&arena_root)?;
 
@@ -134,20 +124,8 @@ impl CliSession {
                 label.to_lowercase(),
                 model.replace('/', "_")
             ));
-            let _ = git(
-                &repo_root,
-                &["worktree", "remove", "--force", &worktree.to_string_lossy()],
-            );
-            git(
-                &repo_root,
-                &[
-                    "worktree",
-                    "add",
-                    "--detach",
-                    &worktree.to_string_lossy(),
-                    &base_commit,
-                ],
-            )?;
+            let _ = worktree::remove_worktree(&repo_root, &worktree, true);
+            worktree::create_detached_worktree(&repo_root, &worktree, &base_commit)?;
 
             println!(
                 "  {} {} → {}",
@@ -218,16 +196,18 @@ impl CliSession {
         let mut contestants = Vec::new();
         for handle in handles {
             let (label, provider, model, worktree, log_path, elapsed, exit_ok) = handle.await?;
-            let diff = git(&worktree, &["diff", "HEAD"]).unwrap_or_default();
+            let diff = worktree::git(&worktree, &["diff", "HEAD"]).unwrap_or_default();
             let untracked =
-                git(&worktree, &["ls-files", "--others", "--exclude-standard"]).unwrap_or_default();
+                worktree::git(&worktree, &["ls-files", "--others", "--exclude-standard"])
+                    .unwrap_or_default();
             let mut full_diff = diff;
             for file in untracked.lines() {
                 if let Ok(content) = std::fs::read_to_string(worktree.join(file)) {
                     full_diff.push_str(&format!("\n+++ new file: {}\n{}", file, content));
                 }
             }
-            let diff_stat = git(&worktree, &["diff", "--stat", "HEAD"]).unwrap_or_default();
+            let diff_stat =
+                worktree::git(&worktree, &["diff", "--stat", "HEAD"]).unwrap_or_default();
             contestants.push(Contestant {
                 label,
                 provider,

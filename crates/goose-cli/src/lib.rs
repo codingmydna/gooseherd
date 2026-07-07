@@ -12,6 +12,7 @@ pub mod recipes;
 pub mod scenario_tests;
 pub mod session;
 pub mod signal;
+pub mod worktree;
 
 // Re-export commonly used types
 pub use cli::Cli;

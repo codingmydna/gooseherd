@@ -34,6 +34,7 @@ pub enum InputResult {
     InitProject,
     Remember(String),
     Arena(String),
+    Worktree(String),
     Clear,
     Recipe(Option<String>),
     Compact,
@@ -384,6 +385,9 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == "/arena" || s.starts_with("/arena ") => Some(InputResult::Arena(
             s.get("/arena".len()..).unwrap_or("").trim().to_string(),
         )),
+        s if s == "/worktree" || s.starts_with("/worktree ") => Some(InputResult::Worktree(
+            s.get("/worktree".len()..).unwrap_or("").trim().to_string(),
+        )),
         s if s == CMD_BTW || s.starts_with(&format!("{CMD_BTW} ")) => Some(InputResult::Btw(
             s.get(CMD_BTW.len()..).unwrap_or("").trim().to_string(),
         )),
@@ -532,6 +536,7 @@ fn print_help() {
 /usage - Show token usage and cost for this session
 /stats - Orchestration run statistics: per-role/model tokens, durations, verdicts, reported-model verification
 /arena [lineup=provider/model,...] <task> - Run the same task on each contestant in isolated git worktrees, then blind-judge the diffs (GOOSE_ARENA_LINEUP, GOOSE_ARENA_TIMEOUT_SECS)
+/worktree <name> - Create a named git worktree under .goose/worktrees and print how to enter it
 /btw <question> - Ask a side question (answered by the planner model) without adding it to the session history
 /roles [role=provider/model ...] - Show or change /orch role assignments in-session (also effort=<level>, cycles=<n>)
 /preset [save <name> | <name> | delete <name>] - Save/apply/delete role presets; bare /preset opens a picker. Shift+Tab cycles presets at the prompt
@@ -654,6 +659,23 @@ mod tests {
 
         // Test unknown commands
         assert!(handle_slash_command("/unknown").is_none());
+    }
+
+    #[test]
+    fn test_worktree_command() {
+        if let Some(InputResult::Worktree(name)) = handle_slash_command("/worktree alpha") {
+            assert_eq!(name, "alpha");
+        } else {
+            panic!("Expected Worktree");
+        }
+
+        if let Some(InputResult::Worktree(name)) = handle_slash_command("/worktree") {
+            assert_eq!(name, "");
+        } else {
+            panic!("Expected Worktree");
+        }
+
+        assert!(handle_slash_command("/worktreex").is_none());
     }
 
     #[test]

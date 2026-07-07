@@ -33,6 +33,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/arena",
         "Same task, N models, isolated worktrees, blind judge",
     ),
+    ("/worktree", "Create a named git worktree"),
     ("/orch", "Plan → implement → review loop across models"),
     ("/roles", "Show or change orchestration roles/effort"),
     ("/preset", "Save/apply role presets; Shift+Tab cycles"),

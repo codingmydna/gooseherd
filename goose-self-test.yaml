@@ -8,6 +8,7 @@ activities:
   - Initialize test workspace and logging infrastructure
   - Test file operations (create, read, update, delete, undo)
   - Validate shell command execution and error handling
+  - Validate goose worktree command workflow
   - Analyze code structure and parsing capabilities
   - Test extension discovery and management
   - Test load tool for knowledge injection and discovery
@@ -148,6 +149,17 @@ prompt: |
   Test comprehensive shell workflow: command chaining (mkdir test && cd test && echo "test" > file.txt),
   error handling (false || echo "handled"), and environment variables (export VAR=test && echo $VAR).
   Verify both success and failure paths work correctly.
+
+  ### Worktree Command Testing
+  Test the `goose worktree` CLI in a disposable git repository:
+  1. Create `{{ workspace_dir }}/worktree_cli/repo` and initialize it with `git init`.
+  2. Configure local git user.name/user.email, write a `.gitignore` that ignores `.env`, `.env.local`, and `.env.*.local` but does not ignore `.goose/`, add `README.md`, and commit the initial revision.
+  3. Create ignored env files `.env`, `.env.local`, and `.env.dev.local`.
+  4. Run `goose worktree new alpha --branch selftest/alpha`.
+  5. Verify `.goose/worktrees/.gitignore` exists with content `*`, the env files inside `.goose/worktrees/alpha` are symlinks, `git status --porcelain` in the main repo is clean, and the command prints `cd <path> && goose`.
+  6. Run `goose worktree list` and verify it shows the worktree path, branch `selftest/alpha`, and dirty status `no`.
+  7. Run `printf 'y\n' | goose worktree prune` and verify the worktree directory is removed.
+  8. From `{{ workspace_dir }}/worktree_cli/non_git`, run `goose worktree list` and verify it exits non-zero with a friendly git-repository error.
 
   ### Code Analysis Testing
   1. Create sample code files in Python, JavaScript, and Go

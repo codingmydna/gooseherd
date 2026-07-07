@@ -13,6 +13,7 @@ pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
 mod ux;
+mod worktree;
 
 use crate::session::task_execution_display::{
     format_task_execution_notification, TASK_EXECUTION_NOTIFICATION_TYPE,
@@ -715,6 +716,12 @@ impl CliSession {
             InputResult::Arena(args) => {
                 history.save(editor);
                 if let Err(e) = self.handle_arena(args).await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::Worktree(name) => {
+                history.save(editor);
+                if let Err(e) = self.handle_worktree(name).await {
                     output::render_error(&e.to_string());
                 }
             }
