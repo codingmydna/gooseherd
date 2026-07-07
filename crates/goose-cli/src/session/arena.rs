@@ -192,6 +192,7 @@ impl CliSession {
             "arena: {} contestants working in parallel…",
             handles.len()
         )));
+        let _thinking_turn = output::begin_thinking_turn();
         output::show_thinking();
         let mut contestants = Vec::new();
         for handle in handles {
@@ -221,6 +222,7 @@ impl CliSession {
             });
         }
         output::hide_thinking();
+        drop(_thinking_turn);
 
         println!();
         println!("{}", style("arena results").cyan().bold());
@@ -291,6 +293,7 @@ impl CliSession {
             "judge {}/{} working…",
             judge_role.provider_name, judge_role.model
         )));
+        let _thinking_turn = output::begin_thinking_turn();
         output::show_thinking();
         let (verdict_message, _usage) =
             goose::session_context::with_session_id(
@@ -305,6 +308,7 @@ impl CliSession {
             )
             .await?;
         output::hide_thinking();
+        drop(_thinking_turn);
         output::render_message(&verdict_message, self.debug);
 
         println!(

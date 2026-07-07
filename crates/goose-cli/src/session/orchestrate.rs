@@ -577,25 +577,38 @@ async fn stream_role_completion(
     let mut thinking_header_shown = false;
     let mut text = String::new();
     let mut usage: Option<ProviderUsage> = None;
+    let _thinking_turn = output::begin_thinking_turn();
+    let mut status_tick = tokio::time::interval(output::thinking_status_refresh_interval());
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    while let Some(next) = stream.next().await {
-        let (message, message_usage) = next?;
-        if let Some(message) = message {
-            for content in &message.content {
-                if let goose::conversation::message::MessageContent::Text(t) = content {
-                    text.push_str(&t.text);
+    loop {
+        tokio::select! {
+            next = stream.next() => {
+                let Some(next) = next else {
+                    break;
+                };
+                let (message, message_usage) = next?;
+                if let Some(message) = message {
+                    for content in &message.content {
+                        if let goose::conversation::message::MessageContent::Text(t) = content {
+                            text.push_str(&t.text);
+                        }
+                    }
+                    output::hide_thinking();
+                    output::render_message_streaming(
+                        &message,
+                        &mut buffer,
+                        &mut thinking_header_shown,
+                        debug,
+                    );
+                }
+                if message_usage.is_some() {
+                    usage = message_usage;
                 }
             }
-            output::hide_thinking();
-            output::render_message_streaming(
-                &message,
-                &mut buffer,
-                &mut thinking_header_shown,
-                debug,
-            );
-        }
-        if message_usage.is_some() {
-            usage = message_usage;
+            _ = status_tick.tick() => {
+                output::refresh_thinking_status();
+            }
         }
     }
     output::flush_markdown_buffer_current_theme(&mut buffer);
@@ -851,7 +864,10 @@ impl CliSession {
             task,
         };
 
-        output::set_active_role(Some(output::ActiveRole::Planner));
+        output::set_active_role_status(Some(output::ActiveRoleStatus {
+            role: output::ActiveRole::Planner,
+            cycle: None,
+        }));
         phase_banner(
             &format!(
                 "phase: plan · {}/{}",
@@ -860,7 +876,7 @@ impl CliSession {
             output::ActiveRole::Planner,
         );
         output::set_thinking_context(Some(format!(
-            "planner {}/{} working…",
+            "{}/{} working…",
             planner_role.provider_name, planner_role.model
         )));
         let phase_started = Instant::now();
@@ -937,7 +953,10 @@ impl CliSession {
         );
 
         for cycle in 1..=max_cycles {
-            output::set_active_role(Some(output::ActiveRole::Implementer));
+            output::set_active_role_status(Some(output::ActiveRoleStatus {
+                role: output::ActiveRole::Implementer,
+                cycle: Some((cycle, max_cycles)),
+            }));
             phase_banner(
                 &format!(
                     "phase: implement (cycle {}/{}) · {}/{}",
@@ -946,7 +965,7 @@ impl CliSession {
                 output::ActiveRole::Implementer,
             );
             output::set_thinking_context(Some(format!(
-                "implementer {}/{} working…",
+                "{}/{} working…",
                 implementer_role.provider_name, implementer_role.model
             )));
             let phase_started = Instant::now();
@@ -994,7 +1013,10 @@ impl CliSession {
                 None,
             );
 
-            output::set_active_role(Some(output::ActiveRole::Reviewer));
+            output::set_active_role_status(Some(output::ActiveRoleStatus {
+                role: output::ActiveRole::Reviewer,
+                cycle: Some((cycle, max_cycles)),
+            }));
             phase_banner(
                 &format!(
                     "phase: review (cycle {}/{}) · {}/{}",
@@ -1003,7 +1025,7 @@ impl CliSession {
                 output::ActiveRole::Reviewer,
             );
             output::set_thinking_context(Some(format!(
-                "reviewer {}/{} working…",
+                "{}/{} working…",
                 reviewer_role.provider_name, reviewer_role.model
             )));
             let phase_started = Instant::now();

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicU32, AtomicU8, Ordering},
     Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
@@ -87,11 +87,17 @@ thread_local! {
     static THINKING_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveRole {
     Planner,
     Implementer,
     Reviewer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveRoleStatus {
+    pub role: ActiveRole,
+    pub cycle: Option<(u32, u32)>,
 }
 
 const ACTIVE_ROLE_NONE: u8 = 0;
@@ -100,27 +106,54 @@ const ACTIVE_ROLE_IMPLEMENTER: u8 = 2;
 const ACTIVE_ROLE_REVIEWER: u8 = 3;
 const MAX_TRACKED_TOOL_CALLS: usize = 128;
 const LONG_TOOL_CALL_DURATION: Duration = Duration::from_secs(3);
+const THINKING_STATUS_REFRESH: Duration = Duration::from_secs(1);
 
 static ACTIVE_ROLE: AtomicU8 = AtomicU8::new(ACTIVE_ROLE_NONE);
-static TOOL_STARTED: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+static ACTIVE_ROLE_CYCLE: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_ROLE_MAX_CYCLES: AtomicU32 = AtomicU32::new(0);
+static TOOL_STARTED: OnceLock<Mutex<HashMap<String, RunningTool>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct RunningTool {
+    started_at: Instant,
+    summary: String,
+}
 
 pub fn set_active_role(role: Option<ActiveRole>) {
-    let value = match role {
+    set_active_role_status(role.map(|role| ActiveRoleStatus { role, cycle: None }));
+}
+
+pub fn set_active_role_status(status: Option<ActiveRoleStatus>) {
+    let value = match status.map(|status| status.role) {
         Some(ActiveRole::Planner) => ACTIVE_ROLE_PLANNER,
         Some(ActiveRole::Implementer) => ACTIVE_ROLE_IMPLEMENTER,
         Some(ActiveRole::Reviewer) => ACTIVE_ROLE_REVIEWER,
         None => ACTIVE_ROLE_NONE,
     };
     ACTIVE_ROLE.store(value, Ordering::Relaxed);
+    let (cycle, max_cycles) = status.and_then(|status| status.cycle).unwrap_or((0, 0));
+    ACTIVE_ROLE_CYCLE.store(cycle, Ordering::Relaxed);
+    ACTIVE_ROLE_MAX_CYCLES.store(max_cycles, Ordering::Relaxed);
+    refresh_thinking_status();
 }
 
 fn active_role() -> Option<ActiveRole> {
+    active_role_status().map(|status| status.role)
+}
+
+fn active_role_status() -> Option<ActiveRoleStatus> {
     match ACTIVE_ROLE.load(Ordering::Relaxed) {
         ACTIVE_ROLE_PLANNER => Some(ActiveRole::Planner),
         ACTIVE_ROLE_IMPLEMENTER => Some(ActiveRole::Implementer),
         ACTIVE_ROLE_REVIEWER => Some(ActiveRole::Reviewer),
         _ => None,
     }
+    .map(|role| {
+        let cycle = ACTIVE_ROLE_CYCLE.load(Ordering::Relaxed);
+        let max_cycles = ACTIVE_ROLE_MAX_CYCLES.load(Ordering::Relaxed);
+        let cycle = (cycle > 0 && max_cycles > 0).then_some((cycle, max_cycles));
+        ActiveRoleStatus { role, cycle }
+    })
 }
 
 fn role_color(role: ActiveRole) -> Color {
@@ -135,7 +168,7 @@ fn active_or_default_color(default: Color) -> Color {
     active_role().map(role_color).unwrap_or(default)
 }
 
-fn tool_started() -> &'static Mutex<HashMap<String, Instant>> {
+fn tool_started() -> &'static Mutex<HashMap<String, RunningTool>> {
     TOOL_STARTED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -143,10 +176,108 @@ fn tool_started() -> &'static Mutex<HashMap<String, Instant>> {
 /// (e.g. "claude-acp/default working…"). None falls back to fun messages.
 pub fn set_thinking_context(context: Option<String>) {
     THINKING_CONTEXT.with(|c| *c.borrow_mut() = context);
+    refresh_thinking_status();
 }
 
 fn get_thinking_context() -> Option<String> {
     THINKING_CONTEXT.with(|c| c.borrow().clone())
+}
+
+pub struct ThinkingStatusLabelInput<'a> {
+    pub base: &'a str,
+    pub elapsed: Duration,
+    pub role: Option<ActiveRoleStatus>,
+    pub running_tools: &'a [String],
+    pub terminal_width: Option<usize>,
+    pub hint: Option<&'a str>,
+}
+
+pub fn build_thinking_status_label(input: ThinkingStatusLabelInput<'_>) -> String {
+    let mut label = String::new();
+    if let Some(role) = input.role {
+        label.push_str(&format_active_role_status(role));
+        label.push_str(" · ");
+    }
+    label.push_str(input.base);
+    label.push_str(" for ");
+    label.push_str(&format_elapsed(input.elapsed));
+
+    match input.running_tools.len() {
+        0 => {}
+        1 => {
+            label.push_str(" · ");
+            label.push_str(&input.running_tools[0]);
+            label.push_str(" running");
+        }
+        count => {
+            label.push_str(" · ");
+            label.push_str(&count.to_string());
+            label.push_str(" tools running");
+        }
+    }
+
+    if let Some(hint) = input.hint {
+        label.push_str("  ");
+        label.push_str(hint);
+    }
+
+    match input.terminal_width {
+        Some(width) => truncate_to_display_width(&label, width),
+        None => label,
+    }
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn format_active_role_status(status: ActiveRoleStatus) -> String {
+    let role = match status.role {
+        ActiveRole::Planner => "planner",
+        ActiveRole::Implementer => "implementer",
+        ActiveRole::Reviewer => "reviewer",
+    };
+    match status.cycle {
+        Some((cycle, max_cycles)) => format!("{role} c{cycle}/{max_cycles}"),
+        None => role.to_string(),
+    }
+}
+
+fn truncate_to_display_width(text: &str, max_width: usize) -> String {
+    if measure_text_width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let suffix = "...";
+    let suffix_width = measure_text_width(suffix);
+    if max_width <= suffix_width {
+        return ".".repeat(max_width);
+    }
+
+    let mut output = String::new();
+    for ch in text.chars() {
+        let char_width = measure_text_width(&ch.to_string());
+        if measure_text_width(&output) + char_width + suffix_width > max_width {
+            break;
+        }
+        output.push(ch);
+    }
+    output.push_str(suffix);
+    output
+}
+
+fn thinking_status_width() -> Option<usize> {
+    Term::stdout()
+        .size_checked()
+        .map(|(_height, width)| (width as usize).saturating_sub(4))
 }
 
 /// Reset the per-response bullet so the next assistant text block gets a fresh `●`.
@@ -214,37 +345,137 @@ pub fn get_show_full_tool_output() -> bool {
 #[derive(Default)]
 pub struct ThinkingIndicator {
     spinner: Option<cliclack::ProgressBar>,
+    turn_started_at: Option<Instant>,
+    dynamic_message: Option<String>,
+    fallback_message: Option<String>,
+    last_message: Option<String>,
 }
 
 impl ThinkingIndicator {
+    fn begin_fresh_turn(&mut self) {
+        self.turn_started_at = Some(Instant::now());
+        self.dynamic_message = None;
+        self.fallback_message = None;
+        self.last_message = None;
+        clear_running_tools();
+    }
+
+    fn begin_turn(&mut self) {
+        if self.turn_started_at.is_none() {
+            self.begin_fresh_turn();
+        }
+    }
+
+    fn finish_turn(&mut self) {
+        self.hide();
+        self.turn_started_at = None;
+        self.dynamic_message = None;
+        self.fallback_message = None;
+        self.last_message = None;
+        clear_running_tools();
+    }
+
+    fn set_base_message(&mut self, message: String) {
+        self.dynamic_message = Some(message);
+        self.refresh();
+    }
+
     pub fn show(&mut self) {
+        self.begin_turn();
+        let message = self.current_message();
+        if let Some(spinner) = self.spinner.as_mut() {
+            if self.last_message.as_deref() != Some(message.as_str()) {
+                spinner.set_message(message.clone());
+                self.last_message = Some(message);
+            }
+            return;
+        }
+
         let spinner = cliclack::spinner();
-        let hint = style("(Ctrl+C to interrupt)").dim();
+        spinner.start(message.clone());
+        self.spinner = Some(spinner);
+        self.last_message = Some(message);
+    }
+
+    fn refresh(&mut self) {
+        if self.turn_started_at.is_none() {
+            return;
+        }
+        if self.spinner.is_none() {
+            self.show();
+            return;
+        }
+        let message = self.current_message();
+        if self.last_message.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        if let Some(spinner) = self.spinner.as_mut() {
+            spinner.set_message(message.clone());
+            self.last_message = Some(message);
+        }
+    }
+
+    fn current_message(&mut self) -> String {
+        let base = self.current_base_message();
+        let elapsed = self
+            .turn_started_at
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let running_tools = running_tool_summaries();
+        let hint = "(Ctrl+C to interrupt)";
+        let terminal_width = thinking_status_width();
+        let hint_width = measure_text_width("  ") + measure_text_width(hint);
+        let status_width =
+            terminal_width.and_then(|width| (width > hint_width + 8).then_some(width - hint_width));
+        let status_width = status_width.or(terminal_width.filter(|width| *width <= hint_width + 8));
+        let role_status = active_role_status();
+        let status = build_thinking_status_label(ThinkingStatusLabelInput {
+            base: &base,
+            elapsed,
+            role: role_status,
+            running_tools: &running_tools,
+            terminal_width: status_width,
+            hint: None,
+        });
+
+        let status = role_status
+            .map(|role| style(status.clone()).fg(role_color(role.role)).to_string())
+            .unwrap_or(status);
+
+        if terminal_width.is_some() && status_width == terminal_width {
+            status
+        } else {
+            format!("{}  {}", status, style(hint).dim())
+        }
+    }
+
+    fn current_base_message(&mut self) -> String {
+        if let Some(message) = &self.dynamic_message {
+            return message.clone();
+        }
         if let Some(context) = get_thinking_context() {
-            let context = match active_role() {
-                Some(role) => style(context).fg(role_color(role)).to_string(),
-                None => context,
-            };
-            spinner.start(format!("{}  {}", context, hint));
-        } else if Config::global()
+            return context;
+        }
+        if let Some(message) = &self.fallback_message {
+            return message.clone();
+        }
+        let message = if Config::global()
             .get_param("RANDOM_THINKING_MESSAGES")
             .unwrap_or(true)
         {
-            spinner.start(format!(
-                "{}...  {}",
-                super::thinking::get_random_thinking_message(),
-                hint,
-            ));
+            format!("{}...", super::thinking::get_random_thinking_message())
         } else {
-            spinner.start(format!("Thinking...  {}", hint));
-        }
-        self.spinner = Some(spinner);
+            "Thinking...".to_string()
+        };
+        self.fallback_message = Some(message.clone());
+        message
     }
 
     pub fn hide(&mut self) {
         if let Some(spinner) = self.spinner.take() {
             spinner.stop("");
         }
+        self.last_message = None;
     }
 
     pub fn is_shown(&self) -> bool {
@@ -275,6 +506,43 @@ pub fn hide_thinking() {
     if std::io::stdout().is_terminal() {
         THINKING.with(|t| t.borrow_mut().hide());
     }
+}
+
+pub struct ThinkingTurnGuard {
+    active: bool,
+}
+
+impl Drop for ThinkingTurnGuard {
+    fn drop(&mut self) {
+        if self.active {
+            finish_thinking_turn();
+        }
+    }
+}
+
+pub fn begin_thinking_turn() -> ThinkingTurnGuard {
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| t.borrow_mut().begin_fresh_turn());
+    }
+    ThinkingTurnGuard { active: true }
+}
+
+pub fn finish_thinking_turn() {
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| t.borrow_mut().finish_turn());
+    } else {
+        clear_running_tools();
+    }
+}
+
+pub fn refresh_thinking_status() {
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| t.borrow_mut().refresh());
+    }
+}
+
+pub fn thinking_status_refresh_interval() -> Duration {
+    THINKING_STATUS_REFRESH
 }
 
 pub fn run_status_hook(status: &str) {
@@ -309,13 +577,9 @@ pub fn is_showing_thinking() -> bool {
     THINKING.with(|t| t.borrow().is_shown())
 }
 
-pub fn set_thinking_message(s: &String) {
+pub fn set_thinking_message(s: &str) {
     if std::io::stdout().is_terminal() {
-        THINKING.with(|t| {
-            if let Some(spinner) = t.borrow_mut().spinner.as_mut() {
-                spinner.set_message(s);
-            }
-        });
+        THINKING.with(|t| t.borrow_mut().set_base_message(s.to_owned()));
     }
 }
 
@@ -583,12 +847,18 @@ fn render_thinking_streaming(
     }
 }
 
-fn remember_tool_start(id: &str) {
+fn remember_tool_start(id: &str, summary: Option<String>) {
     if let Ok(mut started) = tool_started().lock() {
         if started.len() >= MAX_TRACKED_TOOL_CALLS {
             started.clear();
         }
-        started.insert(id.to_string(), Instant::now());
+        started.insert(
+            id.to_string(),
+            RunningTool {
+                started_at: Instant::now(),
+                summary: summary.unwrap_or_else(|| "tool".to_string()),
+            },
+        );
     }
 }
 
@@ -596,7 +866,25 @@ fn take_tool_elapsed(id: &str) -> Option<Duration> {
     tool_started()
         .lock()
         .ok()
-        .and_then(|mut started| started.remove(id).map(|started_at| started_at.elapsed()))
+        .and_then(|mut started| started.remove(id).map(|tool| tool.started_at.elapsed()))
+}
+
+fn clear_running_tools() {
+    if let Ok(mut started) = tool_started().lock() {
+        started.clear();
+    }
+}
+
+fn running_tool_summaries() -> Vec<String> {
+    let Ok(started) = tool_started().lock() else {
+        return Vec::new();
+    };
+    let mut summaries = started
+        .values()
+        .map(|tool| tool.summary.clone())
+        .collect::<Vec<_>>();
+    summaries.sort();
+    summaries
 }
 
 fn print_tool_elapsed(elapsed: Option<Duration>, has_output: bool) {
@@ -616,9 +904,9 @@ fn print_tool_elapsed(elapsed: Option<Duration>, has_output: bool) {
 }
 
 fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
-    remember_tool_start(&req.id);
     match &req.tool_call {
         Ok(call) => {
+            remember_tool_start(&req.id, Some(tool_request_status_summary(req, call)));
             if is_acp_tool_request(req) {
                 return render_acp_request(req, call, debug);
             }
@@ -634,7 +922,10 @@ fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
                 _ => render_default_request(call, debug),
             }
         }
-        Err(e) => print_markdown(&e.to_string(), theme),
+        Err(e) => {
+            remember_tool_start(&req.id, None);
+            print_markdown(&e.to_string(), theme);
+        }
     }
 }
 
@@ -694,12 +985,47 @@ fn acp_tool_kind(tool_meta: Option<&Value>) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn render_acp_request(req: &ToolRequest, call: &CallToolRequestParams, debug: bool) {
-    let arguments = call
-        .arguments
+fn call_arguments_value(call: &CallToolRequestParams) -> Value {
+    call.arguments
         .as_ref()
         .map(|arguments| Value::Object(arguments.clone()))
-        .unwrap_or(Value::Null);
+        .unwrap_or(Value::Null)
+}
+
+fn tool_request_status_summary(req: &ToolRequest, call: &CallToolRequestParams) -> String {
+    let arguments = call_arguments_value(call);
+    if let Some(summary) = acp_tool_kind(req.tool_meta.as_ref())
+        .and_then(|kind| acp_call_summary(kind, req.tool_meta.as_ref(), &arguments))
+    {
+        return summary;
+    }
+
+    let name = call.name.to_string();
+    let keys: &[&str] = if is_shell_tool_name(&name) {
+        &["command", "cmd"]
+    } else if is_file_tool_name(&name) {
+        &["path", "file_path", "abs_path", "filePath"]
+    } else {
+        &[]
+    };
+
+    if let Some(summary) = acp_argument_string(&arguments, keys)
+        .or_else(|| acp_first_string_argument(&arguments))
+        .and_then(clean_acp_summary)
+    {
+        return summary;
+    }
+
+    let (tool, extension) = split_tool_name(&name);
+    if extension.is_empty() {
+        tool
+    } else {
+        format!("{tool} ({extension})")
+    }
+}
+
+fn render_acp_request(req: &ToolRequest, call: &CallToolRequestParams, debug: bool) {
+    let arguments = call_arguments_value(call);
     let summary = acp_tool_kind(req.tool_meta.as_ref())
         .and_then(|kind| acp_call_summary(kind, req.tool_meta.as_ref(), &arguments));
     let bullet = style("●").fg(active_or_default_color(Color::Cyan));
@@ -1981,6 +2307,125 @@ mod tests {
         let after_second_toggle = toggle_full_tool_output();
         assert_eq!(after_second_toggle, initial);
         assert_eq!(get_show_full_tool_output(), initial);
+    }
+
+    #[test]
+    fn thinking_status_label_formats_elapsed_seconds_and_minutes() {
+        let label = build_thinking_status_label(ThinkingStatusLabelInput {
+            base: "Thinking...",
+            elapsed: Duration::from_secs(59),
+            role: None,
+            running_tools: &[],
+            terminal_width: None,
+            hint: None,
+        });
+        assert_eq!(label, "Thinking... for 59s");
+
+        let label = build_thinking_status_label(ThinkingStatusLabelInput {
+            base: "Thinking...",
+            elapsed: Duration::from_secs(79),
+            role: None,
+            running_tools: &[],
+            terminal_width: None,
+            hint: None,
+        });
+        assert_eq!(label, "Thinking... for 1m 19s");
+    }
+
+    #[test]
+    fn thinking_status_label_describes_zero_one_and_many_tools() {
+        let label = build_thinking_status_label(ThinkingStatusLabelInput {
+            base: "model working...",
+            elapsed: Duration::from_secs(7),
+            role: None,
+            running_tools: &[],
+            terminal_width: None,
+            hint: None,
+        });
+        assert_eq!(label, "model working... for 7s");
+
+        let running_tools = vec!["cargo test -p goose-cli".to_string()];
+        let label = build_thinking_status_label(ThinkingStatusLabelInput {
+            base: "model working...",
+            elapsed: Duration::from_secs(7),
+            role: None,
+            running_tools: &running_tools,
+            terminal_width: None,
+            hint: None,
+        });
+        assert_eq!(
+            label,
+            "model working... for 7s · cargo test -p goose-cli running"
+        );
+
+        let running_tools = vec!["read src/main.rs".to_string(), "cargo test".to_string()];
+        let label = build_thinking_status_label(ThinkingStatusLabelInput {
+            base: "model working...",
+            elapsed: Duration::from_secs(7),
+            role: None,
+            running_tools: &running_tools,
+            terminal_width: None,
+            hint: None,
+        });
+        assert_eq!(label, "model working... for 7s · 2 tools running");
+    }
+
+    #[test]
+    fn thinking_status_label_includes_orch_role_and_cycle() {
+        let label = build_thinking_status_label(ThinkingStatusLabelInput {
+            base: "codex/gpt-5 working...",
+            elapsed: Duration::from_secs(61),
+            role: Some(ActiveRoleStatus {
+                role: ActiveRole::Implementer,
+                cycle: Some((2, 3)),
+            }),
+            running_tools: &[],
+            terminal_width: None,
+            hint: None,
+        });
+        assert_eq!(label, "implementer c2/3 · codex/gpt-5 working... for 1m 1s");
+    }
+
+    #[test]
+    fn thinking_status_label_truncates_to_display_width() {
+        let label = build_thinking_status_label(ThinkingStatusLabelInput {
+            base: "very-long-model-name working...",
+            elapsed: Duration::from_secs(7),
+            role: Some(ActiveRoleStatus {
+                role: ActiveRole::Planner,
+                cycle: None,
+            }),
+            running_tools: &["cargo test -p goose-cli".to_string()],
+            terminal_width: Some(24),
+            hint: None,
+        });
+
+        assert_eq!(measure_text_width(&label), 24);
+        assert_eq!(label, "planner · very-long-m...");
+    }
+
+    #[test]
+    fn thinking_indicator_fresh_turn_resets_stale_start_after_unguarded_hide() {
+        let mut indicator = ThinkingIndicator::default();
+        indicator.begin_turn();
+        let stale_start = indicator.turn_started_at.unwrap();
+        indicator.hide();
+
+        indicator.begin_fresh_turn();
+
+        assert!(indicator.turn_started_at.unwrap() > stale_start);
+    }
+
+    #[test]
+    fn thinking_indicator_dynamic_message_overrides_static_context() {
+        set_thinking_context(Some("provider/model working...".to_string()));
+        let mut indicator = ThinkingIndicator::default();
+        indicator.begin_turn();
+
+        indicator.set_base_message("Compacting context...".to_string());
+
+        assert_eq!(indicator.current_base_message(), "Compacting context...");
+        set_thinking_context(None);
     }
 
     #[test]

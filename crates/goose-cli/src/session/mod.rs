@@ -1171,12 +1171,16 @@ impl CliSession {
     async fn handle_recipe(&mut self, filepath_opt: Option<String>) {
         println!("{}", console::style("Generating Recipe").green());
 
-        output::show_thinking();
-        let recipe = self
-            .agent
-            .create_recipe(&self.session_id, self.messages.clone())
-            .await;
-        output::hide_thinking();
+        let recipe = {
+            let _thinking_turn = output::begin_thinking_turn();
+            output::show_thinking();
+            let recipe = self
+                .agent
+                .create_recipe(&self.session_id, self.messages.clone())
+                .await;
+            output::hide_thinking();
+            recipe
+        };
 
         match recipe {
             Ok(recipe) => {
@@ -1292,14 +1296,18 @@ impl CliSession {
         model_config: goose_providers::model::ModelConfig,
     ) -> Result<(), anyhow::Error> {
         let plan_prompt = self.agent.get_plan_prompt(&self.session_id).await?;
-        output::show_thinking();
-        let (plan_response, _usage) = goose::session_context::with_session_id(
-            Some(self.session_id.clone()),
-            reasoner.complete(&model_config, &plan_prompt, plan_messages.messages(), &[]),
-        )
-        .await?;
+        let (plan_response, _usage) = {
+            let _thinking_turn = output::begin_thinking_turn();
+            output::show_thinking();
+            let result = goose::session_context::with_session_id(
+                Some(self.session_id.clone()),
+                reasoner.complete(&model_config, &plan_prompt, plan_messages.messages(), &[]),
+            )
+            .await;
+            output::hide_thinking();
+            result?
+        };
         output::render_message(&plan_response, self.debug);
-        output::hide_thinking();
         let planner_response_type = classify_planner_response(
             &self.session_id,
             plan_response.as_concat_text(),
@@ -1413,6 +1421,10 @@ impl CliSession {
                 )));
             }
         }
+        let _thinking_turn = interactive.then(output::begin_thinking_turn);
+        if interactive {
+            output::refresh_thinking_status();
+        }
 
         let cancel_token_interrupt = cancel_token.clone();
         let handle = tokio::spawn(async move {
@@ -1452,6 +1464,8 @@ impl CliSession {
         };
         let mut live_tick = tokio::time::interval(std::time::Duration::from_millis(150));
         live_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut status_tick = tokio::time::interval(output::thinking_status_refresh_interval());
+        status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         use futures::StreamExt;
         loop {
@@ -1644,6 +1658,9 @@ impl CliSession {
                             self.handle_live_command(&line).await;
                         }
                     }
+                }
+                _ = status_tick.tick(), if interactive => {
+                    output::refresh_thinking_status();
                 }
             }
         }
@@ -2477,7 +2494,7 @@ fn display_log_notification(
             }
         }
     } else if output::is_showing_thinking() {
-        output::set_thinking_message(&formatted_message.to_string());
+        output::set_thinking_message(formatted_message);
     } else {
         progress_bars.log(formatted_message);
     }
