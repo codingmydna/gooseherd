@@ -6,13 +6,15 @@ use goose::providers::base::{Provider, ProviderUsage};
 use goose::utils::safe_truncate;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::{ledger, output, CliSession};
 
 const MAX_CYCLES_KEY: &str = "GOOSE_ORCH_MAX_CYCLES";
+const PHASE_IDLE_TIMEOUT_KEY: &str = "GOOSE_ORCH_PHASE_IDLE_TIMEOUT_SECS";
 const DEFAULT_MAX_CYCLES: u32 = 3;
+const DEFAULT_PHASE_IDLE_TIMEOUT_SECS: u64 = 120;
 const EVIDENCE_CHAR_LIMIT: usize = 30_000;
 
 const PLAN_SYSTEM_PROMPT: &str = r#"You are the planning lead in a two-model workflow. A separate implementer model will execute your plan with file-editing and shell tools. Your session is read-only: you can explore the working directory but cannot modify anything.
@@ -532,6 +534,15 @@ fn role_system_prompt(base: &str, role: &RoleConfig) -> String {
     }
 }
 
+fn orch_phase_idle_timeout() -> Duration {
+    let secs = Config::global()
+        .get_param::<u64>(PHASE_IDLE_TIMEOUT_KEY)
+        .ok()
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_PHASE_IDLE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 /// Write an orchestration artifact under <artifact_dir>/.goose-orch/<run_id>/.
 fn persist_artifact(artifact_dir: &Path, run_id: &str, name: &str, content: &str) {
     let dir = artifact_dir.join(".goose-orch").join(run_id);
@@ -565,6 +576,27 @@ async fn stream_role_completion(
     session_id: &str,
     debug: bool,
 ) -> Result<(String, Option<ProviderUsage>)> {
+    stream_role_completion_with_idle_timeout(
+        provider,
+        model_config,
+        system,
+        request,
+        session_id,
+        debug,
+        None,
+    )
+    .await
+}
+
+async fn stream_role_completion_with_idle_timeout(
+    provider: &Arc<dyn Provider>,
+    model_config: &goose_providers::model::ModelConfig,
+    system: &str,
+    request: Message,
+    session_id: &str,
+    debug: bool,
+    idle_timeout: Option<Duration>,
+) -> Result<(String, Option<ProviderUsage>)> {
     use futures::StreamExt;
 
     let mut stream = goose::session_context::with_session_id(
@@ -580,6 +612,9 @@ async fn stream_role_completion(
     let _thinking_turn = output::begin_thinking_turn();
     let mut status_tick = tokio::time::interval(output::thinking_status_refresh_interval());
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let idle_sleep = tokio::time::sleep(idle_timeout.unwrap_or(Duration::from_secs(1)));
+    tokio::pin!(idle_sleep);
+    let mut timeout_error: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -605,14 +640,37 @@ async fn stream_role_completion(
                 if message_usage.is_some() {
                     usage = message_usage;
                 }
+                if let Some(timeout) = idle_timeout {
+                    idle_sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
+                }
             }
             _ = status_tick.tick() => {
                 output::refresh_thinking_status();
+            }
+            _ = &mut idle_sleep, if idle_timeout.is_some() => {
+                let secs = idle_timeout.unwrap().as_secs();
+                if text.trim().is_empty() {
+                    timeout_error = Some(format!(
+                        "orchestration phase timed out after {secs}s without assistant text"
+                    ));
+                    break;
+                }
+                println!(
+                    "  {}",
+                    console::style(format!(
+                        "orchestration phase idle for {secs}s; using collected assistant text"
+                    ))
+                    .yellow()
+                );
+                break;
             }
         }
     }
     output::flush_markdown_buffer_current_theme(&mut buffer);
     output::reset_response_bullet();
+    if let Some(error) = timeout_error {
+        anyhow::bail!(error);
+    }
     Ok((text, usage))
 }
 
@@ -863,6 +921,11 @@ impl CliSession {
             run_id: &run_id,
             task,
         };
+        let role_idle_timeout = if interactive {
+            None
+        } else {
+            Some(orch_phase_idle_timeout())
+        };
 
         output::set_active_role_status(Some(output::ActiveRoleStatus {
             role: output::ActiveRole::Planner,
@@ -890,16 +953,32 @@ impl CliSession {
             PLAN_SYSTEM_PROMPT, task, working_dir
         ));
         let planner_system = role_system_prompt(PLAN_SYSTEM_PROMPT, planner_role);
-        let (plan_text, plan_usage) = stream_role_completion(
-            &planner,
-            &planner_model,
-            &planner_system,
-            plan_request,
-            &self.session_id,
-            self.debug,
-        )
-        .await?;
+        let (plan_text, plan_usage) = if let Some(timeout) = role_idle_timeout {
+            stream_role_completion_with_idle_timeout(
+                &planner,
+                &planner_model,
+                &planner_system,
+                plan_request,
+                &self.session_id,
+                self.debug,
+                Some(timeout),
+            )
+            .await?
+        } else {
+            stream_role_completion(
+                &planner,
+                &planner_model,
+                &planner_system,
+                plan_request,
+                &self.session_id,
+                self.debug,
+            )
+            .await?
+        };
         output::hide_thinking();
+        if plan_text.trim().is_empty() {
+            anyhow::bail!("planner produced an empty plan");
+        }
         // Captured after the completion so the ACP adapter has reported the
         // session's real context size (a model fingerprint).
         let planner_context_limit = planner.get_context_limit(&planner_model).await.ok();
@@ -1067,15 +1146,28 @@ impl CliSession {
             ));
             output::show_thinking();
             let reviewer_system = role_system_prompt(REVIEW_SYSTEM_PROMPT, reviewer_role);
-            let (review_text, review_usage) = stream_role_completion(
-                &reviewer,
-                &reviewer_model,
-                &reviewer_system,
-                review_request,
-                &self.session_id,
-                self.debug,
-            )
-            .await?;
+            let (review_text, review_usage) = if let Some(timeout) = role_idle_timeout {
+                stream_role_completion_with_idle_timeout(
+                    &reviewer,
+                    &reviewer_model,
+                    &reviewer_system,
+                    review_request,
+                    &self.session_id,
+                    self.debug,
+                    Some(timeout),
+                )
+                .await?
+            } else {
+                stream_role_completion(
+                    &reviewer,
+                    &reviewer_model,
+                    &reviewer_system,
+                    review_request,
+                    &self.session_id,
+                    self.debug,
+                )
+                .await?
+            };
             output::hide_thinking();
             persist_artifact(
                 &workspace.original_dir,
@@ -1138,6 +1230,8 @@ impl CliSession {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn git(dir: &Path, args: &[&str]) {
         crate::worktree::git(dir, args).expect("git command");
@@ -1164,6 +1258,92 @@ mod tests {
                 .map(|path| path.to_string())
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[derive(Debug)]
+    struct SilentProvider {
+        first_text: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl goose::providers::base::Provider for SilentProvider {
+        fn get_name(&self) -> &str {
+            "silent-provider"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system: &str,
+            _messages: &[goose::conversation::message::Message],
+            _tools: &[rmcp::model::Tool],
+        ) -> Result<goose::providers::base::MessageStream, goose_providers::errors::ProviderError>
+        {
+            use futures::StreamExt;
+
+            let first_text = self.first_text;
+            let pending = futures::stream::pending();
+            if let Some(first_text) = first_text {
+                let first = futures::stream::once(async move {
+                    Ok((
+                        Some(
+                            goose::conversation::message::Message::assistant()
+                                .with_text(first_text),
+                        ),
+                        None,
+                    ))
+                });
+                Ok(Box::pin(first.chain(pending)))
+            } else {
+                Ok(Box::pin(pending))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_role_completion_returns_partial_text_after_idle_timeout() {
+        let provider: Arc<dyn goose::providers::base::Provider> = Arc::new(SilentProvider {
+            first_text: Some("partial plan"),
+        });
+
+        let (text, usage) = super::stream_role_completion_with_idle_timeout(
+            &provider,
+            &goose_providers::model::ModelConfig::new("test-model"),
+            "",
+            goose::conversation::message::Message::user().with_text("plan this"),
+            "test-session",
+            false,
+            Some(Duration::from_millis(10)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(text, "partial plan");
+        assert!(usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_role_completion_errors_when_idle_timeout_has_no_text() {
+        let provider: Arc<dyn goose::providers::base::Provider> =
+            Arc::new(SilentProvider { first_text: None });
+
+        let err = super::stream_role_completion_with_idle_timeout(
+            &provider,
+            &goose_providers::model::ModelConfig::new("test-model"),
+            "",
+            goose::conversation::message::Message::user().with_text("plan this"),
+            "test-session",
+            false,
+            Some(Duration::from_millis(10)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("orchestration phase timed out after 0s without assistant text"),
+            "{err}"
+        );
     }
 
     #[test]

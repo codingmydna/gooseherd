@@ -1,9 +1,9 @@
 use agent_client_protocol::schema::v1::{
-    ClientCapabilities, CloseSessionRequest, ContentBlock, ContentChunk, Diff as AcpDiff,
-    EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse, McpCapabilities,
-    McpServer, McpServerHttp, McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    CancelNotification, ClientCapabilities, CloseSessionRequest, ContentBlock, ContentChunk,
+    Diff as AcpDiff, EnvVariable, HttpHeader, ImageContent, InitializeRequest, InitializeResponse,
+    McpCapabilities, McpServer, McpServerHttp, McpServerStdio, NewSessionRequest,
+    NewSessionResponse, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModeResponse, StopReason,
     TextContent, ToolCallContent, ToolCallStatus, ToolKind,
@@ -92,7 +92,13 @@ enum ClientRequest {
         session_id: SessionId,
         content: Vec<ContentBlock>,
         response_tx: mpsc::Sender<AcpUpdate>,
+        control_rx: mpsc::Receiver<PromptControl>,
     },
+}
+
+#[derive(Debug)]
+enum PromptControl {
+    Cancel,
 }
 
 // tokio I/O handles can't move between runtimes, so the child process must be
@@ -380,8 +386,9 @@ impl AcpProvider {
         &self,
         session_id: SessionId,
         content: Vec<ContentBlock>,
-    ) -> Result<mpsc::Receiver<AcpUpdate>> {
+    ) -> Result<(mpsc::Receiver<AcpUpdate>, mpsc::Sender<PromptControl>)> {
         let (response_tx, response_rx) = mpsc::channel(64);
+        let (control_tx, control_rx) = mpsc::channel(4);
         self.tx
             .as_ref()
             .unwrap()
@@ -389,10 +396,11 @@ impl AcpProvider {
                 session_id,
                 content,
                 response_tx,
+                control_rx,
             })
             .await
             .context("ACP client is unavailable")?;
-        Ok(response_rx)
+        Ok((response_rx, control_tx))
     }
 
     fn session_has_config_option(&self, category: SessionConfigOptionCategory) -> bool {
@@ -499,8 +507,8 @@ impl Provider for AcpProvider {
         if let Ok(mut buffer) = self.pending_tool_updates.lock() {
             buffer.clear();
         }
-        let mut rx = match self.prompt(session_id, prompt_blocks).await {
-            Ok(rx) => rx,
+        let (mut rx, prompt_control_tx) = match self.prompt(session_id, prompt_blocks).await {
+            Ok(channels) => channels,
             Err(e) => {
                 if claim.first_prompt {
                     self.handoff_context_sent.store(false, Ordering::Release);
@@ -648,6 +656,18 @@ impl Provider for AcpProvider {
                             permission_decision_from_mode(goose_mode)
                         };
                         if let Some(decision) = auto_decision {
+                            if plan_explore && decision.should_record_rejection() {
+                                if let Some(plan_text) =
+                                    recover_plan_from_switch_mode_permission(&request)
+                                {
+                                    let _ = response_tx
+                                        .send(map_permission_response(&request, decision));
+                                    let _ = prompt_control_tx.send(PromptControl::Cancel).await;
+                                    let message = Message::assistant().with_text(&plan_text);
+                                    yield (Some(message), None);
+                                    break;
+                                }
+                            }
                             if decision.should_record_rejection() {
                                 rejected_tool_calls.insert(
                                     request.tool_call.tool_call_id.0.to_string(),
@@ -1193,26 +1213,45 @@ async fn handle_requests(
                 session_id,
                 content,
                 response_tx,
+                mut control_rx,
             } => {
                 *prompt_response_tx.lock().unwrap() = Some(response_tx.clone());
 
-                let response: Result<PromptResponse, _> = cx
-                    .send_request(PromptRequest::new(session_id, content))
-                    .block_task()
-                    .await;
+                let mut response = Box::pin(
+                    cx.send_request(PromptRequest::new(session_id.clone(), content))
+                        .block_task(),
+                );
 
-                match response {
-                    Ok(r) => {
-                        log_undelivered(
-                            response_tx.try_send(AcpUpdate::Complete(r.stop_reason, r.usage)),
-                            AGENT_METHOD_NAMES.session_prompt,
-                        );
+                tokio::select! {
+                    response = &mut response => {
+                        match response {
+                            Ok(r) => {
+                                log_undelivered(
+                                    response_tx.try_send(AcpUpdate::Complete(r.stop_reason, r.usage)),
+                                    AGENT_METHOD_NAMES.session_prompt,
+                                );
+                            }
+                            Err(e) => {
+                                log_undelivered(
+                                    response_tx.try_send(AcpUpdate::Error(e.to_string())),
+                                    AGENT_METHOD_NAMES.session_prompt,
+                                );
+                            }
+                        }
                     }
-                    Err(e) => {
-                        log_undelivered(
-                            response_tx.try_send(AcpUpdate::Error(e.to_string())),
-                            AGENT_METHOD_NAMES.session_prompt,
-                        );
+                    control = control_rx.recv() => {
+                        match control {
+                            Some(PromptControl::Cancel) => {
+                                if let Err(e) = cx.send_notification(CancelNotification::new(session_id.clone())) {
+                                    tracing::debug!(method = AGENT_METHOD_NAMES.session_cancel, session_id = %session_id, error = %e, "failed to cancel ACP prompt");
+                                }
+                            }
+                            None => {
+                                if let Err(e) = cx.send_notification(CancelNotification::new(session_id.clone())) {
+                                    tracing::debug!(method = AGENT_METHOD_NAMES.session_cancel, session_id = %session_id, error = %e, "failed to cancel dropped ACP prompt stream");
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1651,6 +1690,48 @@ fn plan_explore_decision(
     }
 }
 
+fn recover_plan_from_switch_mode_permission(request: &RequestPermissionRequest) -> Option<String> {
+    if request.tool_call.fields.kind != Some(ToolKind::SwitchMode) {
+        return None;
+    }
+
+    let raw_input = request.tool_call.fields.raw_input.as_ref()?;
+    let plan = find_plan_text(raw_input).or_else(|| {
+        let title = request
+            .tool_call
+            .fields
+            .title
+            .as_deref()
+            .unwrap_or_default();
+        if title.eq_ignore_ascii_case("Ready to code?") {
+            raw_input.as_str().map(str::to_string)
+        } else {
+            None
+        }
+    })?;
+    let plan = plan.trim();
+    if plan.is_empty() {
+        None
+    } else {
+        Some(plan.to_string())
+    }
+}
+
+fn find_plan_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in ["plan", "final_plan"] {
+                if let Some(text) = map.get(key).and_then(serde_json::Value::as_str) {
+                    return Some(text.to_string());
+                }
+            }
+            map.values().find_map(find_plan_text)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_plan_text),
+        _ => None,
+    }
+}
+
 fn permission_decision_from_mode(goose_mode: GooseMode) -> Option<PermissionDecision> {
     match goose_mode {
         GooseMode::Auto => Some(PermissionDecision::AllowOnce),
@@ -1830,6 +1911,94 @@ mod tests {
         let next_claim = provider.claim_handoff_context(&messages);
         assert!(next_claim.first_prompt);
         assert!(next_claim.include_context);
+    }
+
+    #[tokio::test]
+    async fn plan_explore_switch_mode_permission_recovers_plan_and_ends_stream() {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, PermissionOptionKind, ToolCallId, ToolCallUpdate,
+            ToolCallUpdateFields,
+        };
+        use futures::StreamExt;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let (mut provider, model) = test_provider_with_tx(Some(tx));
+        provider.plan_explore = true;
+        let plan = "1. Read the relevant files.\n2. Patch the planner deadlock.";
+
+        let stream_handle = tokio::spawn(async move {
+            let mut stream = provider
+                .stream(
+                    &model,
+                    "",
+                    &[Message::user().with_text("fix the orch planner deadlock")],
+                    &[],
+                )
+                .await
+                .unwrap();
+            let mut text = String::new();
+            while let Some(item) = stream.next().await {
+                let (message, _) = item.unwrap();
+                if let Some(message) = message {
+                    for content in message.content {
+                        if let MessageContent::Text(t) = content {
+                            text.push_str(&t.text);
+                        }
+                    }
+                }
+            }
+            text
+        });
+
+        let ClientRequest::Prompt {
+            response_tx,
+            mut control_rx,
+            ..
+        } = rx.recv().await.expect("expected prompt request")
+        else {
+            panic!("unexpected client request");
+        };
+        let (permission_tx, permission_rx) = oneshot::channel();
+        let request = RequestPermissionRequest::new(
+            "session-1",
+            ToolCallUpdate::new(
+                ToolCallId::new("tool-1"),
+                ToolCallUpdateFields::new()
+                    .kind(ToolKind::SwitchMode)
+                    .title("Ready to code?".to_string())
+                    .raw_input(serde_json::json!({ "plan": plan })),
+            ),
+            vec![
+                PermissionOption::new("approve", "Approve", PermissionOptionKind::AllowOnce),
+                PermissionOption::new("reject_once", "Reject", PermissionOptionKind::RejectOnce),
+            ],
+        );
+
+        response_tx
+            .send(AcpUpdate::PermissionRequest {
+                request: Box::new(request),
+                response_tx: permission_tx,
+            })
+            .await
+            .unwrap();
+
+        let permission_response = permission_rx.await.unwrap();
+        assert_eq!(
+            PermissionDecision::from(&permission_response.outcome),
+            PermissionDecision::RejectOnce
+        );
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), control_rx.recv())
+                .await
+                .expect("prompt cancellation control should be sent"),
+            Some(PromptControl::Cancel)
+        ));
+
+        let text = tokio::time::timeout(std::time::Duration::from_millis(100), stream_handle)
+            .await
+            .expect("stream should finish after plan recovery")
+            .unwrap();
+        assert_eq!(text, plan);
     }
 
     fn test_provider_with_model_option(
