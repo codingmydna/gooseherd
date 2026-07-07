@@ -26,6 +26,10 @@ pub struct PhaseRecord {
     pub duration_ms: u64,
     pub verdict: Option<String>,
     pub task_preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_exemplars_injected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_exemplar_run_ids: Option<Vec<String>>,
 }
 
 fn ledger_path() -> PathBuf {
