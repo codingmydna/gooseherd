@@ -87,3 +87,5 @@ gooseselftest/
 .goose-arena/
 .goose-orch/
 .claude/
+.goose-orch/
+.goose-arena/
