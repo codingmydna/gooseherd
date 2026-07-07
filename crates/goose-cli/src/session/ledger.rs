@@ -25,6 +25,8 @@ pub struct PhaseRecord {
     pub output_tokens: Option<i64>,
     pub duration_ms: u64,
     pub verdict: Option<String>,
+    pub permission_policy: Option<String>,
+    pub permission_denials: Option<u64>,
     pub task_preview: String,
 }
 

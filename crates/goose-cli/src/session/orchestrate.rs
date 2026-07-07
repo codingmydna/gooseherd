@@ -45,6 +45,26 @@ pub enum OrchOutcome {
     Aborted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrchImplementPolicy {
+    Auto,
+    Allowlist,
+}
+
+fn resolve_orch_implement_policy() -> Result<OrchImplementPolicy> {
+    let raw = Config::global()
+        .get_param::<String>(goose::acp::ORCH_IMPLEMENT_POLICY_KEY)
+        .unwrap_or_else(|_| "auto".to_string());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(OrchImplementPolicy::Auto),
+        "allowlist" => Ok(OrchImplementPolicy::Allowlist),
+        _ => anyhow::bail!(
+            "{} must be one of: auto, allowlist",
+            goose::acp::ORCH_IMPLEMENT_POLICY_KEY
+        ),
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub(super) struct RoleConfig {
     pub(super) provider_name: String,
@@ -526,6 +546,16 @@ fn is_acp_provider(provider_name: &str) -> bool {
     provider_name.ends_with("-acp")
 }
 
+fn implement_policy_label(policy: OrchImplementPolicy, is_acp: bool) -> String {
+    match (policy, is_acp) {
+        (OrchImplementPolicy::Auto, _) => "auto".to_string(),
+        (OrchImplementPolicy::Allowlist, true) => "allowlist".to_string(),
+        (OrchImplementPolicy::Allowlist, false) => {
+            "allowlist requested; native uses auto".to_string()
+        }
+    }
+}
+
 fn role_system_prompt(base: &str, role: &RoleConfig) -> String {
     if is_acp_provider(&role.provider_name) {
         base.to_string()
@@ -680,6 +710,11 @@ struct PhaseMeta<'a> {
     task: &'a str,
 }
 
+struct PhasePolicySummary {
+    name: String,
+    denials: u64,
+}
+
 /// Print a phase summary line, warn when the reported model doesn't match
 /// GOOSE_<ROLE>_EXPECT_MODEL, and append the phase to the run ledger.
 #[allow(clippy::too_many_arguments)]
@@ -693,6 +728,7 @@ fn record_phase(
     context_limit: Option<usize>,
     elapsed_ms: u64,
     verdict: Option<&str>,
+    policy: Option<&PhasePolicySummary>,
 ) {
     let reported_model = usage.map(|u| u.model.clone());
     let (input_tokens, output_tokens) = usage
@@ -705,17 +741,21 @@ fn record_phase(
         .unwrap_or((None, None));
 
     let fmt_tok = |t: Option<i64>| t.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string());
+    let policy_suffix = policy
+        .map(|policy| format!(" · policy {} · denied {}", policy.name, policy.denials))
+        .unwrap_or_default();
     println!(
         "  {} {}",
         console::style("⎿").dim(),
         console::style(format!(
-            "{} done · model {} · in {} / out {} · {:.1}s{}",
+            "{} done · model {} · in {} / out {} · {:.1}s{}{}",
             phase,
             reported_model.as_deref().unwrap_or("(unreported)"),
             fmt_tok(input_tokens),
             fmt_tok(output_tokens),
             elapsed_ms as f64 / 1000.0,
-            verdict.map(|v| format!(" · {}", v)).unwrap_or_default()
+            verdict.map(|v| format!(" · {}", v)).unwrap_or_default(),
+            policy_suffix
         ))
         .dim()
     );
@@ -771,6 +811,8 @@ fn record_phase(
         output_tokens,
         duration_ms: elapsed_ms,
         verdict: verdict.map(|v| v.to_string()),
+        permission_policy: policy.map(|policy| policy.name.clone()),
+        permission_denials: policy.map(|policy| policy.denials),
         task_preview: safe_truncate(meta.task, 120),
     });
 }
@@ -797,6 +839,8 @@ impl CliSession {
         let planner_role = roles.planner;
         let reviewer_role = roles.reviewer;
         let implementer_role = roles.implementer;
+        let implement_policy = resolve_orch_implement_policy()?;
+        let implementer_is_acp = is_acp_provider(&implementer_role.provider_name);
         let max_cycles = max_cycles_override
             .filter(|n| *n >= 1)
             .or_else(|| {
@@ -826,6 +870,14 @@ impl CliSession {
             ))
             .dim()
         );
+        println!(
+            "  {}",
+            console::style(format!(
+                "implement policy: {}",
+                implement_policy_label(implement_policy, implementer_is_acp)
+            ))
+            .dim()
+        );
 
         let prev_mode = config.get_goose_mode().unwrap_or_default();
         let outcome = self
@@ -837,6 +889,7 @@ impl CliSession {
                 max_cycles,
                 auto_merge,
                 interactive,
+                implement_policy,
             )
             .await;
 
@@ -847,6 +900,10 @@ impl CliSession {
         if let Err(e) = config.set_param("GOOSE_ACP_PLAN_EXPLORE", false) {
             output::render_error(&format!("Failed to reset plan-explore flag: {}", e));
         }
+        if let Err(e) = config.set_param(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, false) {
+            output::render_error(&format!("Failed to reset implement policy flag: {}", e));
+        }
+        goose::acp::reset_orch_implement_denial_count();
         if let Err(e) = self
             .agent
             .config
@@ -891,6 +948,7 @@ impl CliSession {
         max_cycles: u32,
         auto_merge: bool,
         interactive: bool,
+        implement_policy: OrchImplementPolicy,
     ) -> Result<OrchOutcome> {
         let config = Config::global();
         let original_dir = std::env::current_dir().context("failed to read current directory")?;
@@ -992,6 +1050,7 @@ impl CliSession {
             planner_context_limit,
             phase_started.elapsed().as_millis() as u64,
             None,
+            None,
         );
 
         persist_artifact(&workspace.original_dir, &run_id, "plan.md", &plan_text);
@@ -1007,8 +1066,17 @@ impl CliSession {
         };
         config.set_param("GOOSE_ACP_PLAN_EXPLORE", false)?;
 
-        // The implementer session needs to act without approval prompts.
-        config.set_goose_mode(GooseMode::Auto)?;
+        let implementer_is_acp = is_acp_provider(&implementer_role.provider_name);
+        let acp_allowlist =
+            implementer_is_acp && implement_policy == OrchImplementPolicy::Allowlist;
+        let implementer_goose_mode = if acp_allowlist {
+            GooseMode::Approve
+        } else {
+            GooseMode::Auto
+        };
+
+        config.set_param(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, acp_allowlist)?;
+        config.set_goose_mode(implementer_goose_mode)?;
         let impl_model_config = goose::model_config::model_config_from_user_config(
             &implementer_role.provider_name,
             implementer_role.model.as_str(),
@@ -1020,8 +1088,9 @@ impl CliSession {
                 impl_model_config,
             )
             .await?;
+        config.set_param(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, false)?;
 
-        let implementer_playbook = if is_acp_provider(&implementer_role.provider_name) {
+        let implementer_playbook = if implementer_is_acp {
             String::new()
         } else {
             format!("\n\n# Operating playbook\n\n{}", playbook_text())
@@ -1055,9 +1124,14 @@ impl CliSession {
                 .unwrap_or_default();
             self.push_message(Message::user().with_text(&instruction));
             output::show_thinking();
+            goose::acp::reset_orch_implement_denial_count();
             self.process_agent_response(interactive, CancellationToken::default())
                 .await?;
             output::hide_thinking();
+            let policy_summary = PhasePolicySummary {
+                name: implement_policy_label(implement_policy, implementer_is_acp),
+                denials: goose::acp::orch_implement_denial_count(),
+            };
             let usage_after = self
                 .get_session()
                 .await
@@ -1090,6 +1164,7 @@ impl CliSession {
                 None,
                 phase_started.elapsed().as_millis() as u64,
                 None,
+                Some(&policy_summary),
             );
 
             output::set_active_role_status(Some(output::ActiveRoleStatus {
@@ -1193,6 +1268,7 @@ impl CliSession {
                 None,
                 phase_started.elapsed().as_millis() as u64,
                 Some(verdict),
+                None,
             );
 
             if approved {
