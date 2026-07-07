@@ -18,8 +18,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Mutex, OnceLock,
+};
+use std::time::{Duration, Instant};
 
 use super::streaming_buffer::MarkdownBuffer;
 
@@ -84,6 +87,58 @@ thread_local! {
     static THINKING_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ActiveRole {
+    Planner,
+    Implementer,
+    Reviewer,
+}
+
+const ACTIVE_ROLE_NONE: u8 = 0;
+const ACTIVE_ROLE_PLANNER: u8 = 1;
+const ACTIVE_ROLE_IMPLEMENTER: u8 = 2;
+const ACTIVE_ROLE_REVIEWER: u8 = 3;
+const MAX_TRACKED_TOOL_CALLS: usize = 128;
+const LONG_TOOL_CALL_DURATION: Duration = Duration::from_secs(3);
+
+static ACTIVE_ROLE: AtomicU8 = AtomicU8::new(ACTIVE_ROLE_NONE);
+static TOOL_STARTED: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+pub fn set_active_role(role: Option<ActiveRole>) {
+    let value = match role {
+        Some(ActiveRole::Planner) => ACTIVE_ROLE_PLANNER,
+        Some(ActiveRole::Implementer) => ACTIVE_ROLE_IMPLEMENTER,
+        Some(ActiveRole::Reviewer) => ACTIVE_ROLE_REVIEWER,
+        None => ACTIVE_ROLE_NONE,
+    };
+    ACTIVE_ROLE.store(value, Ordering::Relaxed);
+}
+
+fn active_role() -> Option<ActiveRole> {
+    match ACTIVE_ROLE.load(Ordering::Relaxed) {
+        ACTIVE_ROLE_PLANNER => Some(ActiveRole::Planner),
+        ACTIVE_ROLE_IMPLEMENTER => Some(ActiveRole::Implementer),
+        ACTIVE_ROLE_REVIEWER => Some(ActiveRole::Reviewer),
+        _ => None,
+    }
+}
+
+fn role_color(role: ActiveRole) -> Color {
+    match role {
+        ActiveRole::Planner => Color::Cyan,
+        ActiveRole::Implementer => Color::Yellow,
+        ActiveRole::Reviewer => Color::Magenta,
+    }
+}
+
+fn active_or_default_color(default: Color) -> Color {
+    active_role().map(role_color).unwrap_or(default)
+}
+
+fn tool_started() -> &'static Mutex<HashMap<String, Instant>> {
+    TOOL_STARTED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Spinner label showing which model is currently in control
 /// (e.g. "claude-acp/default working…"). None falls back to fun messages.
 pub fn set_thinking_context(context: Option<String>) {
@@ -103,7 +158,8 @@ fn print_response_bullet_once() {
     RESPONSE_BULLET_SHOWN.with(|s| {
         let mut shown = s.borrow_mut();
         if !*shown {
-            println!("\n{}", style("●").white().bold());
+            let color = active_or_default_color(Color::White);
+            println!("\n{}", style("●").fg(color).bold());
             *shown = true;
         }
     });
@@ -155,6 +211,10 @@ impl ThinkingIndicator {
         let spinner = cliclack::spinner();
         let hint = style("(Ctrl+C to interrupt)").dim();
         if let Some(context) = get_thinking_context() {
+            let context = match active_role() {
+                Some(role) => style(context).fg(role_color(role)).to_string(),
+                None => context,
+            };
             spinner.start(format!("{}  {}", context, hint));
         } else if Config::global()
             .get_param("RANDOM_THINKING_MESSAGES")
@@ -513,24 +573,65 @@ fn render_thinking_streaming(
     }
 }
 
+fn remember_tool_start(id: &str) {
+    if let Ok(mut started) = tool_started().lock() {
+        if started.len() >= MAX_TRACKED_TOOL_CALLS {
+            started.clear();
+        }
+        started.insert(id.to_string(), Instant::now());
+    }
+}
+
+fn take_tool_elapsed(id: &str) -> Option<Duration> {
+    tool_started()
+        .lock()
+        .ok()
+        .and_then(|mut started| started.remove(id).map(|started_at| started_at.elapsed()))
+}
+
+fn print_tool_elapsed(elapsed: Option<Duration>, has_output: bool) {
+    let Some(elapsed) = elapsed else {
+        return;
+    };
+    if elapsed < LONG_TOOL_CALL_DURATION {
+        return;
+    }
+
+    let elapsed = format!("{:.1}s", elapsed.as_secs_f64());
+    if has_output {
+        println!("    {}", style(elapsed).dim());
+    } else {
+        println!("  ⎿ {}", style(elapsed).dim());
+    }
+}
+
 fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
+    remember_tool_start(&req.id);
     match &req.tool_call {
-        Ok(call) => match call.name.to_string().as_str() {
-            name if is_shell_tool_name(name) => render_shell_request(call, debug),
-            name if is_file_tool_name(name) => render_text_editor_request(call, debug),
-            "execute_typescript" | "execute_code" => render_execute_code_request(call, debug),
-            "delegate" => render_delegate_request(call, debug),
-            "subagent" => render_delegate_request(call, debug),
-            "todo__write" | "todo__todo_write" => render_todo_request(call, debug),
-            "load" => {}
-            _ => render_default_request(call, debug),
-        },
+        Ok(call) => {
+            if is_acp_tool_request(req) {
+                return render_acp_request(req, call, debug);
+            }
+
+            match call.name.to_string().as_str() {
+                name if is_shell_tool_name(name) => render_shell_request(call, debug),
+                name if is_file_tool_name(name) => render_text_editor_request(call, debug),
+                "execute_typescript" | "execute_code" => render_execute_code_request(call, debug),
+                "delegate" => render_delegate_request(call, debug),
+                "subagent" => render_delegate_request(call, debug),
+                "todo__write" | "todo__todo_write" => render_todo_request(call, debug),
+                "load" => {}
+                _ => render_default_request(call, debug),
+            }
+        }
         Err(e) => print_markdown(&e.to_string(), theme),
     }
 }
 
 fn render_tool_response(resp: &ToolResponse, debug: bool) {
     let config = Config::global();
+    let elapsed = take_tool_elapsed(&resp.id);
+    let mut has_output = false;
 
     match &resp.tool_result {
         Ok(result) => {
@@ -556,15 +657,102 @@ fn render_tool_response(resp: &ToolResponse, debug: bool) {
 
                 if debug {
                     println!("{:#?}", content);
+                    has_output = true;
                 } else if let Some(text) = content.as_text() {
+                    if !text.text.is_empty() {
+                        has_output = true;
+                    }
                     print_tool_output(&text.text);
                 }
             }
         }
         Err(e) => {
             println!("    {}", style(e.to_string()).red().dim());
+            has_output = true;
         }
     }
+    print_tool_elapsed(elapsed, has_output);
+}
+
+fn is_acp_tool_request(req: &ToolRequest) -> bool {
+    acp_tool_kind(req.tool_meta.as_ref()).is_some()
+}
+
+fn acp_tool_kind(tool_meta: Option<&Value>) -> Option<&str> {
+    tool_meta
+        .and_then(|meta| meta.get("goose.acp.kind"))
+        .and_then(Value::as_str)
+}
+
+fn render_acp_request(req: &ToolRequest, call: &CallToolRequestParams, debug: bool) {
+    let arguments = call
+        .arguments
+        .as_ref()
+        .map(|arguments| Value::Object(arguments.clone()))
+        .unwrap_or(Value::Null);
+    let summary = acp_tool_kind(req.tool_meta.as_ref())
+        .and_then(|kind| acp_call_summary(kind, req.tool_meta.as_ref(), &arguments));
+    let bullet = style("●").fg(active_or_default_color(Color::Cyan));
+    let title = style(call.name.to_string()).bold();
+
+    println!();
+    println!("{} {}", bullet, title);
+    if let Some(summary) = summary {
+        println!("  ⎿ {}", style(summary).dim());
+    }
+    if debug {
+        print_params(&call.arguments, 1, debug);
+    }
+}
+
+fn acp_call_summary(kind: &str, tool_meta: Option<&Value>, arguments: &Value) -> Option<String> {
+    if let Some(summary) = acp_location_summary(tool_meta) {
+        return Some(summary);
+    }
+
+    let keys: &[&str] = match kind {
+        "execute" => &["command", "cmd"],
+        "read" | "edit" | "delete" | "move" => &["file_path", "path", "abs_path", "filePath"],
+        "search" => &["pattern", "query"],
+        "fetch" => &["url"],
+        _ => &[],
+    };
+
+    acp_argument_string(arguments, keys)
+        .or_else(|| acp_first_string_argument(arguments))
+        .and_then(clean_acp_summary)
+}
+
+fn acp_location_summary(tool_meta: Option<&Value>) -> Option<String> {
+    let locations = tool_meta?
+        .get("goose.acp.locations")
+        .and_then(Value::as_array)?;
+    let first = locations.first()?;
+    let path = first.get("path").and_then(Value::as_str)?;
+    let mut summary = path.to_string();
+    if let Some(line) = first.get("line").and_then(Value::as_u64) {
+        summary.push(':');
+        summary.push_str(&line.to_string());
+    }
+    if locations.len() > 1 {
+        summary.push_str(&format!(" (+{} more)", locations.len() - 1));
+    }
+    clean_acp_summary(&summary)
+}
+
+fn acp_argument_string<'a>(arguments: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    let object = arguments.as_object()?;
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+}
+
+fn acp_first_string_argument(arguments: &Value) -> Option<&str> {
+    arguments.as_object()?.values().find_map(Value::as_str)
+}
+
+fn clean_acp_summary(raw: &str) -> Option<String> {
+    let cleaned = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!cleaned.is_empty()).then(|| safe_truncate(&cleaned, 80))
 }
 
 fn print_tool_output(text: &str) {
@@ -1151,12 +1339,13 @@ fn render_subagent_tool_graph(subagent_id: &str, tool_graph: &[Value]) {
 
 fn print_tool_header(call: &CallToolRequestParams) {
     let (tool, extension) = split_tool_name(&call.name);
+    let bullet = style("●").fg(active_or_default_color(Color::Cyan));
     let tool_header = if extension.is_empty() {
-        format!("{} {}", style("●").cyan(), style(&tool).bold())
+        format!("{} {}", bullet, style(&tool).bold())
     } else {
         format!(
             "{} {} {}",
-            style("●").cyan(),
+            bullet,
             style(&tool).bold(),
             style(format!("({})", extension)).dim(),
         )
@@ -1871,6 +2060,40 @@ mod tests {
         assert_eq!(
             parse_todo_line("- [?] Mystery"),
             TodoLine::Text("- [?] Mystery".to_string())
+        );
+    }
+
+    #[test]
+    fn acp_call_summary_prefers_locations_with_line_numbers() {
+        let tool_meta = json!({
+            "goose.acp.locations": [
+                {"path": "crates/goose-cli/src/session/output.rs", "line": 42},
+                {"path": "crates/goose-cli/src/session/mod.rs"}
+            ]
+        });
+        let arguments = json!({"command": "cargo test"});
+
+        assert_eq!(
+            acp_call_summary("execute", Some(&tool_meta), &arguments).as_deref(),
+            Some("crates/goose-cli/src/session/output.rs:42 (+1 more)")
+        );
+    }
+
+    #[test]
+    fn acp_call_summary_falls_back_to_kind_specific_arguments() {
+        assert_eq!(
+            acp_call_summary(
+                "execute",
+                None,
+                &json!({"command": "cargo clippy --all-targets -- -D warnings\n"})
+            )
+            .as_deref(),
+            Some("cargo clippy --all-targets -- -D warnings")
+        );
+
+        assert_eq!(
+            acp_call_summary("edit", None, &json!({"file_path": "src/main.rs"})).as_deref(),
+            Some("src/main.rs")
         );
     }
 }

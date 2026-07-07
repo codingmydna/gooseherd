@@ -529,7 +529,7 @@ fn print_help() {
 /prompts [--extension <name>] - List all available prompts, optionally filtered by extension
 /prompt <n> [--info] [key=value...] - Get prompt info or execute a prompt
 /mode <name> - Set the goose mode to use ({modes})
-/model [name] - Show the current model, or switch models for this session while keeping the same provider
+/model [provider/]model - Show the current provider/model, or switch this session and save it as default
 /plan <message_text> -  Enters 'plan' mode with optional message. Create a plan based on the current messages and asks user if they want to act on it.
 /orch <task> - Run the task through a plan/implement/review loop: planner model plans, implementer model executes, reviewer model reviews until approved (GOOSE_PLANNER_*, GOOSE_IMPLEMENTER_*, GOOSE_REVIEWER_* config)
 /status - Show session status: provider/model/effort/connection type, orchestration roles, subagent config, token usage

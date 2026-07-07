@@ -200,6 +200,8 @@ pub enum HintStatus {
 pub struct CompletionCache {
     pub prompts: HashMap<String, Vec<String>>,
     pub prompt_info: HashMap<String, output::PromptInfo>,
+    pub providers: Vec<(String, Vec<String>)>,
+    pub active_provider: Option<String>,
     pub last_updated: Instant,
     pub hint_status: HintStatus,
     pub status_line: Option<String>,
@@ -211,6 +213,8 @@ impl CompletionCache {
         Self {
             prompts: HashMap::new(),
             prompt_info: HashMap::new(),
+            providers: Vec::new(),
+            active_provider: None,
             last_updated: Instant::now(),
             hint_status: HintStatus::Default,
             status_line: None,
@@ -928,18 +932,100 @@ impl CliSession {
             .model_config_for_session(&self.session_id)
             .await?;
         let current_model_name = current_model_config.model_name.clone();
+        let provider_metadata = goose::providers::providers().await;
 
         if model.is_none() {
             output::goose_mode_message(&format!(
-                "Current session model: '{}' (provider '{}')",
-                current_model_name, current_provider_name
+                "Current session model: '{}/{}'",
+                current_provider_name, current_model_name
             ));
+            output::goose_mode_message("Available providers:");
+            for (metadata, _) in &provider_metadata {
+                let marker = if metadata.name == current_provider_name {
+                    "*"
+                } else {
+                    " "
+                };
+                output::goose_mode_message(&format!(
+                    "{} {} ({}) default: {}",
+                    marker, metadata.name, metadata.display_name, metadata.default_model
+                ));
+            }
+            output::goose_mode_message("Use /model <provider>/<model> to switch providers.");
             return Ok(());
         }
 
-        let model_name = model.unwrap_or_default().trim();
-        if model_name.is_empty() {
+        let requested_model = model.unwrap_or_default().trim();
+        if requested_model.is_empty() {
             output::render_error("Model name cannot be empty");
+            return Ok(());
+        }
+
+        let requested_provider =
+            requested_model
+                .split_once('/')
+                .and_then(|(candidate, target_model)| {
+                    provider_metadata
+                        .iter()
+                        .any(|(metadata, _)| metadata.name == candidate)
+                        .then_some((candidate, target_model))
+                });
+
+        if let Some((target_provider, target_model)) = requested_provider {
+            let target_model = target_model.trim();
+            if target_model.is_empty() {
+                output::render_error("Model name cannot be empty");
+                return Ok(());
+            }
+
+            let new_model_config =
+                goose::model_config::model_config_from_user_config(target_provider, target_model)
+                    .map_err(|e| anyhow::anyhow!("Failed to create model configuration: {e}"))?;
+
+            let configured_effort = Config::global().get_goose_thinking_effort();
+            let new_effort = new_model_config.thinking_effort().or(configured_effort);
+            let current_effort = current_model_config.thinking_effort().or(configured_effort);
+            if target_provider == current_provider_name
+                && new_model_config.model_name == current_model_config.model_name
+                && new_effort == current_effort
+            {
+                output::goose_mode_message(&format!(
+                    "Session already using model '{}/{}'",
+                    current_provider_name, current_model_name
+                ));
+                return Ok(());
+            }
+
+            let extensions = self.agent.get_extension_configs().await;
+            let new_provider = match goose::providers::create(target_provider, extensions).await {
+                Ok(provider) => provider,
+                Err(e) => {
+                    output::render_error(&format!(
+                        "Failed to create provider '{target_provider}': {e}"
+                    ));
+                    output::goose_mode_message("Use /model to list available providers.");
+                    return Ok(());
+                }
+            };
+
+            self.agent
+                .update_provider(new_provider, new_model_config, &self.session_id)
+                .await?;
+
+            let mode = self.agent.goose_mode().await;
+            self.agent.update_goose_mode(mode, &self.session_id).await?;
+            if let Err(e) =
+                goose::config::set_active_provider(Config::global(), target_provider, target_model)
+            {
+                output::render_error(&format!(
+                    "Session switched, but failed to save active provider: {e}"
+                ));
+            }
+            self.remember_model_completion(target_provider, target_model);
+            output::goose_mode_message(&format!(
+                "Session switched to '{}/{}' (saved as default)",
+                target_provider, target_model
+            ));
             return Ok(());
         }
 
@@ -958,8 +1044,11 @@ impl CliSession {
             return Ok(());
         }
 
-        let new_model_config =
-            build_switched_model_config(&current_provider_name, model_name, &current_model_config)?;
+        let new_model_config = build_switched_model_config(
+            &current_provider_name,
+            requested_model,
+            &current_model_config,
+        )?;
 
         let configured_effort = Config::global().get_goose_thinking_effort();
         let new_effort = new_model_config.thinking_effort().or(configured_effort);
@@ -985,11 +1074,40 @@ impl CliSession {
 
         let mode = self.agent.goose_mode().await;
         self.agent.update_goose_mode(mode, &self.session_id).await?;
+        if let Err(e) = goose::config::set_active_provider(
+            Config::global(),
+            &current_provider_name,
+            requested_model,
+        ) {
+            output::render_error(&format!(
+                "Session model switched, but failed to save active provider: {e}"
+            ));
+        }
+        self.remember_model_completion(&current_provider_name, requested_model);
         output::goose_mode_message(&format!(
             "Session model switched from '{}' to '{}' for provider '{}'",
-            current_model_name, model_name, current_provider_name
+            current_model_name, requested_model, current_provider_name
         ));
         Ok(())
+    }
+
+    fn remember_model_completion(&self, provider_name: &str, model_name: &str) {
+        if let Ok(mut cache) = self.completion_cache.write() {
+            cache.active_provider = Some(provider_name.to_string());
+            if let Some((_, models)) = cache
+                .providers
+                .iter_mut()
+                .find(|(name, _)| name == provider_name)
+            {
+                if !models.iter().any(|model| model == model_name) {
+                    models.push(model_name.to_string());
+                }
+            } else {
+                cache
+                    .providers
+                    .push((provider_name.to_string(), vec![model_name.to_string()]));
+            }
+        }
     }
 
     async fn handle_plan_mode(&mut self, options: input::PlanCommandOptions) -> Result<()> {
@@ -1667,11 +1785,35 @@ impl CliSession {
     pub async fn update_completion_cache(&mut self) -> Result<()> {
         // Get fresh data
         let prompts = self.agent.list_extension_prompts(&self.session_id).await;
+        let active_provider = self
+            .agent
+            .provider()
+            .await
+            .ok()
+            .map(|provider| provider.get_name().to_string());
+        let providers: Vec<(String, Vec<String>)> = goose::providers::providers()
+            .await
+            .into_iter()
+            .map(|(metadata, _)| {
+                let mut seen = HashSet::new();
+                let mut models = Vec::new();
+                for model in std::iter::once(metadata.default_model)
+                    .chain(metadata.known_models.into_iter().map(|model| model.name))
+                {
+                    if !model.is_empty() && seen.insert(model.clone()) {
+                        models.push(model);
+                    }
+                }
+                (metadata.name, models)
+            })
+            .collect();
 
         // Update the cache with write lock
         let mut cache = self.completion_cache.write().unwrap();
         cache.prompts.clear();
         cache.prompt_info.clear();
+        cache.providers = providers;
+        cache.active_provider = active_provider;
 
         for (extension, prompt_list) in prompts {
             let names: Vec<String> = prompt_list.iter().map(|p| p.name.clone()).collect();

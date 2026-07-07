@@ -110,6 +110,7 @@ enum AcpUpdate {
         name: String,
         kind: ToolKind,
         raw_input: Option<serde_json::Value>,
+        locations: Vec<(String, Option<u32>)>,
     },
     ToolCallComplete {
         id: String,
@@ -549,7 +550,13 @@ impl Provider for AcpProvider {
                             .with_id(id);
                         yield (Some(message), None);
                     }
-                    AcpUpdate::ToolCallStart { id, name, kind, raw_input } => {
+                    AcpUpdate::ToolCallStart {
+                        id,
+                        name,
+                        kind,
+                        raw_input,
+                        locations,
+                    } => {
                         text_run = None;
                         thought_run = None;
                         if reject_all_tools {
@@ -564,10 +571,22 @@ impl Provider for AcpProvider {
                             // call. goose.acp.kind preserves ACP's stable categorization for
                             // downstream consumers (metrics, observability, icon selection)
                             // independent of the display title we put in `name`.
-                            let tool_meta = Some(serde_json::json!({
+                            let mut tool_meta = serde_json::json!({
                                 TOOL_META_EXTERNAL_DISPATCH_KEY: true,
                                 "goose.acp.kind": kind,
-                            }));
+                            });
+                            if !locations.is_empty() {
+                                tool_meta["goose.acp.locations"] = serde_json::json!(
+                                    locations
+                                        .iter()
+                                        .map(|(path, line)| serde_json::json!({
+                                            "path": path,
+                                            "line": line,
+                                        }))
+                                        .collect::<Vec<_>>()
+                                );
+                            }
+                            let tool_meta = Some(tool_meta);
                             let message = Message::assistant().with_tool_request_with_metadata(
                                 id,
                                 Ok(params),
@@ -881,6 +900,13 @@ impl AcpClientLoop {
                                         name: tool_call.title.clone(),
                                         kind: tool_call.kind,
                                         raw_input: tool_call.raw_input.clone(),
+                                        locations: tool_call
+                                            .locations
+                                            .iter()
+                                            .map(|location| {
+                                                (location.path.display().to_string(), location.line)
+                                            })
+                                            .collect(),
                                     });
                                     if let Some(accumulated) = synchronous_accumulated {
                                         let content = if accumulated.content.is_empty() {
@@ -2224,7 +2250,7 @@ mod tests {
     /// signal alongside the `external_dispatch` marker that bypasses agent-loop
     /// routing.
     #[test]
-    fn tool_meta_pairs_external_dispatch_marker_with_acp_kind() {
+    fn tool_meta_pairs_external_dispatch_marker_with_acp_kind_and_locations() {
         let cases = [
             (ToolKind::Execute, "execute"),
             (ToolKind::Read, "read"),
@@ -2235,6 +2261,10 @@ mod tests {
             let tool_meta = serde_json::json!({
                 TOOL_META_EXTERNAL_DISPATCH_KEY: true,
                 "goose.acp.kind": kind,
+                "goose.acp.locations": [
+                    {"path": "src/main.rs", "line": 10},
+                    {"path": "Cargo.toml"}
+                ],
             });
             assert_eq!(
                 tool_meta[TOOL_META_EXTERNAL_DISPATCH_KEY],
@@ -2245,6 +2275,13 @@ mod tests {
                 tool_meta["goose.acp.kind"],
                 serde_json::Value::String(expected.to_string()),
                 "goose.acp.kind serialized wrong for kind={kind:?}"
+            );
+            assert_eq!(tool_meta["goose.acp.locations"][0]["path"], "src/main.rs");
+            assert_eq!(tool_meta["goose.acp.locations"][0]["line"], 10);
+            assert_eq!(tool_meta["goose.acp.locations"][1]["path"], "Cargo.toml");
+            assert!(
+                tool_meta["goose.acp.locations"][1]["line"].is_null(),
+                "missing ACP location line should serialize as null"
             );
         }
     }

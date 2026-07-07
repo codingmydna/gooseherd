@@ -23,7 +23,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/prompts", "List available prompts"),
     ("/prompt", "Get prompt info or run a prompt"),
     ("/mode", "Set goose mode (auto/approve/smart_approve/chat)"),
-    ("/model", "Show or switch the current model"),
+    (
+        "/model",
+        "Show or switch provider/model (e.g. /model codex-acp/gpt-5.5)",
+    ),
     ("/recipe", "Generate a recipe from this session"),
     ("/skills", "List or load skills"),
     ("/status", "Session status: model, roles, subagents, usage"),
@@ -217,7 +220,65 @@ impl GooseCompleter {
 
     /// Complete model names for the /model command.
     fn complete_model_names(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
-        Ok((line.len(), vec![]))
+        let arg_start = "/model ".len();
+        let raw_argument = line.get(arg_start..).unwrap_or("");
+        let trimmed_argument = raw_argument.trim_start();
+        let pos = arg_start + raw_argument.len().saturating_sub(trimmed_argument.len());
+        let cache = self.completion_cache.read().unwrap();
+
+        let candidates =
+            if let Some((provider_name, model_prefix)) = trimmed_argument.split_once('/') {
+                cache
+                    .providers
+                    .iter()
+                    .find(|(name, _)| name == provider_name)
+                    .map(|(_, models)| {
+                        models
+                            .iter()
+                            .filter(|model| model.starts_with(model_prefix))
+                            .map(|model| Pair {
+                                display: model.clone(),
+                                replacement: format!("{provider_name}/{model}"),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                let provider_candidates = cache
+                    .providers
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(trimmed_argument))
+                    .map(|(name, _)| Pair {
+                        display: format!("{name}/"),
+                        replacement: format!("{name}/"),
+                    });
+
+                let active_models = cache
+                    .active_provider
+                    .as_ref()
+                    .and_then(|active| {
+                        cache
+                            .providers
+                            .iter()
+                            .find(|(name, _)| name == active)
+                            .map(|(_, models)| models)
+                    })
+                    .or_else(|| cache.providers.first().map(|(_, models)| models));
+
+                provider_candidates
+                    .chain(active_models.into_iter().flat_map(|models| {
+                        models
+                            .iter()
+                            .filter(|model| model.starts_with(trimmed_argument))
+                            .map(|model| Pair {
+                                display: model.clone(),
+                                replacement: model.clone(),
+                            })
+                    }))
+                    .collect()
+            };
+
+        Ok((pos, candidates))
     }
 
     /// Complete slash commands
@@ -618,6 +679,17 @@ mod tests {
             .prompt_info
             .insert("other_prompt".to_string(), other_prompt_info);
 
+        cache.providers = vec![
+            (
+                "openai".to_string(),
+                vec!["gpt-5".to_string(), "gpt-5.5".to_string()],
+            ),
+            (
+                "codex-acp".to_string(),
+                vec!["gpt-5.5".to_string(), "gpt-5.6".to_string()],
+            ),
+        ];
+
         Arc::new(RwLock::new(cache))
     }
 
@@ -656,11 +728,31 @@ mod tests {
 
         let (pos, candidates) = completer.complete_model_names("/model ").unwrap();
         assert_eq!(pos, "/model ".len());
-        assert!(candidates.is_empty());
+        assert!(candidates.iter().any(|c| c.replacement == "openai/"));
+        assert!(candidates.iter().any(|c| c.replacement == "codex-acp/"));
+        assert!(candidates.iter().any(|c| c.replacement == "gpt-5"));
 
         let (pos, candidates) = completer.complete_model_names("/model gpt").unwrap();
-        assert_eq!(pos, "/model gpt".len());
-        assert!(candidates.is_empty());
+        assert_eq!(pos, "/model ".len());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.replacement.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5", "gpt-5.5"]
+        );
+
+        let (pos, candidates) = completer
+            .complete_model_names("/model codex-acp/gpt-5.")
+            .unwrap();
+        assert_eq!(pos, "/model ".len());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.replacement.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex-acp/gpt-5.5", "codex-acp/gpt-5.6"]
+        );
     }
 
     #[test]

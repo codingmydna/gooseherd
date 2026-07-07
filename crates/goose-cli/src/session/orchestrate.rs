@@ -163,8 +163,16 @@ fn parse_verdict_approved(review: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn phase_banner(text: &str) {
-    println!("{}", console::style(format!("― {} ―", text)).cyan().bold());
+fn phase_banner(text: &str, role: output::ActiveRole) {
+    let color = match role {
+        output::ActiveRole::Planner => console::Color::Cyan,
+        output::ActiveRole::Implementer => console::Color::Yellow,
+        output::ActiveRole::Reviewer => console::Color::Magenta,
+    };
+    println!(
+        "{}",
+        console::style(format!("― {} ―", text)).fg(color).bold()
+    );
 }
 
 /// Distilled Fable 5 operating procedure, injected into roles served by bare
@@ -433,6 +441,8 @@ impl CliSession {
 
         // Restore the session provider and goose mode no matter how the run ended.
         // Plan-Explore must never leak into subsequent provider creations.
+        output::set_active_role(None);
+        output::set_thinking_context(None);
         if let Err(e) = config.set_param("GOOSE_ACP_PLAN_EXPLORE", false) {
             output::render_error(&format!("Failed to reset plan-explore flag: {}", e));
         }
@@ -489,10 +499,14 @@ impl CliSession {
             task,
         };
 
-        phase_banner(&format!(
-            "phase: plan · {}/{}",
-            planner_role.provider_name, planner_role.model
-        ));
+        output::set_active_role(Some(output::ActiveRole::Planner));
+        phase_banner(
+            &format!(
+                "phase: plan · {}/{}",
+                planner_role.provider_name, planner_role.model
+            ),
+            output::ActiveRole::Planner,
+        );
         output::set_thinking_context(Some(format!(
             "planner {}/{} working…",
             planner_role.provider_name, planner_role.model
@@ -570,10 +584,18 @@ impl CliSession {
         );
 
         for cycle in 1..=max_cycles {
-            phase_banner(&format!(
-                "phase: implement (cycle {}/{}) · {}/{}",
-                cycle, max_cycles, implementer_role.provider_name, implementer_role.model
-            ));
+            output::set_active_role(Some(output::ActiveRole::Implementer));
+            phase_banner(
+                &format!(
+                    "phase: implement (cycle {}/{}) · {}/{}",
+                    cycle, max_cycles, implementer_role.provider_name, implementer_role.model
+                ),
+                output::ActiveRole::Implementer,
+            );
+            output::set_thinking_context(Some(format!(
+                "implementer {}/{} working…",
+                implementer_role.provider_name, implementer_role.model
+            )));
             let phase_started = Instant::now();
             let usage_before = self
                 .get_session()
@@ -619,10 +641,14 @@ impl CliSession {
                 None,
             );
 
-            phase_banner(&format!(
-                "phase: review (cycle {}/{}) · {}/{}",
-                cycle, max_cycles, reviewer_role.provider_name, reviewer_role.model
-            ));
+            output::set_active_role(Some(output::ActiveRole::Reviewer));
+            phase_banner(
+                &format!(
+                    "phase: review (cycle {}/{}) · {}/{}",
+                    cycle, max_cycles, reviewer_role.provider_name, reviewer_role.model
+                ),
+                output::ActiveRole::Reviewer,
+            );
             output::set_thinking_context(Some(format!(
                 "reviewer {}/{} working…",
                 reviewer_role.provider_name, reviewer_role.model
