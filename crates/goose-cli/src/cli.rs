@@ -1007,7 +1007,7 @@ enum Command {
     /// Run the plan → implement → review orchestration headlessly
     #[command(
         about = "Run the multi-model plan → implement → review loop headlessly",
-        long_about = "Runs the same plan → implement → review orchestration as the /orch slash command, without an interactive session. Exits 0 when the reviewer approves the implementation, 1 otherwise."
+        long_about = "Runs the same plan → implement → review orchestration as the /orch slash command, without an interactive session. In git repositories, orch creates an isolated worktree, commits approved changes on orch/<run_id>, and prints a merge command. Use --merge or GOOSE_ORCH_AUTO_MERGE=true to merge approved changes back automatically. Exits 0 when the reviewer approves the implementation, 1 otherwise."
     )]
     Orch {
         /// Task to orchestrate
@@ -1020,6 +1020,13 @@ enum Command {
             help = "Maximum implement/review cycles before giving up (default: GOOSE_ORCH_MAX_CYCLES or 3)"
         )]
         max_cycles: Option<u32>,
+
+        /// Merge approved worktree changes back into the original branch
+        #[arg(
+            long = "merge",
+            help = "Automatically merge approved orch/<run_id> changes back into the original branch"
+        )]
+        merge: bool,
     },
 
     /// Recipe utilities for validation and deeplinking
@@ -1986,7 +1993,7 @@ async fn handle_run_command(
     }
 }
 
-async fn handle_orch_command(text: String, max_cycles: Option<u32>) -> Result<()> {
+async fn handle_orch_command(text: String, max_cycles: Option<u32>, merge: bool) -> Result<()> {
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
     let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
 
@@ -1996,7 +2003,9 @@ async fn handle_orch_command(text: String, max_cycles: Option<u32>) -> Result<()
     })
     .await;
 
-    let outcome = session.handle_orchestrate(text, max_cycles, false).await?;
+    let outcome = session
+        .handle_orchestrate(text, max_cycles, merge, false)
+        .await?;
     if outcome != crate::session::OrchOutcome::Approved {
         std::process::exit(1);
     }
@@ -2377,7 +2386,11 @@ pub async fn cli() -> anyhow::Result<()> {
             )
             .await
         }
-        Some(Command::Orch { text, max_cycles }) => handle_orch_command(text, max_cycles).await,
+        Some(Command::Orch {
+            text,
+            max_cycles,
+            merge,
+        }) => handle_orch_command(text, max_cycles, merge).await,
         Some(Command::Gateway { command }) => handle_gateway_command(command).await,
         Some(Command::Schedule { command }) => handle_schedule_command(command).await,
         #[cfg(feature = "update")]
@@ -2556,6 +2569,33 @@ mod tests {
                 assert_eq!(branch, "topic/alpha");
             }
             _ => panic!("expected worktree new command"),
+        }
+    }
+
+    #[test]
+    fn orch_command_accepts_merge_option() {
+        let cli = Cli::try_parse_from([
+            "goose",
+            "orch",
+            "--text",
+            "add orch lifecycle automation",
+            "--max-cycles",
+            "2",
+            "--merge",
+        ])
+        .expect("parse failed");
+
+        match cli.command {
+            Some(Command::Orch {
+                text,
+                max_cycles,
+                merge,
+            }) => {
+                assert_eq!(text, "add orch lifecycle automation");
+                assert_eq!(max_cycles, Some(2));
+                assert!(merge);
+            }
+            _ => panic!("expected orch command"),
         }
     }
 

@@ -36,6 +36,12 @@ pub struct PrunableWorktree {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeResult {
+    Merged,
+    Conflict,
+}
+
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
     git_os(dir, args.iter().map(OsStr::new))
 }
@@ -80,6 +86,12 @@ pub fn find_repo_root(start: &Path) -> Result<PathBuf> {
         bail!("goose worktree requires a git repository. Run it from inside a git checkout.");
     }
     Ok(PathBuf::from(root))
+}
+
+pub fn current_branch(dir: &Path) -> Result<String> {
+    Ok(git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_string())
 }
 
 pub fn create_named_worktree(
@@ -144,6 +156,55 @@ pub fn remove_worktree(repo_root: &Path, path: &Path, force: bool) -> Result<()>
     args.push(path.as_os_str().to_os_string());
     git_os(repo_root, args)?;
     Ok(())
+}
+
+pub fn commit_all(worktree: &Path, message: &str, exclude: &[&str]) -> Result<bool> {
+    let mut add_args = vec![
+        OsString::from("add"),
+        OsString::from("-A"),
+        OsString::from("--"),
+        OsString::from("."),
+    ];
+    for path in exclude {
+        let path = path.trim().trim_end_matches('/');
+        if path.is_empty() {
+            continue;
+        }
+        add_args.push(OsString::from(format!(":(exclude){path}")));
+    }
+    git_os(worktree, add_args)?;
+
+    if git(worktree, &["diff", "--cached", "--name-only"])?
+        .trim()
+        .is_empty()
+    {
+        return Ok(false);
+    }
+
+    git_os(
+        worktree,
+        [OsStr::new("commit"), OsStr::new("-m"), OsStr::new(message)],
+    )?;
+    Ok(true)
+}
+
+pub fn merge_branch(dir: &Path, branch: &str) -> Result<MergeResult> {
+    let output = Command::new("git")
+        .args(["merge", "--no-ff", branch])
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("failed to run git merge --no-ff {branch}"))?;
+    if output.status.success() {
+        return Ok(MergeResult::Merged);
+    }
+
+    let _ = Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Ok(MergeResult::Conflict)
 }
 
 pub fn list_goose_worktrees(start: &Path) -> Result<Vec<WorktreeInfo>> {
@@ -541,5 +602,88 @@ mod tests {
         assert!(error
             .to_string()
             .contains("goose worktree requires a git repository"));
+    }
+
+    #[test]
+    fn current_branch_reports_checked_out_branch() {
+        let repo = init_repo();
+
+        git(repo.path(), ["checkout", "-b", "topic/current"]);
+
+        assert_eq!(
+            super::current_branch(repo.path()).expect("current branch"),
+            "topic/current"
+        );
+    }
+
+    #[test]
+    fn commit_all_excludes_requested_paths_and_reports_empty_staging() {
+        let repo = init_repo();
+        let artifact_dir = repo.path().join(".goose-orch/run-1");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        fs::write(repo.path().join("README.md"), "changed\n").expect("change readme");
+        fs::write(artifact_dir.join("plan.md"), "plan\n").expect("write artifact");
+
+        assert!(
+            super::commit_all(repo.path(), "test: commit changes", &[".goose-orch"])
+                .expect("commit")
+        );
+
+        let tree =
+            super::git(repo.path(), &["ls-tree", "-r", "--name-only", "HEAD"]).expect("tree names");
+        assert!(tree.contains("README.md"));
+        assert!(!tree.contains(".goose-orch"));
+        assert!(
+            !super::commit_all(repo.path(), "test: empty", &[".goose-orch"]).expect("no commit")
+        );
+    }
+
+    #[test]
+    fn merge_branch_merges_committed_worktree_branch() {
+        let repo = init_repo();
+        let created = super::create_named_worktree(repo.path(), "merge", Some("topic/merge"))
+            .expect("worktree");
+        fs::write(created.path.join("README.md"), "changed in worktree\n").expect("change readme");
+        assert!(
+            super::commit_all(&created.path, "test: worktree change", &[]).expect("commit branch")
+        );
+
+        let result = super::merge_branch(repo.path(), "topic/merge").expect("merge");
+
+        assert_eq!(result, super::MergeResult::Merged);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("README.md")).expect("read readme"),
+            "changed in worktree\n"
+        );
+    }
+
+    #[test]
+    fn merge_branch_reports_conflict_and_leaves_original_branch_clean() {
+        let repo = init_repo();
+        let original_branch = super::current_branch(repo.path()).expect("original branch");
+        let created = super::create_named_worktree(repo.path(), "conflict", Some("topic/conflict"))
+            .expect("worktree");
+        fs::write(created.path.join("README.md"), "worktree\n").expect("worktree change");
+        assert!(
+            super::commit_all(&created.path, "test: worktree conflict", &[])
+                .expect("commit branch")
+        );
+        fs::write(repo.path().join("README.md"), "original\n").expect("original change");
+        assert!(
+            super::commit_all(repo.path(), "test: original conflict", &[])
+                .expect("commit original")
+        );
+
+        let result = super::merge_branch(repo.path(), "topic/conflict").expect("conflict result");
+
+        assert_eq!(result, super::MergeResult::Conflict);
+        assert_eq!(
+            super::current_branch(repo.path()).expect("current branch"),
+            original_branch
+        );
+        assert!(super::git(repo.path(), &["status", "--porcelain"])
+            .expect("status")
+            .trim()
+            .is_empty());
     }
 }

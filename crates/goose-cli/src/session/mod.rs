@@ -674,7 +674,7 @@ impl CliSession {
             }
             InputResult::Orchestrate(task) => {
                 history.save(editor);
-                if let Err(e) = self.handle_orchestrate(task, None, true).await {
+                if let Err(e) = self.handle_orchestrate(task, None, false, true).await {
                     output::render_error(&e.to_string());
                 }
             }

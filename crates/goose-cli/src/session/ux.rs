@@ -403,7 +403,10 @@ impl CliSession {
             let config = Config::global();
             let prev_mode = config.get_goose_mode().unwrap_or_default();
             let _ = config.set_goose_mode(GooseMode::Chat);
-            let built = build_role_provider(&role).await;
+            let built = match std::env::current_dir() {
+                Ok(current_dir) => build_role_provider(&role, &current_dir).await,
+                Err(error) => Err(error.into()),
+            };
             let _ = config.set_goose_mode(prev_mode);
 
             let result = async {

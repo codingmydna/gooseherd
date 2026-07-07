@@ -282,7 +282,8 @@ impl CliSession {
         }
 
         config.set_param("GOOSE_ACP_PLAN_EXPLORE", true)?;
-        let judge_built = build_role_provider(&judge_role).await;
+        let current_dir = std::env::current_dir()?;
+        let judge_built = build_role_provider(&judge_role, &current_dir).await;
         config.set_param("GOOSE_ACP_PLAN_EXPLORE", false)?;
         let (judge, judge_model) = judge_built?;
 
