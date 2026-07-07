@@ -44,6 +44,11 @@ use goose_providers::model::ModelConfig;
 
 /// Sentinel: resolved to the actual model name during connect().
 pub const ACP_CURRENT_MODEL: &str = "current";
+const ACP_DEFAULT_MODEL_ALIAS: &str = "default";
+
+fn is_model_selection_alias(model_name: &str) -> bool {
+    matches!(model_name, ACP_CURRENT_MODEL | ACP_DEFAULT_MODEL_ALIAS)
+}
 
 pub struct AcpProviderConfig {
     pub command: PathBuf,
@@ -346,7 +351,7 @@ impl AcpProvider {
         let Some(config_id) = self.model_config_option_id.clone() else {
             return Ok(());
         };
-        if model_name == ACP_CURRENT_MODEL {
+        if is_model_selection_alias(model_name) {
             return Ok(());
         }
 
@@ -1892,6 +1897,21 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_model_if_changed_skips_default_model_alias() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let provider = test_provider_with_model_option(tx, None);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            provider.apply_model_if_changed("default"),
+        )
+        .await;
+
+        assert!(result.is_ok());
         assert!(rx.try_recv().is_err());
     }
 

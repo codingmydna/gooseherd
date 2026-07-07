@@ -36,6 +36,7 @@ mod gcpauth;
 pub mod gcpvertexai;
 pub mod gemini_cli;
 pub mod gemini_oauth;
+pub mod generic_acp;
 pub mod githubcopilot;
 pub mod google;
 pub mod http_status {

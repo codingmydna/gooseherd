@@ -22,6 +22,7 @@ use super::{
     gcpvertexai::GcpVertexAIProvider,
     gemini_cli::GeminiCliProvider,
     gemini_oauth::GeminiOAuthProvider,
+    generic_acp,
     githubcopilot::GithubCopilotProvider,
     google::GoogleProvider,
     huggingface::HuggingFaceProvider,
@@ -174,6 +175,9 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
 
     if let Err(e) = load_custom_providers_into_registry(&mut registry) {
         tracing::warn!("Failed to load custom providers: {}", e);
+    }
+    if let Err(e) = generic_acp::register_generic_acp_providers(&mut registry) {
+        tracing::warn!("Failed to load generic ACP providers: {}", e);
     }
     RwLock::new(registry)
 }

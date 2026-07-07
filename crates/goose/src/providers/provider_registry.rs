@@ -159,6 +159,31 @@ impl ProviderRegistry {
         );
     }
 
+    pub fn register_acp_agent(
+        &mut self,
+        metadata: ProviderMetadata,
+        provider_type: ProviderType,
+        inventory_registration: Option<InventoryRegistration>,
+        constructor: ProviderConstructor,
+    ) {
+        let name = metadata.name.clone();
+        let inventory = InventoryResolvers::for_metadata(&metadata, inventory_registration);
+
+        self.entries.insert(
+            name,
+            ProviderEntry {
+                metadata,
+                constructor,
+                inventory_identity: inventory.identity,
+                inventory_configured: inventory.configured,
+                cleanup: None,
+                provider_type,
+                supports_inventory_refresh: inventory.supports_refresh,
+                tls_config: self.tls_config.clone(),
+            },
+        );
+    }
+
     pub fn register_with_name<P, F, G>(
         &mut self,
         config: &DeclarativeProviderConfig,
@@ -413,5 +438,40 @@ mod tests {
         let entry = registry.entries.get("custom_hf").unwrap();
 
         assert!(!entry.inventory_configured());
+    }
+
+    #[test]
+    fn register_acp_agent_uses_runtime_metadata_and_inventory() {
+        let mut registry = ProviderRegistry::new(None);
+        let metadata = ProviderMetadata::new(
+            "gemini-acp",
+            "Gemini (ACP)",
+            "Configured ACP agent.",
+            "current",
+            vec![],
+            "",
+            vec![],
+        );
+        let constructor: ProviderConstructor = Arc::new(|_, _, _| {
+            Box::pin(async { unreachable!("constructor is not used by this test") })
+        });
+
+        registry.register_acp_agent(
+            metadata,
+            ProviderType::Custom,
+            Some(InventoryRegistration::new(false, || {
+                Ok(InventoryIdentityInput::new("gemini-acp", "gemini-acp"))
+            })),
+            constructor,
+        );
+
+        let entry = registry.entries.get("gemini-acp").unwrap();
+        assert_eq!(entry.metadata().display_name, "Gemini (ACP)");
+        assert_eq!(entry.provider_type(), ProviderType::Custom);
+        assert!(!entry.supports_inventory_refresh());
+        assert_eq!(
+            entry.inventory_identity().unwrap().provider_id,
+            "gemini-acp"
+        );
     }
 }

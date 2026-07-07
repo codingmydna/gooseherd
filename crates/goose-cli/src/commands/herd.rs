@@ -7,6 +7,9 @@ use anyhow::Result;
 use console::style;
 use goose::config::search_path::SearchPaths;
 use goose::config::Config;
+use goose::providers::generic_acp::{
+    generic_acp_provider_name, parse_acp_command, read_acp_agents, GOOSE_ACP_AGENTS_KEY,
+};
 
 const CLAUDE_ADAPTER: &str = "claude-agent-acp";
 const CODEX_ADAPTER: &str = "codex-acp";
@@ -129,6 +132,45 @@ fn check_adapter(binary: &str, package: &str) -> (Check, bool) {
     }
 }
 
+fn check_generic_acp_agents(config: &Config) -> Vec<Check> {
+    let agents = match read_acp_agents(config) {
+        Ok(agents) => agents,
+        Err(error) => {
+            return vec![Check::fail(
+                GOOSE_ACP_AGENTS_KEY,
+                format!("fix {GOOSE_ACP_AGENTS_KEY} in your goose config: {error}"),
+            )];
+        }
+    };
+
+    agents
+        .into_iter()
+        .map(|(key, command)| {
+            let provider_name = generic_acp_provider_name(&key);
+            let (program, _) = match parse_acp_command(&command) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    return Check::fail(
+                        format!("{provider_name} agent"),
+                        format!("set {GOOSE_ACP_AGENTS_KEY}.{key} to a command such as `{key} --acp`"),
+                    );
+                }
+            };
+
+            match resolve_binary(&program) {
+                Some(path) => Check::ok(
+                    format!("{provider_name} agent ({program})"),
+                    Some(path.display().to_string()),
+                ),
+                None => Check::fail(
+                    format!("{provider_name} agent ({program})"),
+                    format!("install the ACP agent CLI for `{key}` or update {GOOSE_ACP_AGENTS_KEY}.{key}"),
+                ),
+            }
+        })
+        .collect()
+}
+
 fn roles_configured(config: &Config) -> bool {
     config.get_param::<String>("GOOSE_PLANNER_PROVIDER").is_ok()
         && config
@@ -184,12 +226,14 @@ pub async fn handle_herd() -> Result<()> {
         check_adapter(CODEX_ADAPTER, CODEX_ADAPTER_PKG);
 
     let config = Config::global();
+    let generic_acp_checks = check_generic_acp_agents(config);
     let mut roles_ok = roles_configured(config);
 
     for check in claude_checks
         .iter()
         .chain(codex_checks.iter())
         .chain([&claude_adapter_check, &codex_adapter_check])
+        .chain(generic_acp_checks.iter())
     {
         print_check(check);
     }
@@ -249,4 +293,66 @@ pub async fn handle_herd() -> Result<()> {
         println!("Fix the ✗ items above, then run `goose herd` again.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> Config {
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        let secrets_file = tempfile::NamedTempFile::new().unwrap();
+        Config::new_with_file_secrets(config_file.path(), secrets_file.path()).unwrap()
+    }
+
+    #[test]
+    fn generic_acp_checks_report_configured_binary() {
+        let config = test_config();
+        #[cfg(unix)]
+        let command = "sh --acp";
+        #[cfg(windows)]
+        let command = "cmd /C acp";
+        let agents = BTreeMap::from([("fake".to_string(), command.to_string())]);
+        config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
+
+        let checks = check_generic_acp_agents(&config);
+
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].ok);
+        assert!(checks[0].label.starts_with("fake-acp agent"));
+    }
+
+    #[test]
+    fn generic_acp_checks_report_missing_binary() {
+        let config = test_config();
+        let agents = BTreeMap::from([(
+            "missing".to_string(),
+            "missing-acp-binary-for-goose-herd-test --acp".to_string(),
+        )]);
+        config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
+
+        let checks = check_generic_acp_agents(&config);
+
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].ok);
+        assert!(checks[0].label.contains("missing-acp agent"));
+        assert!(checks[0]
+            .fix
+            .as_ref()
+            .unwrap()
+            .contains("install the ACP agent CLI"));
+    }
+
+    #[test]
+    fn generic_acp_checks_report_invalid_command() {
+        let config = test_config();
+        let agents = BTreeMap::from([("empty".to_string(), "   ".to_string())]);
+        config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
+
+        let checks = check_generic_acp_agents(&config);
+
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].ok);
+        assert_eq!(checks[0].label, "empty-acp agent");
+    }
 }
