@@ -39,15 +39,14 @@ impl TodoClient {
 
                 Workflow:
                 - Start: write initial checklist
-                - During: update progress
+                - During: mark the task you are working on with [~] (one at a time), completed with [x]
                 - End: verify all complete
 
                 Template:
-                - [x] Requirement 1
-                - [ ] Task
+                - [x] Completed task
+                - [~] Task in progress
+                - [ ] Pending task
                   - [ ] Sub-task
-                - [ ] Requirement 2
-                - [ ] Another task
             "#}
                 .to_string(),
             );

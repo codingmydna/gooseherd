@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use super::streaming_buffer::MarkdownBuffer;
@@ -462,6 +463,8 @@ pub fn render_enter_plan_mode() {
     );
 }
 
+static LAST_TODO_RENDERED: Mutex<Option<String>> = Mutex::new(None);
+
 pub fn render_act_on_plan() {
     println!(
         "\n{}\n",
@@ -518,7 +521,7 @@ fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
             "execute_typescript" | "execute_code" => render_execute_code_request(call, debug),
             "delegate" => render_delegate_request(call, debug),
             "subagent" => render_delegate_request(call, debug),
-            "todo__write" => render_todo_request(call, debug),
+            "todo__write" | "todo__todo_write" => render_todo_request(call, debug),
             "load" => {}
             _ => render_default_request(call, debug),
         },
@@ -916,13 +919,123 @@ fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
     println!();
 }
 
-fn render_todo_request(call: &CallToolRequestParams, _debug: bool) {
-    print_tool_header(call);
+#[derive(Debug, PartialEq, Eq)]
+enum TodoStatus {
+    Pending,
+    InProgress,
+    Done,
+}
 
-    if let Some(args) = &call.arguments {
-        if let Some(Value::String(content)) = args.get("content") {
-            println!("    {} {}", style("content").dim(), style(content).dim());
+#[derive(Debug, PartialEq, Eq)]
+enum TodoLine {
+    Item {
+        indent: String,
+        status: TodoStatus,
+        text: String,
+    },
+    Text(String),
+}
+
+fn parse_todo_line(line: &str) -> TodoLine {
+    let first_non_whitespace = line
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(index, _)| index)
+        .unwrap_or(line.len());
+    let (indent, rest) = line.split_at(first_non_whitespace);
+
+    let Some(after_prefix) = rest.strip_prefix("- [") else {
+        return TodoLine::Text(line.to_string());
+    };
+    let mut chars = after_prefix.chars();
+    let Some(marker) = chars.next() else {
+        return TodoLine::Text(line.to_string());
+    };
+    let after_marker = chars.as_str();
+    let Some(text) = after_marker.strip_prefix("] ") else {
+        return TodoLine::Text(line.to_string());
+    };
+
+    let status = match marker {
+        ' ' => TodoStatus::Pending,
+        '~' | '-' | '/' => TodoStatus::InProgress,
+        'x' | 'X' => TodoStatus::Done,
+        _ => return TodoLine::Text(line.to_string()),
+    };
+
+    TodoLine::Item {
+        indent: indent.to_string(),
+        status,
+        text: text.to_string(),
+    }
+}
+
+fn render_todo_checklist(content: &str) {
+    const MAX_TODO_LINES: usize = 40;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let hidden_lines = if !get_show_full_tool_output() && lines.len() > MAX_TODO_LINES {
+        lines.len() - MAX_TODO_LINES
+    } else {
+        0
+    };
+    let visible_line_count = lines.len() - hidden_lines;
+
+    for line in &lines[..visible_line_count] {
+        match parse_todo_line(line) {
+            TodoLine::Item {
+                indent,
+                status: TodoStatus::Pending,
+                text,
+            } => println!("    {}☐ {}", indent, text),
+            TodoLine::Item {
+                indent,
+                status: TodoStatus::InProgress,
+                text,
+            } => println!(
+                "    {} {}",
+                style(format!("{indent}◐")).cyan(),
+                style(text).cyan()
+            ),
+            TodoLine::Item {
+                indent,
+                status: TodoStatus::Done,
+                text,
+            } => println!(
+                "    {} {}",
+                style(format!("{indent}✔")).dim(),
+                style(text).dim()
+            ),
+            TodoLine::Text(text) => println!("    {}", style(text).dim()),
         }
+    }
+
+    if hidden_lines > 0 {
+        println!(
+            "    {}",
+            style(format!("… (+{} lines)", hidden_lines)).dim().italic()
+        );
+    }
+}
+
+fn render_todo_request(call: &CallToolRequestParams, debug: bool) {
+    let Some(content) = call
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get("content"))
+        .and_then(Value::as_str)
+    else {
+        render_default_request(call, debug);
+        return;
+    };
+
+    print_tool_header(call);
+    let mut last = LAST_TODO_RENDERED.lock().unwrap();
+    if last.as_deref() == Some(content) {
+        println!("    {}", style("(no changes)").dim());
+    } else {
+        render_todo_checklist(content);
+        *last = Some(content.to_string());
     }
     println!();
 }
@@ -1703,5 +1816,61 @@ mod tests {
             json!({"top_up_url": "https://router.tetrate.ai/billing"}),
         );
         assert_eq!(get_credits_top_up_url(&message), None);
+    }
+
+    #[test]
+    fn test_parse_todo_line_recognizes_status_markers() {
+        assert_eq!(
+            parse_todo_line("- [ ] Pending task"),
+            TodoLine::Item {
+                indent: String::new(),
+                status: TodoStatus::Pending,
+                text: "Pending task".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_todo_line("- [~] Task in progress"),
+            TodoLine::Item {
+                indent: String::new(),
+                status: TodoStatus::InProgress,
+                text: "Task in progress".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_todo_line("- [x] Completed task"),
+            TodoLine::Item {
+                indent: String::new(),
+                status: TodoStatus::Done,
+                text: "Completed task".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_todo_line("- [X] Completed task"),
+            TodoLine::Item {
+                indent: String::new(),
+                status: TodoStatus::Done,
+                text: "Completed task".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_todo_line_preserves_indent_and_falls_back() {
+        assert_eq!(
+            parse_todo_line("  - [ ] Sub-task"),
+            TodoLine::Item {
+                indent: "  ".to_string(),
+                status: TodoStatus::Pending,
+                text: "Sub-task".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_todo_line("Notes"),
+            TodoLine::Text("Notes".to_string())
+        );
+        assert_eq!(
+            parse_todo_line("- [?] Mystery"),
+            TodoLine::Text("- [?] Mystery".to_string())
+        );
     }
 }
