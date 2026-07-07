@@ -13,9 +13,13 @@ use super::{ledger, output, CliSession};
 
 const MAX_CYCLES_KEY: &str = "GOOSE_ORCH_MAX_CYCLES";
 const PHASE_IDLE_TIMEOUT_KEY: &str = "GOOSE_ORCH_PHASE_IDLE_TIMEOUT_SECS";
+const GATES_KEY: &str = "GOOSE_ORCH_GATES";
+const MAX_GATE_RETRIES_KEY: &str = "GOOSE_ORCH_MAX_GATE_RETRIES";
 const DEFAULT_MAX_CYCLES: u32 = 3;
 const DEFAULT_PHASE_IDLE_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_MAX_GATE_RETRIES: u32 = 2;
 const EVIDENCE_CHAR_LIMIT: usize = 30_000;
+const GATE_OUTPUT_TAIL_LIMIT: usize = 4_000;
 
 const PLAN_SYSTEM_PROMPT: &str = r#"You are the planning lead in a two-model workflow. A separate implementer model will execute your plan with file-editing and shell tools. Your session is read-only: you can explore the working directory but cannot modify anything.
 
@@ -42,6 +46,7 @@ If REVISE, follow with a numbered list of concrete, actionable defects (file, pr
 pub enum OrchOutcome {
     Approved,
     MaxCycles,
+    GateFailed,
     Aborted,
 }
 
@@ -500,6 +505,199 @@ fn phase_banner(text: &str, role: output::ActiveRole) {
         "{}",
         console::style(format!("― {} ―", text)).fg(color).bold()
     );
+}
+
+fn gate_banner(text: &str) {
+    println!(
+        "{}",
+        console::style(format!("― {} ―", text))
+            .fg(console::Color::Blue)
+            .bold()
+    );
+}
+
+#[derive(Debug)]
+enum GateOutcome {
+    Passed,
+    Failed {
+        command: String,
+        output_tail: String,
+    },
+}
+
+#[derive(Debug)]
+enum GateStep {
+    Proceed,
+    Reimplement(String),
+    Abort(String),
+}
+
+fn effective_gates(gates: Vec<String>) -> Vec<String> {
+    gates
+        .into_iter()
+        .map(|gate| gate.trim().to_string())
+        .filter(|gate| !gate.is_empty())
+        .collect()
+}
+
+fn run_gates(impl_dir: &Path, gates: &[String]) -> GateOutcome {
+    for command in gates {
+        if command.trim().is_empty() {
+            continue;
+        }
+        let output = match spawn_gate(impl_dir, command) {
+            Ok(output) => output,
+            Err(error) => {
+                return GateOutcome::Failed {
+                    command: command.clone(),
+                    output_tail: format!("failed to launch gate command: {error}"),
+                };
+            }
+        };
+
+        if !output.status.success() {
+            let mut combined = format!("status: {}\n", output.status);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stdout.trim().is_empty() {
+                combined.push_str(&format!("stdout:\n{stdout}\n"));
+            }
+            if !stderr.trim().is_empty() {
+                combined.push_str(&format!("stderr:\n{stderr}\n"));
+            }
+            return GateOutcome::Failed {
+                command: command.clone(),
+                output_tail: tail_truncate(&combined, GATE_OUTPUT_TAIL_LIMIT),
+            };
+        }
+    }
+
+    GateOutcome::Passed
+}
+
+fn spawn_gate(impl_dir: &Path, command: &str) -> std::io::Result<std::process::Output> {
+    use std::process::Command;
+
+    let mut cmd = if command_needs_shell(command) {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command);
+        cmd
+    } else {
+        let mut parts = command.split_whitespace();
+        let program = parts.next().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty gate command")
+        })?;
+        let mut cmd = Command::new(program);
+        cmd.args(parts);
+        cmd
+    };
+
+    cmd.current_dir(impl_dir).output()
+}
+
+fn command_needs_shell(command: &str) -> bool {
+    command
+        .chars()
+        .any(|ch| matches!(ch, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`'))
+}
+
+fn tail_truncate(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let marker = "...";
+    let marker_len = marker.chars().count();
+    if max_chars <= marker_len {
+        return marker.chars().take(max_chars).collect();
+    }
+
+    let tail_len = max_chars - marker_len;
+    let tail: String = s.chars().skip(count - tail_len).collect();
+    format!("{marker}{tail}")
+}
+
+fn next_gate_step(outcome: GateOutcome, gate_retries: &mut u32, max_gate_retries: u32) -> GateStep {
+    match outcome {
+        GateOutcome::Passed => GateStep::Proceed,
+        GateOutcome::Failed {
+            command,
+            output_tail,
+        } => {
+            if *gate_retries >= max_gate_retries {
+                GateStep::Abort(format!(
+                    "machine gate `{command}` still failing after {max_gate_retries} retries"
+                ))
+            } else {
+                *gate_retries += 1;
+                GateStep::Reimplement(gate_rejection_instruction(&command, &output_tail))
+            }
+        }
+    }
+}
+
+fn gate_rejection_instruction(command: &str, output_tail: &str) -> String {
+    format!(
+        "A machine quality gate failed; the reviewer was not called. Fix the underlying issue and re-run your verification. All gates must pass before review.\n\nFailed gate command:\n{command}\n\nGate output (tail):\n{output_tail}"
+    )
+}
+
+fn gate_passed_review_note(gates: &[String]) -> String {
+    let commands = gates
+        .iter()
+        .map(|gate| gate.trim())
+        .filter(|gate| !gate.is_empty())
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n게이트 통과: {}", commands.join("; "))
+    }
+}
+
+fn record_gate_phase(
+    meta: &PhaseMeta<'_>,
+    cycle: u32,
+    passed: bool,
+    detail: &str,
+    elapsed_ms: u64,
+) {
+    let verdict = if passed {
+        "PASS".to_string()
+    } else {
+        format!("FAIL: {detail}")
+    };
+    println!(
+        "  {} {}",
+        console::style("⎿").dim(),
+        console::style(format!(
+            "gate {} · {:.1}s",
+            if passed { "passed" } else { "failed" },
+            elapsed_ms as f64 / 1000.0
+        ))
+        .dim()
+    );
+    ledger::append(&ledger::PhaseRecord {
+        ts_ms: ledger::now_ms(),
+        session_id: meta.session_id.to_string(),
+        run_id: meta.run_id.to_string(),
+        phase: "gate".to_string(),
+        cycle,
+        role: "gate".to_string(),
+        provider: String::new(),
+        config_model: String::new(),
+        reported_model: None,
+        context_limit: None,
+        input_tokens: None,
+        output_tokens: None,
+        duration_ms: elapsed_ms,
+        verdict: Some(verdict),
+        task_preview: safe_truncate(meta.task, 120),
+    });
 }
 
 /// Distilled Fable 5 operating procedure, injected into roles served by bare
@@ -1030,67 +1228,123 @@ impl CliSession {
             "You are the implementer in a plan/implement/review workflow. Execute the plan below for the task. Modify files and run verification with your tools. When done, report what you changed and how you verified it.{}\n\nTask:\n{}\n\nWorking directory:\n{}\n\nPlan:\n{}",
             implementer_playbook, task, working_dir, plan_text
         );
+        let gates = effective_gates(
+            config
+                .get_param::<Vec<String>>(GATES_KEY)
+                .unwrap_or_default(),
+        );
+        let max_gate_retries = config
+            .get_param::<u32>(MAX_GATE_RETRIES_KEY)
+            .ok()
+            .unwrap_or(DEFAULT_MAX_GATE_RETRIES);
+        let mut gate_retries = 0;
+        let gate_note = gate_passed_review_note(&gates);
 
         for cycle in 1..=max_cycles {
-            output::set_active_role_status(Some(output::ActiveRoleStatus {
-                role: output::ActiveRole::Implementer,
-                cycle: Some((cycle, max_cycles)),
-            }));
-            phase_banner(
-                &format!(
-                    "phase: implement (cycle {}/{}) · {}/{}",
-                    cycle, max_cycles, implementer_role.provider_name, implementer_role.model
-                ),
-                output::ActiveRole::Implementer,
-            );
-            output::set_thinking_context(Some(format!(
-                "{}/{} working…",
-                implementer_role.provider_name, implementer_role.model
-            )));
-            let phase_started = Instant::now();
-            let usage_before = self
-                .get_session()
-                .await
-                .map(|s| s.accumulated_usage)
-                .unwrap_or_default();
-            self.push_message(Message::user().with_text(&instruction));
-            output::show_thinking();
-            self.process_agent_response(interactive, CancellationToken::default())
-                .await?;
-            output::hide_thinking();
-            let usage_after = self
-                .get_session()
-                .await
-                .map(|s| s.accumulated_usage)
-                .unwrap_or_default();
-            let delta = |after: Option<i32>, before: Option<i32>| match (after, before) {
-                (Some(a), Some(b)) => Some((a - b) as i64),
-                (Some(a), None) => Some(a as i64),
-                _ => None,
-            };
-            let impl_usage = ProviderUsage::new(
-                implementer_role.model.clone(),
-                goose::providers::base::Usage {
-                    input_tokens: delta(usage_after.input_tokens, usage_before.input_tokens)
-                        .map(|n| n as i32),
-                    output_tokens: delta(usage_after.output_tokens, usage_before.output_tokens)
-                        .map(|n| n as i32),
-                    total_tokens: None,
-                    cache_read_input_tokens: None,
-                    cache_write_input_tokens: None,
-                },
-            );
-            record_phase(
-                &meta,
-                "implement",
-                cycle,
-                "implementer",
-                implementer_role,
-                Some(&impl_usage),
-                None,
-                phase_started.elapsed().as_millis() as u64,
-                None,
-            );
+            loop {
+                output::set_active_role_status(Some(output::ActiveRoleStatus {
+                    role: output::ActiveRole::Implementer,
+                    cycle: Some((cycle, max_cycles)),
+                }));
+                phase_banner(
+                    &format!(
+                        "phase: implement (cycle {}/{}) · {}/{}",
+                        cycle, max_cycles, implementer_role.provider_name, implementer_role.model
+                    ),
+                    output::ActiveRole::Implementer,
+                );
+                output::set_thinking_context(Some(format!(
+                    "{}/{} working…",
+                    implementer_role.provider_name, implementer_role.model
+                )));
+                let phase_started = Instant::now();
+                let usage_before = self
+                    .get_session()
+                    .await
+                    .map(|s| s.accumulated_usage)
+                    .unwrap_or_default();
+                self.push_message(Message::user().with_text(&instruction));
+                output::show_thinking();
+                self.process_agent_response(interactive, CancellationToken::default())
+                    .await?;
+                output::hide_thinking();
+                let usage_after = self
+                    .get_session()
+                    .await
+                    .map(|s| s.accumulated_usage)
+                    .unwrap_or_default();
+                let delta = |after: Option<i32>, before: Option<i32>| match (after, before) {
+                    (Some(a), Some(b)) => Some((a - b) as i64),
+                    (Some(a), None) => Some(a as i64),
+                    _ => None,
+                };
+                let impl_usage = ProviderUsage::new(
+                    implementer_role.model.clone(),
+                    goose::providers::base::Usage {
+                        input_tokens: delta(usage_after.input_tokens, usage_before.input_tokens)
+                            .map(|n| n as i32),
+                        output_tokens: delta(usage_after.output_tokens, usage_before.output_tokens)
+                            .map(|n| n as i32),
+                        total_tokens: None,
+                        cache_read_input_tokens: None,
+                        cache_write_input_tokens: None,
+                    },
+                );
+                record_phase(
+                    &meta,
+                    "implement",
+                    cycle,
+                    "implementer",
+                    implementer_role,
+                    Some(&impl_usage),
+                    None,
+                    phase_started.elapsed().as_millis() as u64,
+                    None,
+                );
+
+                if gates.is_empty() {
+                    break;
+                }
+
+                output::set_active_role_status(None);
+                gate_banner(&format!(
+                    "phase: gate (cycle {}/{}) · {} gate(s)",
+                    cycle,
+                    max_cycles,
+                    gates.len()
+                ));
+                let gate_started = Instant::now();
+                let outcome = run_gates(&workspace.impl_dir, &gates);
+                let (passed, detail) = match &outcome {
+                    GateOutcome::Passed => (true, String::new()),
+                    GateOutcome::Failed { command, .. } => (false, command.clone()),
+                };
+                record_gate_phase(
+                    &meta,
+                    cycle,
+                    passed,
+                    &detail,
+                    gate_started.elapsed().as_millis() as u64,
+                );
+
+                match next_gate_step(outcome, &mut gate_retries, max_gate_retries) {
+                    GateStep::Proceed => break,
+                    GateStep::Reimplement(next_instruction) => {
+                        instruction = next_instruction;
+                    }
+                    GateStep::Abort(reason) => {
+                        println!(
+                            "{}",
+                            console::style(format!(
+                                "orchestrate: {reason}; aborting without review."
+                            ))
+                            .red()
+                            .bold()
+                        );
+                        return Ok(OrchOutcome::GateFailed);
+                    }
+                }
+            }
 
             output::set_active_role_status(Some(output::ActiveRoleStatus {
                 role: output::ActiveRole::Reviewer,
@@ -1136,13 +1390,14 @@ impl CliSession {
                 warn_truncated("git evidence", evidence.full.len(), &run_id);
             }
             let review_request = Message::user().with_text(format!(
-                "{}\n\n---\n\nTask:\n{}\n\nPlan:\n{}\n\nGit evidence:\n{}\n\nImplementer report:\n{}\n\nWorking directory: {}",
+                "{}\n\n---\n\nTask:\n{}\n\nPlan:\n{}\n\nGit evidence:\n{}\n\nImplementer report:\n{}\n\nWorking directory: {}{}",
                 REVIEW_SYSTEM_PROMPT,
                 task,
                 plan_text,
                 evidence.text,
                 safe_truncate(&implementer_report, EVIDENCE_CHAR_LIMIT),
-                working_dir
+                working_dir,
+                gate_note
             ));
             output::show_thinking();
             let reviewer_system = role_system_prompt(REVIEW_SYSTEM_PROMPT, reviewer_role);
@@ -1440,6 +1695,148 @@ mod tests {
         assert_eq!(
             super::parse_status_path("R  old.txt -> 새.txt"),
             Some("새.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn run_gates_passes_when_all_commands_succeed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        assert!(matches!(
+            super::run_gates(temp.path(), &["true".to_string()]),
+            super::GateOutcome::Passed
+        ));
+        assert!(matches!(
+            super::run_gates(temp.path(), &[]),
+            super::GateOutcome::Passed
+        ));
+    }
+
+    #[test]
+    fn run_gates_uses_impl_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("sentinel"), "present\n").expect("write sentinel");
+
+        assert!(matches!(
+            super::run_gates(temp.path(), &["test -f sentinel".to_string()]),
+            super::GateOutcome::Passed
+        ));
+    }
+
+    #[test]
+    fn run_gates_stops_at_first_failing_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        match super::run_gates(
+            temp.path(),
+            &["true".to_string(), "false".to_string(), "true".to_string()],
+        ) {
+            super::GateOutcome::Failed { command, .. } => assert_eq!(command, "false"),
+            super::GateOutcome::Passed => panic!("expected failing gate"),
+        }
+    }
+
+    #[test]
+    fn run_gates_captures_stderr_tail_via_shell() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        match super::run_gates(temp.path(), &["echo GATE_MARKER 1>&2; exit 1".to_string()]) {
+            super::GateOutcome::Failed { output_tail, .. } => {
+                assert!(output_tail.contains("GATE_MARKER"), "{output_tail}");
+            }
+            super::GateOutcome::Passed => panic!("expected failing gate"),
+        }
+    }
+
+    #[test]
+    fn command_needs_shell_detects_operators() {
+        assert!(!super::command_needs_shell(
+            "cargo clippy --all-targets -- -D warnings"
+        ));
+        assert!(!super::command_needs_shell("cargo fmt --check"));
+        assert!(super::command_needs_shell("a && b"));
+        assert!(super::command_needs_shell("a | b"));
+        assert!(super::command_needs_shell("a > f"));
+    }
+
+    #[test]
+    fn tail_truncate_keeps_tail() {
+        assert_eq!(super::tail_truncate("abcdef", 20), "abcdef");
+        assert_eq!(super::tail_truncate("abcdef", 5), "...ef");
+        assert_eq!(super::tail_truncate("abcdefgh", 6), "...fgh");
+    }
+
+    #[test]
+    fn next_gate_step_reimplements_then_aborts() {
+        let mut gate_retries = 0;
+
+        for _ in 0..2 {
+            match super::next_gate_step(
+                super::GateOutcome::Failed {
+                    command: "false".to_string(),
+                    output_tail: "tail text".to_string(),
+                },
+                &mut gate_retries,
+                2,
+            ) {
+                super::GateStep::Reimplement(instruction) => {
+                    assert!(instruction.contains("false"));
+                    assert!(instruction.contains("tail text"));
+                }
+                other => panic!("expected reimplement, got {other:?}"),
+            }
+        }
+
+        match super::next_gate_step(
+            super::GateOutcome::Failed {
+                command: "false".to_string(),
+                output_tail: "tail text".to_string(),
+            },
+            &mut gate_retries,
+            2,
+        ) {
+            super::GateStep::Abort(reason) => {
+                assert!(reason.contains("false"));
+                assert!(reason.contains("2"));
+            }
+            other => panic!("expected abort, got {other:?}"),
+        }
+        assert_eq!(gate_retries, 2);
+    }
+
+    #[test]
+    fn next_gate_step_proceeds_on_pass() {
+        let mut gate_retries = 0;
+
+        assert!(matches!(
+            super::next_gate_step(super::GateOutcome::Passed, &mut gate_retries, 2),
+            super::GateStep::Proceed
+        ));
+        assert_eq!(gate_retries, 0);
+    }
+
+    #[test]
+    fn gates_unset_is_noop() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gates = Vec::new();
+
+        assert!(matches!(
+            super::run_gates(temp.path(), &gates),
+            super::GateOutcome::Passed
+        ));
+        assert_eq!(super::gate_passed_review_note(&gates), "");
+    }
+
+    #[test]
+    fn gate_passed_review_note_lists_commands() {
+        let gates = vec![
+            "cargo fmt --check".to_string(),
+            "cargo test -p goose-cli".to_string(),
+        ];
+
+        assert_eq!(
+            super::gate_passed_review_note(&gates),
+            "\n\n게이트 통과: cargo fmt --check; cargo test -p goose-cli"
         );
     }
 }
