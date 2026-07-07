@@ -19,7 +19,7 @@ use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content as RmcpContent, Role, Tool};
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -45,6 +45,18 @@ use goose_providers::model::ModelConfig;
 /// Sentinel: resolved to the actual model name during connect().
 pub const ACP_CURRENT_MODEL: &str = "current";
 const ACP_DEFAULT_MODEL_ALIAS: &str = "default";
+pub const ORCH_IMPLEMENT_POLICY_KEY: &str = "GOOSE_ORCH_IMPLEMENT_POLICY";
+pub const ORCH_IMPLEMENT_ACTIVE_KEY: &str = "GOOSE_ORCH_IMPLEMENT_ACTIVE";
+pub const ORCH_ALLOWED_COMMANDS_KEY: &str = "GOOSE_ORCH_ALLOWED_COMMANDS";
+static ORCH_IMPLEMENT_DENIAL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn reset_orch_implement_denial_count() {
+    ORCH_IMPLEMENT_DENIAL_COUNT.store(0, Ordering::Relaxed);
+}
+
+pub fn orch_implement_denial_count() -> u64 {
+    ORCH_IMPLEMENT_DENIAL_COUNT.load(Ordering::Relaxed)
+}
 
 fn is_model_selection_alias(model_name: &str) -> bool {
     matches!(model_name, ACP_CURRENT_MODEL | ACP_DEFAULT_MODEL_ALIAS)
@@ -157,11 +169,112 @@ struct HandoffContextClaim {
     include_context: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ImplementPolicy {
+    Auto,
+    Allowlist {
+        workspace_root: PathBuf,
+        allowed_commands: Vec<String>,
+    },
+}
+
+impl ImplementPolicy {
+    fn from_config(work_dir: &Path) -> Self {
+        let config = crate::config::Config::global();
+        let active = config
+            .get_param::<bool>(ORCH_IMPLEMENT_ACTIVE_KEY)
+            .unwrap_or(false);
+        if !active {
+            return Self::Auto;
+        }
+
+        let policy = config
+            .get_param::<String>(ORCH_IMPLEMENT_POLICY_KEY)
+            .unwrap_or_else(|_| "auto".to_string());
+        if policy.eq_ignore_ascii_case("allowlist") {
+            Self::Allowlist {
+                workspace_root: work_dir.to_path_buf(),
+                allowed_commands: orch_allowed_commands_from_config(),
+            }
+        } else {
+            Self::Auto
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyPermissionDecision {
+    decision: PermissionDecision,
+    denial_reason: Option<String>,
+}
+
+impl PolicyPermissionDecision {
+    fn allow() -> Self {
+        Self {
+            decision: PermissionDecision::AllowOnce,
+            denial_reason: None,
+        }
+    }
+
+    fn reject(reason: impl Into<String>) -> Self {
+        Self {
+            decision: PermissionDecision::RejectOnce,
+            denial_reason: Some(reason.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AutoPermissionDecision {
+    decision: PermissionDecision,
+    denial_policy: &'static str,
+    denial_reason: Option<String>,
+    count_as_orch_implement_denial: bool,
+}
+
+impl AutoPermissionDecision {
+    fn new(decision: PermissionDecision, denial_policy: &'static str) -> Self {
+        Self {
+            decision,
+            denial_policy,
+            denial_reason: None,
+            count_as_orch_implement_denial: false,
+        }
+    }
+
+    fn implement_allowlist(decision: PolicyPermissionDecision) -> Self {
+        Self {
+            decision: decision.decision,
+            denial_policy: "implement allowlist",
+            denial_reason: decision.denial_reason,
+            count_as_orch_implement_denial: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RejectedToolCall {
+    name: String,
+    policy: &'static str,
+    reason: Option<String>,
+}
+
+impl RejectedToolCall {
+    fn denial_text(&self) -> String {
+        let mut text = format!("Tool call denied by {} policy: {}", self.policy, self.name);
+        if let Some(reason) = self.reason.as_deref().filter(|reason| !reason.is_empty()) {
+            text.push_str(&format!(" ({reason})"));
+        }
+        text
+    }
+}
+
 pub struct AcpProvider {
     name: String,
     goose_mode: Arc<Mutex<GooseMode>>,
     mode_mapping: HashMap<GooseMode, String>,
     plan_explore: bool,
+    implement_policy: ImplementPolicy,
 
     session: AcpSession,
 
@@ -250,6 +363,7 @@ impl AcpProvider {
         let (init_tx, init_rx) = oneshot::channel();
         let mode_mapping = config.mode_mapping.clone();
         let plan_explore = config.plan_explore;
+        let implement_policy = ImplementPolicy::from_config(&config.work_dir);
         let model_config_option_id = config.model_config_option_id.clone();
         let applied_model = config.model_config_option_id.as_ref().and_then(|id| {
             config
@@ -295,6 +409,7 @@ impl AcpProvider {
             goose_mode: goose_mode_shared,
             mode_mapping,
             plan_explore,
+            implement_policy,
             session,
             pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
             pending_tool_updates,
@@ -528,6 +643,7 @@ impl Provider for AcpProvider {
         let reject_all_tools = goose_mode == GooseMode::Chat && !self.plan_explore;
         let model_name = model_config.model_name.clone();
         let plan_explore = self.plan_explore;
+        let implement_policy = self.implement_policy.clone();
         let plan_allow_exec = crate::config::Config::global()
             .get_param::<bool>("GOOSE_PLAN_ALLOW_EXEC")
             .unwrap_or(false);
@@ -535,7 +651,7 @@ impl Provider for AcpProvider {
         Ok(Box::pin(try_stream! {
             let mut suppress_text = false;
             // id → tool name, so denial messages can say what was denied.
-            let mut rejected_tool_calls: HashMap<String, String> = HashMap::new();
+            let mut rejected_tool_calls: HashMap<String, RejectedToolCall> = HashMap::new();
             // Stable id+timestamp per contiguous run so Desktop coalesces chunks into one bubble.
             let mut text_run: Option<(String, i64)> = None;
             let mut thought_run: Option<(String, i64)> = None;
@@ -574,7 +690,14 @@ impl Provider for AcpProvider {
                         thought_run = None;
                         if reject_all_tools {
                             suppress_text = true;
-                            rejected_tool_calls.insert(id, name);
+                            rejected_tool_calls.insert(
+                                id,
+                                RejectedToolCall {
+                                    name,
+                                    policy: "read-only",
+                                    reason: None,
+                                },
+                            );
                         } else {
                             let mut params = CallToolRequestParams::new(name);
                             if let Some(serde_json::Value::Object(map)) = raw_input {
@@ -617,13 +740,12 @@ impl Provider for AcpProvider {
                     } => {
                         text_run = None;
                         thought_run = None;
-                        if let Some(denied_name) = rejected_tool_calls.remove(&id) {
+                        if let Some(rejected) = rejected_tool_calls.remove(&id) {
                             // In chat mode no tool_request was emitted (suppressed at
                             // ToolCallStart), so surface a plain text message. In other
                             // modes a tool_request WAS emitted, so pair it with an error
                             // tool_response so downstream consumers see the rejection.
-                            let denial_text =
-                                format!("Tool call denied by read-only policy: {}", denied_name);
+                            let denial_text = rejected.denial_text();
                             if reject_all_tools {
                                 let message = Message::assistant()
                                     .with_text(&denial_text);
@@ -651,30 +773,53 @@ impl Provider for AcpProvider {
                         text_run = None;
                         thought_run = None;
                         let auto_decision = if plan_explore {
-                            Some(plan_explore_decision(&request, plan_allow_exec))
+                            Some(AutoPermissionDecision::new(
+                                plan_explore_decision(&request, plan_allow_exec),
+                                "read-only",
+                            ))
+                        } else if let ImplementPolicy::Allowlist {
+                            workspace_root,
+                            allowed_commands,
+                        } = &implement_policy
+                        {
+                            Some(AutoPermissionDecision::implement_allowlist(
+                                implement_allowlist_decision(
+                                    &request,
+                                    workspace_root,
+                                    allowed_commands,
+                                ),
+                            ))
                         } else {
                             permission_decision_from_mode(goose_mode)
+                                .map(|decision| AutoPermissionDecision::new(decision, "read-only"))
                         };
-                        if let Some(decision) = auto_decision {
-                            if plan_explore && decision.should_record_rejection() {
+                        if let Some(auto_decision) = auto_decision {
+                            if plan_explore && auto_decision.decision.should_record_rejection() {
                                 if let Some(plan_text) =
                                     recover_plan_from_switch_mode_permission(&request)
                                 {
                                     let _ = response_tx
-                                        .send(map_permission_response(&request, decision));
+                                        .send(permission_response_with_policy_meta(&request, &auto_decision));
                                     let _ = prompt_control_tx.send(PromptControl::Cancel).await;
                                     let message = Message::assistant().with_text(&plan_text);
                                     yield (Some(message), None);
                                     break;
                                 }
                             }
-                            if decision.should_record_rejection() {
+                            if auto_decision.decision.should_record_rejection() {
+                                if auto_decision.count_as_orch_implement_denial {
+                                    ORCH_IMPLEMENT_DENIAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                                }
                                 rejected_tool_calls.insert(
                                     request.tool_call.tool_call_id.0.to_string(),
-                                    request.tool_call.fields.title.clone().unwrap_or_else(|| "Tool".to_string()),
+                                    RejectedToolCall {
+                                        name: request.tool_call.fields.title.clone().unwrap_or_else(|| "Tool".to_string()),
+                                        policy: auto_decision.denial_policy,
+                                        reason: auto_decision.denial_reason.clone(),
+                                    },
                                 );
                             }
-                            let _ = response_tx.send(map_permission_response(&request, decision));
+                            let _ = response_tx.send(permission_response_with_policy_meta(&request, &auto_decision));
                             continue;
                         }
 
@@ -701,7 +846,11 @@ impl Provider for AcpProvider {
                         if decision.should_record_rejection() {
                             rejected_tool_calls.insert(
                                     request.tool_call.tool_call_id.0.to_string(),
-                                    request.tool_call.fields.title.clone().unwrap_or_else(|| "Tool".to_string()),
+                                    RejectedToolCall {
+                                        name: request.tool_call.fields.title.clone().unwrap_or_else(|| "Tool".to_string()),
+                                        policy: "read-only",
+                                        reason: None,
+                                    },
                                 );
                         }
                         let _ = response_tx.send(map_permission_response(&request, decision));
@@ -1673,6 +1822,52 @@ fn resolve_mode(
     }
 }
 
+fn permission_response_with_policy_meta(
+    request: &RequestPermissionRequest,
+    decision: &AutoPermissionDecision,
+) -> RequestPermissionResponse {
+    let mut response = map_permission_response(request, decision.decision);
+    if decision.decision.should_record_rejection() {
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "goose.policy".to_string(),
+            serde_json::json!(decision.denial_policy),
+        );
+        if let Some(reason) = decision.denial_reason.as_deref() {
+            meta.insert("goose.reason".to_string(), serde_json::json!(reason));
+        }
+        response = response.meta(meta);
+    }
+    response
+}
+
+fn orch_allowed_commands_from_config() -> Vec<String> {
+    let config = crate::config::Config::global();
+    if let Ok(commands) = config.get_param::<Vec<String>>(ORCH_ALLOWED_COMMANDS_KEY) {
+        return clean_command_allowlist(commands);
+    }
+
+    config
+        .get_param::<String>(ORCH_ALLOWED_COMMANDS_KEY)
+        .map(|raw| {
+            raw.split([',', '\n'])
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .map(clean_command_allowlist)
+        .unwrap_or_default()
+}
+
+fn clean_command_allowlist(commands: Vec<String>) -> Vec<String> {
+    commands
+        .into_iter()
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty())
+        .collect()
+}
+
 /// Plan-Explore policy: judge a permission request by the tool's ACP kind.
 /// Reads, searches, fetches, thinking, and subagent exploration are approved;
 /// anything that mutates files is rejected. Execute follows `allow_exec`.
@@ -1687,6 +1882,307 @@ fn plan_explore_decision(
         Some(ToolKind::SwitchMode) => PermissionDecision::RejectOnce,
         Some(ToolKind::Execute) if !allow_exec => PermissionDecision::RejectOnce,
         _ => PermissionDecision::AllowOnce,
+    }
+}
+
+/// Implement allowlist policy: ACP implementers may mutate only paths proven
+/// to stay inside the orchestration implementation workspace. Commands must
+/// match GOOSE_ORCH_ALLOWED_COMMANDS by first token or explicit prefix.
+fn implement_allowlist_decision(
+    request: &RequestPermissionRequest,
+    workspace_root: &Path,
+    allowed_commands: &[String],
+) -> PolicyPermissionDecision {
+    match request.tool_call.fields.kind {
+        Some(ToolKind::Edit) | Some(ToolKind::Delete) | Some(ToolKind::Move) => {
+            decide_file_mutation(request, workspace_root)
+        }
+        Some(ToolKind::Execute) => decide_execute(request, allowed_commands),
+        Some(ToolKind::Read)
+        | Some(ToolKind::Search)
+        | Some(ToolKind::Fetch)
+        | Some(ToolKind::Think) => PolicyPermissionDecision::allow(),
+        Some(ToolKind::SwitchMode) => {
+            PolicyPermissionDecision::reject("switching session mode is not allowed")
+        }
+        Some(ToolKind::Other) | None => {
+            PolicyPermissionDecision::reject("unknown tool kind is not allowed")
+        }
+        _ => PolicyPermissionDecision::reject("unsupported tool kind is not allowed"),
+    }
+}
+
+fn decide_file_mutation(
+    request: &RequestPermissionRequest,
+    workspace_root: &Path,
+) -> PolicyPermissionDecision {
+    let workspace_root = match workspace_root.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            return PolicyPermissionDecision::reject(format!(
+                "implement workspace {} cannot be resolved: {error}",
+                workspace_root.display()
+            ));
+        }
+    };
+    let paths = permission_request_paths(request);
+    if paths.is_empty() {
+        return PolicyPermissionDecision::reject(
+            "mutating request did not include a file path in locations or raw_input",
+        );
+    }
+
+    for path in paths {
+        let resolved = match resolve_policy_path(&workspace_root, &path) {
+            Ok(path) => path,
+            Err(reason) => {
+                return PolicyPermissionDecision::reject(format!(
+                    "path {} cannot be resolved: {reason}",
+                    path.display()
+                ));
+            }
+        };
+        if !resolved.starts_with(&workspace_root) {
+            return PolicyPermissionDecision::reject(format!(
+                "path {} resolves outside implement workspace {}",
+                path.display(),
+                workspace_root.display()
+            ));
+        }
+    }
+
+    PolicyPermissionDecision::allow()
+}
+
+fn resolve_policy_path(workspace_root: &Path, path: &Path) -> Result<PathBuf, String> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+
+    if let Ok(canonical) = candidate.canonicalize() {
+        return Ok(canonical);
+    }
+
+    let existing_ancestor = candidate
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| "no existing ancestor".to_string())?;
+    let mut resolved = existing_ancestor
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let remaining = candidate
+        .strip_prefix(existing_ancestor)
+        .map_err(|error| error.to_string())?;
+
+    for component in remaining.components() {
+        match component {
+            Component::Normal(part) => resolved.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("unexpected absolute component".to_string());
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn permission_request_paths(request: &RequestPermissionRequest) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(locations) = request.tool_call.fields.locations.as_deref() {
+        paths.extend(locations.iter().map(|location| location.path.clone()));
+    }
+    if let Some(raw_input) = request.tool_call.fields.raw_input.as_ref() {
+        collect_raw_input_paths(raw_input, &mut paths);
+    }
+    paths
+}
+
+fn collect_raw_input_paths(value: &serde_json::Value, paths: &mut Vec<PathBuf>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if is_path_key(key) {
+                    collect_path_values(value, paths);
+                } else {
+                    collect_raw_input_paths(value, paths);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_raw_input_paths(value, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_path_values(value: &serde_json::Value, paths: &mut Vec<PathBuf>) {
+    match value {
+        serde_json::Value::String(path) if !path.trim().is_empty() => {
+            paths.push(PathBuf::from(path));
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_path_values(value, paths);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_path_values(value, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_path_key(key: &str) -> bool {
+    let normalized = key.replace(['_', '-'], "").to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "path"
+            | "filepath"
+            | "filename"
+            | "file"
+            | "source"
+            | "destination"
+            | "target"
+            | "from"
+            | "to"
+            | "oldpath"
+            | "newpath"
+            | "oldfile"
+            | "newfile"
+    ) || normalized.ends_with("path")
+}
+
+fn decide_execute(
+    request: &RequestPermissionRequest,
+    allowed_commands: &[String],
+) -> PolicyPermissionDecision {
+    let Some(command) = request
+        .tool_call
+        .fields
+        .raw_input
+        .as_ref()
+        .and_then(extract_command)
+    else {
+        return PolicyPermissionDecision::reject(
+            "execute request did not include a command in raw_input",
+        );
+    };
+
+    if command_matches_allowlist(&command, allowed_commands) {
+        PolicyPermissionDecision::allow()
+    } else {
+        PolicyPermissionDecision::reject(format!(
+            "command `{command}` is not in {ORCH_ALLOWED_COMMANDS_KEY}"
+        ))
+    }
+}
+
+fn extract_command(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(command) => non_empty(command),
+        serde_json::Value::Array(values) => command_from_array(values),
+        serde_json::Value::Object(map) => {
+            for key in ["command", "cmd", "shell_command", "shellCommand", "script"] {
+                if let Some(command) = map.get(key).and_then(command_value_to_string) {
+                    return Some(command);
+                }
+            }
+            map.values().find_map(extract_command)
+        }
+        _ => None,
+    }
+}
+
+fn command_value_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(command) => non_empty(command),
+        serde_json::Value::Array(values) => command_from_array(values),
+        _ => None,
+    }
+}
+
+fn command_from_array(values: &[serde_json::Value]) -> Option<String> {
+    let parts = values
+        .iter()
+        .map(|value| value.as_str().map(str::trim))
+        .collect::<Option<Vec<_>>>()?;
+    non_empty(&parts.join(" "))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn command_matches_allowlist(command: &str, allowed_commands: &[String]) -> bool {
+    let command = command.trim();
+    let first_token = first_command_token(command);
+    allowed_commands.iter().any(|allowed| {
+        let allowed = allowed.trim();
+        if allowed.is_empty() {
+            return false;
+        }
+        if !allowed.chars().any(char::is_whitespace) {
+            return first_token.as_deref() == Some(allowed);
+        }
+        command == allowed
+            || command
+                .strip_prefix(allowed)
+                .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+    })
+}
+
+fn first_command_token(command: &str) -> Option<String> {
+    let mut chars = command.trim_start().chars().peekable();
+    let mut token = String::new();
+    let mut quote = None;
+
+    while let Some(ch) = chars.next() {
+        if let Some(quote_char) = quote {
+            if ch == quote_char {
+                quote = None;
+            } else if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    token.push(next);
+                }
+            } else {
+                token.push(ch);
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            break;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '\\' {
+            if let Some(next) = chars.next() {
+                token.push(next);
+            }
+        } else {
+            token.push(ch);
+        }
+    }
+
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
     }
 }
 
@@ -1767,6 +2263,7 @@ mod tests {
                 goose_mode: Arc::new(Mutex::new(GooseMode::Auto)),
                 mode_mapping: HashMap::new(),
                 plan_explore: false,
+                implement_policy: ImplementPolicy::Auto,
                 session: AcpSession {
                     id: SessionId::new("test-session"),
                     response: NewSessionResponse::new("test-session"),
@@ -2204,6 +2701,183 @@ mod tests {
     #[test_case(GooseMode::SmartApprove => None ; "smart_approve defers")]
     fn test_permission_decision_from_mode(mode: GooseMode) -> Option<PermissionDecision> {
         permission_decision_from_mode(mode)
+    }
+
+    fn permission_request(
+        kind: ToolKind,
+        raw_input: serde_json::Value,
+        locations: Vec<&std::path::Path>,
+    ) -> RequestPermissionRequest {
+        use agent_client_protocol::schema::v1::{
+            PermissionOption, PermissionOptionKind, ToolCallId, ToolCallLocation, ToolCallUpdate,
+            ToolCallUpdateFields,
+        };
+
+        let fields = ToolCallUpdateFields::new()
+            .kind(kind)
+            .title("test tool".to_string())
+            .raw_input(raw_input);
+        let fields = if locations.is_empty() {
+            fields
+        } else {
+            fields.locations(
+                locations
+                    .into_iter()
+                    .map(ToolCallLocation::new)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        RequestPermissionRequest::new(
+            "session-1",
+            ToolCallUpdate::new(ToolCallId::new("tool-1"), fields),
+            vec![
+                PermissionOption::new("allow_once", "Allow", PermissionOptionKind::AllowOnce),
+                PermissionOption::new("reject_once", "Reject", PermissionOptionKind::RejectOnce),
+            ],
+        )
+    }
+
+    #[test]
+    fn implement_allowlist_allows_edit_inside_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+        std::fs::write(dir.path().join("src/lib.rs"), "fn main() {}\n").expect("write file");
+        let path = std::path::Path::new("src/lib.rs");
+        let request = permission_request(ToolKind::Edit, serde_json::json!({}), vec![path]);
+
+        let decision = implement_allowlist_decision(&request, dir.path(), &[]);
+
+        assert_eq!(decision.decision, PermissionDecision::AllowOnce);
+        assert_eq!(decision.denial_reason, None);
+    }
+
+    #[test]
+    fn implement_allowlist_allows_create_inside_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+        let request = permission_request(
+            ToolKind::Edit,
+            serde_json::json!({ "path": "src/new_file.rs" }),
+            vec![],
+        );
+
+        let decision = implement_allowlist_decision(&request, dir.path(), &[]);
+
+        assert_eq!(decision.decision, PermissionDecision::AllowOnce);
+    }
+
+    #[test]
+    fn implement_allowlist_rejects_edit_outside_workspace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+        let request =
+            permission_request(ToolKind::Edit, serde_json::json!({}), vec![outside.path()]);
+
+        let decision = implement_allowlist_decision(&request, dir.path(), &[]);
+
+        assert_eq!(decision.decision, PermissionDecision::RejectOnce);
+        assert!(decision
+            .denial_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("outside"));
+    }
+
+    #[test]
+    fn implement_allowlist_rejects_relative_path_escape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let request = permission_request(
+            ToolKind::Edit,
+            serde_json::json!({ "path": "../escaped.rs" }),
+            vec![],
+        );
+
+        let decision = implement_allowlist_decision(&request, dir.path(), &[]);
+
+        assert_eq!(decision.decision, PermissionDecision::RejectOnce);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn implement_allowlist_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("linked"))
+            .expect("create symlink");
+        let request = permission_request(
+            ToolKind::Edit,
+            serde_json::json!({ "path": "linked/new_file.rs" }),
+            vec![],
+        );
+
+        let decision = implement_allowlist_decision(&request, dir.path(), &[]);
+
+        assert_eq!(decision.decision, PermissionDecision::RejectOnce);
+    }
+
+    #[test]
+    fn implement_allowlist_allows_matching_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let allowed = vec!["cargo".to_string(), "git status".to_string()];
+
+        let cargo = permission_request(
+            ToolKind::Execute,
+            serde_json::json!({ "command": "cargo test -p goose" }),
+            vec![],
+        );
+        let git_status = permission_request(
+            ToolKind::Execute,
+            serde_json::json!({ "command": "git status --short" }),
+            vec![],
+        );
+
+        assert_eq!(
+            implement_allowlist_decision(&cargo, dir.path(), &allowed).decision,
+            PermissionDecision::AllowOnce
+        );
+        assert_eq!(
+            implement_allowlist_decision(&git_status, dir.path(), &allowed).decision,
+            PermissionDecision::AllowOnce
+        );
+    }
+
+    #[test]
+    fn implement_allowlist_rejects_non_matching_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let request = permission_request(
+            ToolKind::Execute,
+            serde_json::json!({ "command": "rm -rf ." }),
+            vec![],
+        );
+
+        let decision = implement_allowlist_decision(&request, dir.path(), &["cargo".to_string()]);
+
+        assert_eq!(decision.decision, PermissionDecision::RejectOnce);
+        assert!(decision
+            .denial_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not in GOOSE_ORCH_ALLOWED_COMMANDS"));
+    }
+
+    #[test]
+    fn implement_allowlist_allows_read_kinds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+
+        for kind in [
+            ToolKind::Read,
+            ToolKind::Search,
+            ToolKind::Fetch,
+            ToolKind::Think,
+        ] {
+            let request = permission_request(kind, serde_json::json!({}), vec![outside.path()]);
+
+            let decision = implement_allowlist_decision(&request, dir.path(), &[]);
+
+            assert_eq!(decision.decision, PermissionDecision::AllowOnce);
+        }
     }
 
     #[test_case(
