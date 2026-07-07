@@ -5,8 +5,11 @@ use goose::config::{Config, GooseMode};
 use rustyline::Editor;
 use shlex;
 use std::collections::HashMap;
+use std::io::{self, IsTerminal};
 use std::sync::Arc;
 use strum::VariantNames;
+
+const MIN_INPUT_BOX_WIDTH: usize = 20;
 
 #[derive(Debug)]
 pub enum InputResult {
@@ -155,6 +158,32 @@ fn should_use_editor_always(
     editor_always_override.unwrap_or(has_editor)
 }
 
+pub(super) fn input_box_width(term_cols: usize) -> usize {
+    term_cols.saturating_sub(1).max(MIN_INPUT_BOX_WIDTH)
+}
+
+pub(super) fn terminal_input_box_width() -> usize {
+    let (_, columns) = console::Term::stdout().size();
+    input_box_width(columns.into())
+}
+
+pub(super) fn boxed_prompt(width: usize) -> String {
+    let width = width.max(MIN_INPUT_BOX_WIDTH);
+    format!("╭{}╮\n│ > ", "─".repeat(width.saturating_sub(2)))
+}
+
+pub(super) fn box_bottom(width: usize) -> String {
+    let width = width.max(MIN_INPUT_BOX_WIDTH);
+    format!("╰{}╯", "─".repeat(width.saturating_sub(2)))
+}
+
+fn print_box_bottom(width: usize) {
+    println!(
+        "{}",
+        console::Style::new().dim().apply_to(box_bottom(width))
+    );
+}
+
 pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     conversation_messages: Option<&Vec<String>>,
@@ -221,15 +250,38 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache.clone()))),
     );
 
-    let readline_result = editor.readline("> ");
+    let use_boxed_prompt = io::stdout().is_terminal();
+    let input_box_width = terminal_input_box_width();
+    let prompt = if use_boxed_prompt {
+        boxed_prompt(input_box_width)
+    } else {
+        "> ".to_string()
+    };
+
+    let readline_result = editor.readline(&prompt);
     if let Ok(mut cache) = completion_cache.write() {
         cache.flash = None;
     }
     let input = match readline_result {
-        Ok(text) => text,
+        Ok(text) => {
+            if use_boxed_prompt {
+                print_box_bottom(input_box_width);
+            }
+            text
+        }
         Err(e) => match e {
-            rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
-            rustyline::error::ReadlineError::Eof => return Ok(InputResult::Exit),
+            rustyline::error::ReadlineError::Interrupted => {
+                if use_boxed_prompt {
+                    print_box_bottom(input_box_width);
+                }
+                return Ok(InputResult::Exit);
+            }
+            rustyline::error::ReadlineError::Eof => {
+                if use_boxed_prompt {
+                    print_box_bottom(input_box_width);
+                }
+                return Ok(InputResult::Exit);
+            }
             _ => return Err(e.into()),
         },
     };
@@ -560,6 +612,7 @@ fn print_help() {
 
 Navigation:
 Ctrl+C - Clear current line if text is entered, otherwise exit the session
+Shift+Enter/Alt+Enter - Add a newline when supported by your terminal
 Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
 Up/Down arrows - Navigate through command history"
     );
@@ -593,6 +646,31 @@ fn print_editor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boxed_prompt_draws_top_border_and_prompt() {
+        let prompt = boxed_prompt(20);
+
+        assert_eq!(prompt, "╭──────────────────╮\n│ > ");
+        assert!(!prompt.ends_with('\n'));
+    }
+
+    #[test]
+    fn box_bottom_draws_exact_width_without_trailing_newline() {
+        let bottom = box_bottom(20);
+
+        assert_eq!(bottom, "╰──────────────────╯");
+        assert_eq!(bottom.chars().count(), 20);
+        assert!(!bottom.ends_with('\n'));
+    }
+
+    #[test]
+    fn input_box_width_stays_below_terminal_width_with_minimum() {
+        assert_eq!(input_box_width(80), 79);
+        assert_eq!(input_box_width(20), 20);
+        assert_eq!(input_box_width(3), 20);
+        assert_eq!(input_box_width(0), 20);
+    }
 
     #[test]
     fn test_handle_slash_command() {

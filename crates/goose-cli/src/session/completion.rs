@@ -5,6 +5,7 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper, Result};
 use std::borrow::Cow;
+use std::io::{self, IsTerminal};
 use std::sync::Arc;
 use strum::VariantNames;
 
@@ -79,6 +80,36 @@ fn slash_command_hint(line: &str) -> Option<String> {
         _ => {
             let names: Vec<&str> = matches.iter().take(6).map(|(c, _)| *c).collect();
             Some(format!("   {}", names.join(" ")))
+        }
+    }
+}
+
+fn build_input_hint(inline: Option<&str>, status: &str, width: usize) -> String {
+    let bottom = super::input::box_bottom(width);
+    match inline.filter(|hint| !hint.is_empty()) {
+        Some(inline) => format!("{inline}\n{bottom}\n  {status}"),
+        None => format!("\n{bottom}\n  {status}"),
+    }
+}
+
+fn input_hint_status(cache: &CompletionCache, newline_key: char) -> String {
+    if let Some(flash) = &cache.flash {
+        return flash.clone();
+    }
+
+    match cache.hint_status {
+        HintStatus::Interrupted => "Interrupted, what should goose work on instead?".to_string(),
+        HintStatus::MaybeExit => {
+            "Press Ctrl+C again to exit, or type new instructions to continue".to_string()
+        }
+        HintStatus::Default => {
+            let newline_key = newline_key.to_ascii_uppercase();
+            let controls =
+                format!("Enter to send · Shift+Enter newline · Ctrl+{newline_key} newline");
+            match &cache.status_line {
+                Some(status) => format!("{status} · {controls}"),
+                None => controls,
+            }
         }
     }
 }
@@ -543,6 +574,28 @@ impl Hinter for GooseCompleter {
     type Hint = String;
 
     fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+        if io::stdout().is_terminal() {
+            if !line.is_empty() {
+                let mut cache = self.completion_cache.write().unwrap();
+                if cache.hint_status != HintStatus::Default {
+                    cache.hint_status = HintStatus::Default;
+                }
+            }
+
+            let inline = if line.starts_with('/') && _pos == line.len() {
+                slash_command_hint(line)
+            } else {
+                None
+            };
+            let cache = self.completion_cache.read().unwrap();
+            let status = input_hint_status(&cache, super::input::get_newline_key());
+            return Some(build_input_hint(
+                inline.as_deref(),
+                &status,
+                super::input::terminal_input_box_width(),
+            ));
+        }
+
         let cache = self.completion_cache.read().unwrap();
 
         if !line.is_empty() && cache.hint_status != HintStatus::Default {
@@ -590,6 +643,17 @@ impl Highlighter for GooseCompleter {
         prompt: &'p str,
         _default: bool,
     ) -> Cow<'b, str> {
+        if let Some((top, "│ > ")) = prompt.split_once('\n') {
+            let dim = console::Style::new().dim();
+            let bold = console::Style::new().bold();
+            return Cow::Owned(format!(
+                "{}\n{} {} ",
+                dim.apply_to(top),
+                dim.apply_to("│"),
+                bold.apply_to(">")
+            ));
+        }
+
         Cow::Borrowed(prompt)
     }
 
@@ -691,6 +755,70 @@ mod tests {
         ];
 
         Arc::new(RwLock::new(cache))
+    }
+
+    #[test]
+    fn build_input_hint_places_inline_hint_above_status_box() {
+        let hint = build_input_hint(
+            Some("del — Delete a saved preset"),
+            "anthropic/claude · auto · ctx 12% · Enter to send",
+            20,
+        );
+
+        assert_eq!(
+            hint,
+            "del — Delete a saved preset\n╰──────────────────╯\n  anthropic/claude · auto · ctx 12% · Enter to send"
+        );
+        assert!(!hint.ends_with('\n'));
+    }
+
+    #[test]
+    fn build_input_hint_omits_blank_inline_line() {
+        let hint = build_input_hint(None, "Enter to send", 20);
+
+        assert_eq!(hint, "\n╰──────────────────╯\n  Enter to send");
+        assert!(hint.starts_with('\n'));
+        assert!(!hint.ends_with('\n'));
+    }
+
+    #[test]
+    fn input_hint_status_prioritizes_flash() {
+        let mut cache = CompletionCache::new();
+        cache.status_line = Some("anthropic/claude · auto · ctx 12%".to_string());
+        cache.hint_status = HintStatus::MaybeExit;
+        cache.flash = Some("preset → fast · anthropic/claude".to_string());
+
+        assert_eq!(
+            input_hint_status(&cache, 'J'),
+            "preset → fast · anthropic/claude"
+        );
+    }
+
+    #[test]
+    fn input_hint_status_shows_interrupt_and_exit_prompts() {
+        let mut cache = CompletionCache::new();
+        cache.hint_status = HintStatus::Interrupted;
+        assert_eq!(
+            input_hint_status(&cache, 'J'),
+            "Interrupted, what should goose work on instead?"
+        );
+
+        cache.hint_status = HintStatus::MaybeExit;
+        assert_eq!(
+            input_hint_status(&cache, 'J'),
+            "Press Ctrl+C again to exit, or type new instructions to continue"
+        );
+    }
+
+    #[test]
+    fn input_hint_status_reuses_completion_cache_status_line() {
+        let mut cache = CompletionCache::new();
+        cache.status_line = Some("anthropic/claude · auto · ctx 12%".to_string());
+
+        assert_eq!(
+            input_hint_status(&cache, 'J'),
+            "anthropic/claude · auto · ctx 12% · Enter to send · Shift+Enter newline · Ctrl+J newline"
+        );
     }
 
     #[test]
