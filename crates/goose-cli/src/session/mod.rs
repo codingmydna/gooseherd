@@ -184,9 +184,12 @@ pub struct CliSession {
     retry_config: Option<RetryConfig>,
     output_format: String,
     stats: bool,
-    /// Plain messages typed while a turn was streaming; sent automatically
-    /// once the current turn finishes.
+    /// Plain messages that should be sent automatically after the current
+    /// turn, including live steers that were not injected before turn end.
     queued_inputs: std::sync::Mutex<Vec<String>>,
+    /// Live steering messages sent to the active turn; queued only if they
+    /// are not injected before the turn ends.
+    sent_steers: std::sync::Mutex<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +301,7 @@ impl CliSession {
             output_format,
             stats,
             queued_inputs: std::sync::Mutex::new(Vec::new()),
+            sent_steers: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1436,7 +1440,7 @@ impl CliSession {
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
 
-        // Live slash commands while the turn streams (/status, /stats, /btw…).
+        // Live stdin while the turn streams: slash commands and steering text.
         let mut live_stdin = if interactive
             && Config::global()
                 .get_param::<bool>("GOOSE_LIVE_INPUT")
@@ -1565,6 +1569,10 @@ impl CliSession {
                             } else {
                                 log_tool_metrics(&message, &self.messages);
                                 self.messages.push(message.clone());
+                                let injected_steer = is_injected_steer(&message);
+                                if injected_steer {
+                                    self.mark_steer_delivered();
+                                }
 
                                 if interactive { output::hide_thinking() };
                                 let _ = progress_bars.hide();
@@ -1572,12 +1580,18 @@ impl CliSession {
                                 if is_stream_json_mode {
                                     emit_stream_event(&StreamEvent::Message { message: message.clone() });
                                 } else if !is_json_mode {
-                                    output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
-                                    maybe_open_credits_top_up_url(
-                                        &message,
-                                        interactive,
-                                        &mut prompted_credits_urls,
-                                    );
+                                    if injected_steer {
+                                        output::flush_markdown_buffer_current_theme(&mut markdown_buffer);
+                                        output::reset_response_bullet();
+                                        output::render_steer_injected(&message.as_concat_text());
+                                    } else {
+                                        output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                                        maybe_open_credits_top_up_url(
+                                            &message,
+                                            interactive,
+                                            &mut prompted_credits_urls,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1634,6 +1648,12 @@ impl CliSession {
             }
         }
         drop(live_stdin);
+
+        let leftover_steers = self.take_uninjected_steers();
+        if !leftover_steers.is_empty() {
+            self.agent.discard_pending_steers(&self.session_id).await;
+            self.queued_inputs.lock().unwrap().extend(leftover_steers);
+        }
 
         if !is_json_mode && !is_stream_json_mode {
             output::flush_markdown_buffer_current_theme(&mut markdown_buffer);
@@ -2065,12 +2085,27 @@ impl CliSession {
     fn push_message(&mut self, message: Message) {
         self.messages.push(message);
     }
+
+    fn mark_steer_delivered(&self) {
+        let mut sent_steers = self.sent_steers.lock().unwrap();
+        if !sent_steers.is_empty() {
+            sent_steers.remove(0);
+        }
+    }
+
+    fn take_uninjected_steers(&self) -> Vec<String> {
+        std::mem::take(&mut *self.sent_steers.lock().unwrap())
+    }
 }
 
 fn message_has_text(message: &Message) -> bool {
     message.content.iter().any(
         |content| matches!(content, MessageContent::Text(text) if !text.text.trim().is_empty()),
     )
+}
+
+fn is_injected_steer(message: &Message) -> bool {
+    message.role == rmcp::model::Role::User && message.metadata.steer
 }
 
 fn print_run_stats(
@@ -2674,6 +2709,21 @@ mod tests {
         // 60.5 seconds should still show as 1m 00s (not 1m 00.5s)
         let duration = Duration::from_millis(60500);
         assert_eq!(format_elapsed_time(duration), "1m 00s");
+    }
+
+    #[test]
+    fn test_is_injected_steer_only_matches_user_steer_messages() {
+        assert!(is_injected_steer(
+            &Message::user().with_text("change course").with_steer()
+        ));
+        assert!(!is_injected_steer(
+            &Message::user().with_text("ordinary user message")
+        ));
+        assert!(!is_injected_steer(
+            &Message::assistant()
+                .with_text("assistant response")
+                .with_steer()
+        ));
     }
 
     #[test_case(

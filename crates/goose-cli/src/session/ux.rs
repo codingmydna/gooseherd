@@ -228,18 +228,13 @@ impl CliSession {
             );
             Ok(())
         } else {
-            let position = {
-                let mut q = self.queued_inputs.lock().unwrap();
-                q.push(cmd.to_string());
-                q.len()
-            };
+            self.sent_steers.lock().unwrap().push(cmd.to_string());
+            self.agent
+                .steer(&self.session_id, Message::user().with_text(cmd))
+                .await;
             println!(
                 "\n  {}",
-                style(format!(
-                    "✔ queued (#{}) — will be sent when the current turn finishes · /btw for an immediate side question",
-                    position
-                ))
-                .cyan()
+                style("↪ steering — will be injected after the current tool call finishes").cyan()
             );
             Ok(())
         };

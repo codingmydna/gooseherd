@@ -154,6 +154,16 @@ pub fn reset_response_bullet() {
     RESPONSE_BULLET_SHOWN.with(|s| *s.borrow_mut() = false);
 }
 
+pub fn render_steer_injected(text: &str) {
+    hide_thinking();
+    println!(
+        "\n{} {}",
+        style("↪ steering:").cyan().bold(),
+        style(text).dim()
+    );
+    let _ = std::io::stdout().flush();
+}
+
 fn print_response_bullet_once() {
     RESPONSE_BULLET_SHOWN.with(|s| {
         let mut shown = s.borrow_mut();
