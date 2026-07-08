@@ -247,7 +247,6 @@ impl McpClientTrait for DeveloperClient {
 mod tests {
     use super::*;
     use crate::session::SessionManager;
-    use rmcp::model::RawContent;
     use rmcp::object;
     use std::fs;
 
@@ -270,11 +269,12 @@ mod tests {
         }
     }
 
-    fn first_text(result: &CallToolResult) -> &str {
-        match &result.content[0].raw {
-            RawContent::Text(text) => &text.text,
-            _ => panic!("expected text content"),
-        }
+    fn shell_output(result: &CallToolResult) -> ShellOutput {
+        let value = result
+            .structured_content
+            .clone()
+            .expect("expected structured content");
+        serde_json::from_value(value).expect("expected shell output structured content")
     }
 
     #[tokio::test]
@@ -344,7 +344,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.is_error, Some(false));
-        let observed = std::fs::canonicalize(first_text(&result)).unwrap();
+        let observed = std::fs::canonicalize(shell_output(&result).stdout).unwrap();
         let expected = std::fs::canonicalize(&cwd).unwrap();
         assert_eq!(observed, expected);
     }

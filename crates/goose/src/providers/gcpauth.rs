@@ -682,6 +682,13 @@ iXVBc2YmAuU8hiOFUPxtyQfNzG5fQ0rhJSewdtyWxIadJSLj6fsK+AEsNQ==
         }
     }
 
+    fn mock_service_account_with_token_uri(token_uri: String) -> ServiceAccountCredentials {
+        ServiceAccountCredentials {
+            token_uri,
+            ..mock_service_account()
+        }
+    }
+
     fn mock_authorized_user() -> AuthorizedUserCredentials {
         AuthorizedUserCredentials {
             client_id: "test_client".to_string(),
@@ -689,6 +696,17 @@ iXVBc2YmAuU8hiOFUPxtyQfNzG5fQ0rhJSewdtyWxIadJSLj6fsK+AEsNQ==
             refresh_token: "test_refresh".to_string(),
             token_uri: "https://oauth2.googleapis.com/token".to_string(),
         }
+    }
+
+    fn mock_authorized_user_with_token_uri(token_uri: String) -> AuthorizedUserCredentials {
+        AuthorizedUserCredentials {
+            token_uri,
+            ..mock_authorized_user()
+        }
+    }
+
+    fn install_jwt_crypto_provider() {
+        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
     }
 
     // Helper function to create a test GcpAuth instance with credentials
@@ -725,8 +743,19 @@ iXVBc2YmAuU8hiOFUPxtyQfNzG5fQ0rhJSewdtyWxIadJSLj6fsK+AEsNQ==
 
     #[tokio::test]
     async fn test_token_expiration() {
+        install_jwt_crypto_provider();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid_scope"))
+            .mount(&server)
+            .await;
+
         let auth = GcpAuth {
-            credentials: RwLock::new(AdcCredentials::ServiceAccount(mock_service_account())),
+            credentials: RwLock::new(AdcCredentials::ServiceAccount(
+                mock_service_account_with_token_uri(server.uri()),
+            )),
             client: reqwest::Client::new(),
             cached_token: Arc::new(RwLock::new(Some(CachedToken {
                 token: AuthToken {
@@ -737,9 +766,11 @@ iXVBc2YmAuU8hiOFUPxtyQfNzG5fQ0rhJSewdtyWxIadJSLj6fsK+AEsNQ==
             }))),
         };
 
-        // Should fail as token is expired and real credentials aren't available
         let result = auth.get_token().await;
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(AuthError::TokenExchange(error)) if error.contains("invalid_scope")
+        ));
     }
 
     #[tokio::test]
@@ -794,8 +825,19 @@ iXVBc2YmAuU8hiOFUPxtyQfNzG5fQ0rhJSewdtyWxIadJSLj6fsK+AEsNQ==
 
     #[tokio::test]
     async fn test_token_refresh_race_condition() {
+        install_jwt_crypto_provider();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid_scope"))
+            .mount(&server)
+            .await;
+
         let auth = Arc::new(GcpAuth {
-            credentials: RwLock::new(AdcCredentials::ServiceAccount(mock_service_account())),
+            credentials: RwLock::new(AdcCredentials::ServiceAccount(
+                mock_service_account_with_token_uri(server.uri()),
+            )),
             client: reqwest::Client::new(),
             cached_token: Arc::new(RwLock::new(Some(CachedToken {
                 token: AuthToken {
@@ -847,23 +889,32 @@ iXVBc2YmAuU8hiOFUPxtyQfNzG5fQ0rhJSewdtyWxIadJSLj6fsK+AEsNQ==
 
     #[tokio::test]
     async fn test_authorized_user_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid_grant"))
+            .mount(&server)
+            .await;
+
         let auth = GcpAuth {
-            credentials: RwLock::new(AdcCredentials::AuthorizedUser(mock_authorized_user())),
+            credentials: RwLock::new(AdcCredentials::AuthorizedUser(
+                mock_authorized_user_with_token_uri(server.uri()),
+            )),
             client: reqwest::Client::new(),
             cached_token: Arc::new(RwLock::new(None)),
         };
 
-        // This should fail since we can't actually make the token exchange request
         let result = auth.get_token().await;
-        assert!(result.is_err());
         match result {
-            Err(AuthError::TokenExchange(_)) => (),
+            Err(AuthError::TokenExchange(error)) if error.contains("invalid_grant") => (),
             _ => panic!("Expected TokenExchangeError"),
         }
     }
 
     #[tokio::test]
     async fn test_service_account_jwt_creation() {
+        install_jwt_crypto_provider();
+
         let auth = GcpAuth {
             credentials: RwLock::new(AdcCredentials::ServiceAccount(mock_service_account())),
             client: reqwest::Client::new(),

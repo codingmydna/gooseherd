@@ -201,7 +201,7 @@ impl ProviderTestConfig {
             test_smart_approve: false,
             test_mode_update: false,
             test_context_length_exceeded: false,
-            ..Self::with_llm_provider(name, model_name, &[])
+            ..Self::with_llm_provider(name, model_name, &["GOOSE_RUN_AGENTIC_PROVIDER_TESTS"])
         }
     }
 

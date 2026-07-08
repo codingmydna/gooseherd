@@ -258,6 +258,7 @@ goose-mcp = { path = "../goose-mcp", default-features = false }
 insta = { version = "1", default-features = false }
 dtor = { version = "1.0.5", default-features = false, features = ["proc_macro"] }
 tower = { version = "0.5.2", default-features = false, features = ["util"] }
+jsonwebtoken = { version = "10.2", default-features = false, features = ["rust_crypto"] }
 
 [[example]]
 name = "agent"

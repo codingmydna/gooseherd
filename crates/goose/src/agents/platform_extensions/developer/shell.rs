@@ -851,7 +851,8 @@ mod tests {
             .await;
 
         assert_eq!(result.is_error, Some(false));
-        let observed = std::fs::canonicalize(extract_text(&result)).unwrap();
+        let output = extract_shell_output(&result);
+        let observed = std::fs::canonicalize(output.stdout).unwrap();
         let expected = std::fs::canonicalize(dir.path()).unwrap();
         assert_eq!(observed, expected);
     }

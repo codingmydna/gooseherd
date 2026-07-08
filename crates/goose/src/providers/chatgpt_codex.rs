@@ -1053,6 +1053,10 @@ mod tests {
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn install_jwt_crypto_provider() {
+        let _ = jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER.install_default();
+    }
+
     fn input_kinds(payload: &Value) -> Vec<String> {
         payload["input"]
             .as_array()
@@ -1346,6 +1350,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_jwt_claims_verified_with_issuer() {
+        install_jwt_crypto_provider();
+
         let server = MockServer::start().await;
         let jwks_uri = format!("{}/jwks", server.uri());
         Mock::given(method("GET"))
