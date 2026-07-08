@@ -45,6 +45,7 @@ pub enum InputResult {
     Edit(Option<String>),
     ListSkills,
     LoadSkills(Vec<String>),
+    TerminalSetup,
 }
 
 #[derive(Debug)]
@@ -224,11 +225,9 @@ pub fn get_input(
         rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
     );
 
-    // Shift+Enter → newline. Terminals can't distinguish Shift+Enter from
-    // Enter by default; these cover the two ways it becomes distinguishable:
-    // ESC+CR (Alt/Meta-Enter, and what iTerm2/VS Code/Windows Terminal send
-    // when configured like Claude Code's /terminal-setup) and the kitty
-    // keyboard protocol's modifier-aware Enter (kitty/WezTerm/Ghostty/foot).
+    // Shift+Enter → newline. Most terminals send plain Enter unless configured;
+    // /terminal-setup maps Shift+Enter to ESC+CR, which rustyline reads as
+    // Alt/Meta-Enter and routes to this binding.
     editor.bind_sequence(
         rustyline::KeyEvent(rustyline::KeyCode::Enter, rustyline::Modifiers::ALT),
         rustyline::EventHandler::Simple(rustyline::Cmd::Newline),
@@ -347,6 +346,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_EDIT: &str = "/edit";
     const CMD_EDIT_WITH_SPACE: &str = "/edit ";
     const CMD_SKILLS: &str = "/skills";
+    const CMD_TERMINAL_SETUP: &str = "/terminal-setup";
 
     match input {
         "/exit" | "/quit" => Some(InputResult::Exit),
@@ -355,6 +355,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
             print_editor_help();
             Some(InputResult::Retry)
         }
+        s if s == CMD_TERMINAL_SETUP => Some(InputResult::TerminalSetup),
         "/t" => Some(InputResult::ToggleTheme),
         s if s.starts_with("/t ") => {
             let t = s
@@ -594,6 +595,7 @@ fn print_help() {
 /preset [save <name> | <name> | delete <name>] - Save/apply/delete role presets; bare /preset opens a picker. Shift+Tab cycles presets at the prompt
 /init - Analyze this repository and write (or improve) AGENTS.md
 /remember <note> - Append a note to this project's .goosehints memory
+/terminal-setup - Install a terminal key binding so Shift+Enter can insert a newline
 !<command> - Run a shell command directly; its output is added to the conversation context
                         If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.
                         To warm up goose before using '/plan', we recommend setting '/mode approve' & putting appropriate context into goose.
@@ -612,7 +614,8 @@ fn print_help() {
 
 Navigation:
 Ctrl+C - Clear current line if text is entered, otherwise exit the session
-Shift+Enter/Alt+Enter - Add a newline when supported by your terminal
+Shift+Enter - Add a newline after your terminal sends a distinct key sequence; run /terminal-setup if it submits instead
+Option+Enter - Add a newline using the ESC+Enter sequence
 Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
 Up/Down arrows - Navigate through command history"
     );
@@ -737,6 +740,15 @@ mod tests {
 
         // Test unknown commands
         assert!(handle_slash_command("/unknown").is_none());
+    }
+
+    #[test]
+    fn test_terminal_setup_command() {
+        assert!(matches!(
+            handle_slash_command("/terminal-setup"),
+            Some(InputResult::TerminalSetup)
+        ));
+        assert!(handle_slash_command("/terminal-setup now").is_none());
     }
 
     #[test]

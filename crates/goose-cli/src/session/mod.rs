@@ -12,6 +12,7 @@ mod output;
 mod plan_exemplars;
 pub mod streaming_buffer;
 mod task_execution_display;
+mod terminal_setup;
 mod thinking;
 mod ux;
 mod worktree;
@@ -210,6 +211,7 @@ pub struct CompletionCache {
     pub hint_status: HintStatus,
     pub status_line: Option<String>,
     pub flash: Option<String>,
+    newline_hint_state: terminal_setup::NewlineHintState,
 }
 
 impl CompletionCache {
@@ -223,6 +225,7 @@ impl CompletionCache {
             hint_status: HintStatus::Default,
             status_line: None,
             flash: None,
+            newline_hint_state: terminal_setup::default_newline_hint_state(),
         }
     }
 }
@@ -596,6 +599,8 @@ impl CliSession {
     fn create_editor(
         &self,
     ) -> Result<rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>> {
+        self.refresh_newline_hint_state();
+
         let builder =
             rustyline::Config::builder().completion_type(rustyline::CompletionType::Circular);
         let builder = match self.edit_mode {
@@ -610,6 +615,12 @@ impl CliSession {
         let completer = GooseCompleter::new(self.completion_cache.clone());
         editor.set_helper(Some(completer));
         Ok(editor)
+    }
+
+    fn refresh_newline_hint_state(&self) {
+        if let Ok(mut cache) = self.completion_cache.write() {
+            cache.newline_hint_state = terminal_setup::newline_hint_state_from_current_env();
+        }
     }
 
     async fn handle_input(
@@ -801,6 +812,13 @@ impl CliSession {
             InputResult::ListSkills => {
                 history.save(editor);
                 self.handle_list_skills().await?;
+            }
+            InputResult::TerminalSetup => {
+                history.save(editor);
+                match terminal_setup::run_terminal_setup() {
+                    Ok(()) => self.refresh_newline_hint_state(),
+                    Err(e) => output::render_error(&e.to_string()),
+                }
             }
         }
         Ok(())

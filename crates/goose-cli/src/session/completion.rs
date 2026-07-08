@@ -50,6 +50,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "Clear the conversation history"),
     ("/r", "Toggle full tool output"),
     ("/edit", "Compose the message in your editor"),
+    (
+        "/terminal-setup",
+        "Configure Shift+Enter newline for this terminal",
+    ),
 ];
 
 fn slash_command_hint(line: &str) -> Option<String> {
@@ -92,7 +96,7 @@ fn build_input_hint(inline: Option<&str>, status: &str, width: usize) -> String 
     }
 }
 
-fn input_hint_status(cache: &CompletionCache, newline_key: char) -> String {
+fn input_hint_status(cache: &CompletionCache) -> String {
     if let Some(flash) = &cache.flash {
         return flash.clone();
     }
@@ -103,15 +107,22 @@ fn input_hint_status(cache: &CompletionCache, newline_key: char) -> String {
             "Press Ctrl+C again to exit, or type new instructions to continue".to_string()
         }
         HintStatus::Default => {
-            let newline_key = newline_key.to_ascii_uppercase();
-            let controls =
-                format!("Enter to send · Shift+Enter newline · Ctrl+{newline_key} newline");
+            let controls = newline_controls_from_cache(cache);
             match &cache.status_line {
                 Some(status) => format!("{status} · {controls}"),
                 None => controls,
             }
         }
     }
+}
+
+fn newline_controls_from_cache(cache: &CompletionCache) -> String {
+    let state = cache.newline_hint_state;
+    super::terminal_setup::newline_control_hint(
+        state.terminal,
+        state.shift_enter_configured,
+        super::input::get_newline_key(),
+    )
 }
 
 /// Completer for goose CLI commands
@@ -588,7 +599,7 @@ impl Hinter for GooseCompleter {
                 None
             };
             let cache = self.completion_cache.read().unwrap();
-            let status = input_hint_status(&cache, super::input::get_newline_key());
+            let status = input_hint_status(&cache);
             return Some(build_input_hint(
                 inline.as_deref(),
                 &status,
@@ -624,13 +635,10 @@ impl Hinter for GooseCompleter {
                 Some("Press Ctrl+C again to exit, or type new instructions to continue".to_string())
             }
             HintStatus::Default => {
-                let newline_key = super::input::get_newline_key().to_ascii_uppercase();
+                let controls = newline_controls_from_cache(&cache);
                 match &cache.status_line {
-                    Some(status) => Some(format!(
-                        "{} · Enter to send · Ctrl+{} newline",
-                        status, newline_key
-                    )),
-                    None => Some(format!("Enter to send · Ctrl+{} newline", newline_key)),
+                    Some(status) => Some(format!("{status} · {controls}")),
+                    None => Some(controls),
                 }
             }
         }
@@ -789,7 +797,7 @@ mod tests {
         cache.flash = Some("preset → fast · anthropic/claude".to_string());
 
         assert_eq!(
-            input_hint_status(&cache, 'J'),
+            input_hint_status(&cache),
             "preset → fast · anthropic/claude"
         );
     }
@@ -799,13 +807,13 @@ mod tests {
         let mut cache = CompletionCache::new();
         cache.hint_status = HintStatus::Interrupted;
         assert_eq!(
-            input_hint_status(&cache, 'J'),
+            input_hint_status(&cache),
             "Interrupted, what should goose work on instead?"
         );
 
         cache.hint_status = HintStatus::MaybeExit;
         assert_eq!(
-            input_hint_status(&cache, 'J'),
+            input_hint_status(&cache),
             "Press Ctrl+C again to exit, or type new instructions to continue"
         );
     }
@@ -815,10 +823,30 @@ mod tests {
         let mut cache = CompletionCache::new();
         cache.status_line = Some("anthropic/claude · auto · ctx 12%".to_string());
 
+        let status = input_hint_status(&cache);
+
+        assert!(status.starts_with("anthropic/claude · auto · ctx 12% · Enter to send"));
+        assert!(status.contains("Ctrl+J newline"));
+    }
+
+    #[test]
+    fn input_hint_status_uses_cached_newline_state() {
+        let mut cache = CompletionCache::new();
+        cache.newline_hint_state = super::super::terminal_setup::NewlineHintState {
+            terminal: super::super::terminal_setup::DetectedTerminal::VsCode,
+            shift_enter_configured: true,
+        };
+
         assert_eq!(
-            input_hint_status(&cache, 'J'),
-            "anthropic/claude · auto · ctx 12% · Enter to send · Shift+Enter newline · Ctrl+J newline"
+            input_hint_status(&cache),
+            "Enter to send · Shift+Enter newline · Ctrl+J newline"
         );
+
+        cache.newline_hint_state.shift_enter_configured = false;
+        let status = input_hint_status(&cache);
+
+        assert!(status.contains("/terminal-setup"));
+        assert!(status.contains("Option+Enter"));
     }
 
     #[test]
