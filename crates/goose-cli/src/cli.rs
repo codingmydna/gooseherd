@@ -1007,7 +1007,7 @@ enum Command {
     /// Run the plan → implement → review orchestration headlessly
     #[command(
         about = "Run the multi-model plan → implement → review loop headlessly",
-        long_about = "Runs the same plan → implement → review orchestration as the /orch slash command, without an interactive session. In git repositories, orch creates an isolated worktree, commits approved changes on orch/<run_id>, and prints a merge command. Use --merge or GOOSE_ORCH_AUTO_MERGE=true to merge approved changes back automatically. If GOOSE_ORCH_GATES are configured, they run after each implement phase before review; gate failures re-dispatch to the implementer up to GOOSE_ORCH_MAX_GATE_RETRIES times (default 2), then orch exits 1. Exits 0 when the reviewer approves the implementation, 1 otherwise."
+        long_about = "Runs the same plan → implement → review orchestration as the /orch slash command, without an interactive session. In git repositories, orch creates an isolated worktree, commits approved changes on orch/<run_id>, and prints a merge command. Use --merge or GOOSE_ORCH_AUTO_MERGE=true to merge approved changes back automatically. If GOOSE_ORCH_GATES are configured, they run after each implement phase before review; gate failures re-dispatch to the implementer up to GOOSE_ORCH_MAX_GATE_RETRIES times (default 2), then orch exits 1. During planning, GOOSE_ORCH_ASK=off disables planner question blocks and GOOSE_ORCH_MAX_QUESTIONS bounds question rounds (default 2); headless runs auto-select planner recommendations. Exits 0 when the reviewer approves the implementation, 1 otherwise."
     )]
     Orch {
         /// Task to orchestrate

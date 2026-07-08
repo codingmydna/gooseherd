@@ -8,6 +8,7 @@ mod input;
 mod ledger;
 mod live_input;
 mod model_picker;
+mod orch_ask;
 mod orchestrate;
 mod output;
 mod plan_exemplars;

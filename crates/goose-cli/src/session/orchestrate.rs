@@ -4,22 +4,26 @@ use goose::config::{Config, GooseMode};
 use goose::conversation::message::Message;
 use goose::providers::base::{Provider, ProviderUsage};
 use goose::utils::safe_truncate;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::{ledger, output, plan_exemplars, CliSession};
+use super::{ledger, orch_ask, output, plan_exemplars, CliSession};
 
 const MAX_CYCLES_KEY: &str = "GOOSE_ORCH_MAX_CYCLES";
 const PHASE_IDLE_TIMEOUT_KEY: &str = "GOOSE_ORCH_PHASE_IDLE_TIMEOUT_SECS";
 const GATES_KEY: &str = "GOOSE_ORCH_GATES";
 const MAX_GATE_RETRIES_KEY: &str = "GOOSE_ORCH_MAX_GATE_RETRIES";
+const MAX_QUESTIONS_KEY: &str = "GOOSE_ORCH_MAX_QUESTIONS";
+const ASK_KEY: &str = "GOOSE_ORCH_ASK";
 const DEFAULT_MAX_CYCLES: u32 = 3;
 // Reviewers legitimately go quiet for minutes while a delegated test/build
 // command runs; 120s produced false-positive timeouts on healthy reviews.
 const DEFAULT_PHASE_IDLE_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_MAX_GATE_RETRIES: u32 = 2;
+const DEFAULT_MAX_QUESTION_ROUNDS: u32 = 2;
 const EVIDENCE_CHAR_LIMIT: usize = 30_000;
 const GATE_OUTPUT_TAIL_LIMIT: usize = 4_000;
 
@@ -33,6 +37,16 @@ Produce a concrete, step-by-step implementation plan for the given task:
 - Even if some exploration is blocked, always deliver your best plan from what you could read.
 
 Output only the plan."#;
+
+const PLAN_QUESTION_PROTOCOL_PROMPT: &str = r#"Planner question protocol:
+
+Before writing the plan, ask the user questions only when their answer would materially change the plan: missing requirements from the original task, an important double-check, or multiple sound implementation approaches. To ask, output only a fenced block and end your turn:
+
+```orch-question
+{"questions":[{"header":"short tab label, 12 chars max","question":"...","recommended":0,"options":[{"label":"...","description":"Include pros/cons and explain why this is recommended when it is the recommended option.","preview":"optional multi-line ASCII mockup or code snippet for design/layout questions"}]}]}
+```
+
+Ask 1-3 questions at a time. Each question must have 2-4 options. Put your own preferred option index in recommended and justify that recommendation in the option description. Do not output a plan in the same turn as questions. Once answers arrive, or if the user declines to answer, produce the plan as usual. Prefer deciding yourself; ask only when necessary."#;
 
 const REVIEW_SYSTEM_PROMPT: &str = r#"You are the reviewing lead in a two-model workflow. An implementer model has just attempted the task. You receive the original task, the plan, the git evidence of what changed, and the implementer's report. Your session is read-only: you can inspect files in the working directory but cannot modify anything.
 
@@ -56,6 +70,25 @@ pub enum OrchOutcome {
 enum OrchImplementPolicy {
     Auto,
     Allowlist,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanRoundAction {
+    Ask,
+    Finalize,
+}
+
+fn plan_round_action(
+    round: u32,
+    max_question_rounds: u32,
+    ask_enabled: bool,
+    has_question: bool,
+) -> PlanRoundAction {
+    if ask_enabled && has_question && round < max_question_rounds {
+        PlanRoundAction::Ask
+    } else {
+        PlanRoundAction::Finalize
+    }
 }
 
 fn resolve_orch_implement_policy() -> Result<OrchImplementPolicy> {
@@ -768,6 +801,14 @@ fn role_system_prompt(base: &str, role: &RoleConfig) -> String {
     }
 }
 
+fn planner_prompt(ask_enabled: bool) -> String {
+    if ask_enabled {
+        format!("{PLAN_SYSTEM_PROMPT}\n\n{PLAN_QUESTION_PROTOCOL_PROMPT}")
+    } else {
+        PLAN_SYSTEM_PROMPT.to_string()
+    }
+}
+
 fn orch_phase_idle_timeout() -> Duration {
     let secs = Config::global()
         .get_param::<u64>(PHASE_IDLE_TIMEOUT_KEY)
@@ -775,6 +816,26 @@ fn orch_phase_idle_timeout() -> Duration {
         .filter(|secs| *secs > 0)
         .unwrap_or(DEFAULT_PHASE_IDLE_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+fn orch_max_question_rounds() -> u32 {
+    Config::global()
+        .get_param::<u32>(MAX_QUESTIONS_KEY)
+        .ok()
+        .unwrap_or(DEFAULT_MAX_QUESTION_ROUNDS)
+}
+
+fn orch_ask_enabled() -> bool {
+    Config::global()
+        .get_param::<String>(ASK_KEY)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "0"
+            )
+        })
+        .unwrap_or(true)
 }
 
 /// Write an orchestration artifact under <artifact_dir>/.goose-orch/<run_id>/.
@@ -806,7 +867,7 @@ async fn stream_role_completion(
     provider: &Arc<dyn Provider>,
     model_config: &goose_providers::model::ModelConfig,
     system: &str,
-    request: Message,
+    messages: &[Message],
     session_id: &str,
     debug: bool,
 ) -> Result<(String, Option<ProviderUsage>)> {
@@ -814,7 +875,7 @@ async fn stream_role_completion(
         provider,
         model_config,
         system,
-        request,
+        messages,
         session_id,
         debug,
         None,
@@ -826,7 +887,7 @@ async fn stream_role_completion_with_idle_timeout(
     provider: &Arc<dyn Provider>,
     model_config: &goose_providers::model::ModelConfig,
     system: &str,
-    request: Message,
+    messages: &[Message],
     session_id: &str,
     debug: bool,
     idle_timeout: Option<Duration>,
@@ -835,7 +896,7 @@ async fn stream_role_completion_with_idle_timeout(
 
     let mut stream = goose::session_context::with_session_id(
         Some(session_id.to_string()),
-        provider.stream(model_config, system, &[request], &[]),
+        provider.stream(model_config, system, messages, &[]),
     )
     .await?;
 
@@ -1023,6 +1084,87 @@ fn record_phase(
         plan_exemplar_run_ids: exemplar_injection
             .map(|injection| injection.selected_run_ids.clone()),
     });
+}
+
+fn render_auto_answer_banner(
+    question_set: &orch_ask::OrchQuestionSet,
+    answers: &[orch_ask::OrchAnswer],
+    reason: &str,
+) {
+    println!(
+        "  {}",
+        console::style(format!("planner questions auto-answered ({reason})"))
+            .yellow()
+            .bold()
+    );
+    for answer in answers {
+        let Some(question) = question_set.questions.get(answer.question_index) else {
+            continue;
+        };
+        println!(
+            "  {} {} → {}",
+            console::style("·").dim(),
+            question.header,
+            answer_label(question_set, answer)
+        );
+    }
+}
+
+fn record_question_round(
+    meta: &PhaseMeta<'_>,
+    round: u32,
+    role_cfg: &RoleConfig,
+    question_set: &orch_ask::OrchQuestionSet,
+    answers: &[orch_ask::OrchAnswer],
+    reason: &str,
+) {
+    let selected = answers
+        .iter()
+        .filter_map(|answer| {
+            question_set
+                .questions
+                .get(answer.question_index)
+                .map(|question| {
+                    format!("{}={}", question.header, answer_label(question_set, answer))
+                })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    ledger::append(&ledger::PhaseRecord {
+        ts_ms: ledger::now_ms(),
+        session_id: meta.session_id.to_string(),
+        run_id: meta.run_id.to_string(),
+        phase: "plan-question".to_string(),
+        cycle: round,
+        role: "planner".to_string(),
+        provider: role_cfg.provider_name.clone(),
+        config_model: role_cfg.model.clone(),
+        reported_model: None,
+        context_limit: None,
+        input_tokens: None,
+        output_tokens: None,
+        duration_ms: 0,
+        verdict: Some(format!("{reason}: {selected}")),
+        permission_policy: None,
+        permission_denials: None,
+        task_preview: safe_truncate(meta.task, 120),
+        plan_exemplars_injected: None,
+        plan_exemplar_run_ids: None,
+    });
+}
+
+fn answer_label(question_set: &orch_ask::OrchQuestionSet, answer: &orch_ask::OrchAnswer) -> String {
+    let Some(question) = question_set.questions.get(answer.question_index) else {
+        return "(unknown)".to_string();
+    };
+    match &answer.selection {
+        orch_ask::Selection::Option(index) => question
+            .options
+            .get(*index)
+            .map(|option| option.label.clone())
+            .unwrap_or_else(|| format!("Option {}", index + 1)),
+        orch_ask::Selection::FreeText(text) => format!("Custom: {text}"),
+    }
 }
 
 impl CliSession {
@@ -1215,42 +1357,162 @@ impl CliSession {
         let phase_started = Instant::now();
         let (planner, planner_model) =
             build_role_provider(planner_role, &workspace.impl_dir).await?;
-        output::show_thinking();
+        let ask_enabled = orch_ask_enabled();
+        let planner_instructions = planner_prompt(ask_enabled);
         // ACP providers wrap full agent CLIs that may not receive our system prompt,
         // so the role instructions are embedded in the user message as well.
         let mut plan_request_text = format!(
             "{}\n\n---\n\nTask:\n{}\n\nWorking directory: {}",
-            PLAN_SYSTEM_PROMPT, task, working_dir
+            planner_instructions, task, working_dir
         );
         if let Some(prompt_section) = &plan_exemplar_injection.prompt_section {
             plan_request_text.push_str("\n\n---\n\n");
             plan_request_text.push_str(prompt_section);
         }
         let plan_request = Message::user().with_text(plan_request_text);
-        let planner_system = role_system_prompt(PLAN_SYSTEM_PROMPT, planner_role);
-        let (plan_text, plan_usage) = if let Some(timeout) = role_idle_timeout {
-            stream_role_completion_with_idle_timeout(
-                &planner,
-                &planner_model,
-                &planner_system,
-                plan_request,
-                &self.session_id,
-                self.debug,
-                Some(timeout),
-            )
-            .await?
-        } else {
-            stream_role_completion(
-                &planner,
-                &planner_model,
-                &planner_system,
-                plan_request,
-                &self.session_id,
-                self.debug,
-            )
-            .await?
+        let planner_system = role_system_prompt(&planner_instructions, planner_role);
+        let max_question_rounds = orch_max_question_rounds();
+        let ui_available = interactive && std::io::stdout().is_terminal();
+        let mut planner_messages = vec![plan_request];
+        let mut qa_rounds: Vec<(orch_ask::OrchQuestionSet, Vec<orch_ask::OrchAnswer>)> = Vec::new();
+        let mut question_rounds = 0;
+        let mut force_final_plan = false;
+
+        let (mut plan_text, plan_usage) = loop {
+            output::show_thinking();
+            let (planner_text, usage) = if let Some(timeout) = role_idle_timeout {
+                stream_role_completion_with_idle_timeout(
+                    &planner,
+                    &planner_model,
+                    &planner_system,
+                    &planner_messages,
+                    &self.session_id,
+                    self.debug,
+                    Some(timeout),
+                )
+                .await?
+            } else {
+                stream_role_completion(
+                    &planner,
+                    &planner_model,
+                    &planner_system,
+                    &planner_messages,
+                    &self.session_id,
+                    self.debug,
+                )
+                .await?
+            };
+            output::hide_thinking();
+            if planner_text.trim().is_empty() {
+                anyhow::bail!("planner produced an empty plan");
+            }
+
+            let parsed = if ask_enabled && !force_final_plan {
+                orch_ask::parse_orch_question_block(&planner_text)
+            } else {
+                None
+            };
+            match plan_round_action(
+                question_rounds,
+                max_question_rounds,
+                ask_enabled && !force_final_plan,
+                parsed.is_some(),
+            ) {
+                PlanRoundAction::Finalize => {
+                    if let Some(question_set) = parsed {
+                        let answers = orch_ask::auto_recommended_answers(&question_set);
+                        render_auto_answer_banner(&question_set, &answers, "round limit");
+                        record_question_round(
+                            &meta,
+                            question_rounds + 1,
+                            planner_role,
+                            &question_set,
+                            &answers,
+                            "auto-recommended round limit",
+                        );
+                        planner_messages.push(Message::assistant().with_text(planner_text));
+                        let mut reply = orch_ask::format_answers_message(&question_set, &answers);
+                        reply.push_str(
+                            "\nQuestion round limit reached. Do not ask more questions; produce the plan now.",
+                        );
+                        planner_messages.push(Message::user().with_text(reply));
+                        qa_rounds.push((question_set, answers));
+                        force_final_plan = true;
+                        continue;
+                    }
+                    break (planner_text, usage);
+                }
+                PlanRoundAction::Ask => {
+                    let question_set = parsed.expect("question exists for ask action");
+                    let round = question_rounds + 1;
+                    question_rounds = round;
+                    phase_banner(
+                        &format!(
+                            "phase: plan · question round {}/{}",
+                            round, max_question_rounds
+                        ),
+                        output::ActiveRole::Planner,
+                    );
+                    let outcome = if ui_available {
+                        match orch_ask::run_ask_ui(&console::Term::stdout(), &question_set) {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                println!(
+                                    "  {}",
+                                    console::style(format!(
+                                        "question UI failed ({error}); planner will decide"
+                                    ))
+                                    .yellow()
+                                );
+                                orch_ask::AskOutcome::Cancelled
+                            }
+                        }
+                    } else {
+                        let answers = orch_ask::auto_recommended_answers(&question_set);
+                        render_auto_answer_banner(&question_set, &answers, "non-interactive");
+                        record_question_round(
+                            &meta,
+                            round,
+                            planner_role,
+                            &question_set,
+                            &answers,
+                            "auto-recommended non-interactive",
+                        );
+                        orch_ask::AskOutcome::Submitted(answers)
+                    };
+
+                    planner_messages.push(Message::assistant().with_text(planner_text));
+                    match outcome {
+                        orch_ask::AskOutcome::Submitted(answers) => {
+                            let reply = orch_ask::format_answers_message(&question_set, &answers);
+                            planner_messages.push(Message::user().with_text(reply));
+                            qa_rounds.push((question_set, answers));
+                        }
+                        orch_ask::AskOutcome::Chat {
+                            question_index,
+                            text,
+                        } => {
+                            let reply =
+                                orch_ask::chat_reply_message(&question_set, question_index, &text);
+                            planner_messages.push(Message::user().with_text(reply));
+                        }
+                        orch_ask::AskOutcome::Cancelled => {
+                            planner_messages.push(Message::user().with_text(
+                                "The user declined to answer. Proceed using your own recommended options and produce the plan now.",
+                            ));
+                            force_final_plan = true;
+                        }
+                    }
+                }
+            }
         };
-        output::hide_thinking();
+        if !qa_rounds.is_empty() {
+            plan_text = format!(
+                "{}\n\n{}",
+                orch_ask::qa_markdown_section(&qa_rounds),
+                plan_text
+            );
+        }
         if plan_text.trim().is_empty() {
             anyhow::bail!("planner produced an empty plan");
         }
@@ -1502,7 +1764,7 @@ impl CliSession {
                     &reviewer,
                     &reviewer_model,
                     &reviewer_system,
-                    review_request,
+                    std::slice::from_ref(&review_request),
                     &self.session_id,
                     self.debug,
                     Some(timeout),
@@ -1513,7 +1775,7 @@ impl CliSession {
                     &reviewer,
                     &reviewer_model,
                     &reviewer_system,
-                    review_request,
+                    std::slice::from_ref(&review_request),
                     &self.session_id,
                     self.debug,
                 )
@@ -1670,12 +1932,13 @@ mod tests {
         let provider: Arc<dyn goose::providers::base::Provider> = Arc::new(SilentProvider {
             first_text: Some("partial plan"),
         });
+        let request = goose::conversation::message::Message::user().with_text("plan this");
 
         let (text, usage) = super::stream_role_completion_with_idle_timeout(
             &provider,
             &goose_providers::model::ModelConfig::new("test-model"),
             "",
-            goose::conversation::message::Message::user().with_text("plan this"),
+            std::slice::from_ref(&request),
             "test-session",
             false,
             Some(Duration::from_millis(10)),
@@ -1691,12 +1954,13 @@ mod tests {
     async fn stream_role_completion_errors_when_idle_timeout_has_no_text() {
         let provider: Arc<dyn goose::providers::base::Provider> =
             Arc::new(SilentProvider { first_text: None });
+        let request = goose::conversation::message::Message::user().with_text("plan this");
 
         let err = super::stream_role_completion_with_idle_timeout(
             &provider,
             &goose_providers::model::ModelConfig::new("test-model"),
             "",
-            goose::conversation::message::Message::user().with_text("plan this"),
+            std::slice::from_ref(&request),
             "test-session",
             false,
             Some(Duration::from_millis(10)),
@@ -1948,5 +2212,31 @@ mod tests {
             super::gate_passed_review_note(&gates),
             "\n\n게이트 통과: cargo fmt --check; cargo test -p goose-cli"
         );
+    }
+
+    #[test]
+    fn plan_round_action_respects_question_round_cap_and_toggle() {
+        assert_eq!(
+            super::plan_round_action(0, 2, true, false),
+            super::PlanRoundAction::Finalize
+        );
+        assert_eq!(
+            super::plan_round_action(0, 2, true, true),
+            super::PlanRoundAction::Ask
+        );
+        assert_eq!(
+            super::plan_round_action(2, 2, true, true),
+            super::PlanRoundAction::Finalize
+        );
+        assert_eq!(
+            super::plan_round_action(0, 2, false, true),
+            super::PlanRoundAction::Finalize
+        );
+    }
+
+    #[test]
+    fn planner_prompt_omits_question_protocol_when_disabled() {
+        assert!(!super::planner_prompt(false).contains("orch-question"));
+        assert!(super::planner_prompt(true).contains("orch-question"));
     }
 }
