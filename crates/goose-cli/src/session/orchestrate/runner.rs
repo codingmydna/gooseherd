@@ -13,9 +13,10 @@ use super::gates::{
     effective_gates, gate_passed_review_note, next_gate_step, record_gate_phase, run_gates,
     GateOutcome, GateStep,
 };
+use super::limits::handle_phase_error;
 use super::phases::{
     archive_pending_reviews, gate_banner, orch_phase_idle_timeout, parse_verdict_approved,
-    persist_artifact, phase_banner, record_phase, stream_role_completion,
+    partial_completion_text, persist_artifact, phase_banner, record_phase, stream_role_completion,
     stream_role_completion_status, warn_truncated, PendingReviewArchive, PhaseMeta,
     PhasePolicySummary, EVIDENCE_CHAR_LIMIT, REVIEW_SYSTEM_PROMPT,
 };
@@ -192,7 +193,7 @@ impl CliSession {
         } else {
             Some(orch_phase_idle_timeout())
         };
-        let plan = run_plan_phase(
+        let plan = match run_plan_phase(
             &self.session_id,
             self.debug,
             task,
@@ -204,7 +205,21 @@ impl CliSession {
             planner_role,
             &meta,
         )
-        .await?;
+        .await
+        {
+            Ok(plan) => plan,
+            Err(err) => {
+                return handle_phase_error(
+                    err,
+                    "planner",
+                    planner_role,
+                    &run_id,
+                    task,
+                    reviewer_role,
+                    &[],
+                );
+            }
+        };
         let plan_text = plan.plan_text;
         let planner = plan.planner;
         let planner_model = plan.planner_model;
@@ -213,7 +228,20 @@ impl CliSession {
         let (reviewer, reviewer_model) = if reviewer_role == planner_role {
             (Arc::clone(&planner), planner_model.clone())
         } else {
-            build_role_provider(reviewer_role, &workspace.impl_dir).await?
+            match build_role_provider(reviewer_role, &workspace.impl_dir).await {
+                Ok(reviewer) => reviewer,
+                Err(err) => {
+                    return handle_phase_error(
+                        err,
+                        "reviewer",
+                        reviewer_role,
+                        &run_id,
+                        task,
+                        reviewer_role,
+                        &[],
+                    );
+                }
+            }
         };
         config.set_param("GOOSE_ACP_PLAN_EXPLORE", false)?;
 
@@ -232,13 +260,25 @@ impl CliSession {
             &implementer_role.provider_name,
             implementer_role.model.as_str(),
         )?;
-        self.agent
+        if let Err(err) = self
+            .agent
             .recreate_provider_for_session(
                 &self.session_id,
                 &implementer_role.provider_name,
                 impl_model_config,
             )
-            .await?;
+            .await
+        {
+            return handle_phase_error(
+                err,
+                "implementer",
+                implementer_role,
+                &run_id,
+                task,
+                reviewer_role,
+                &[],
+            );
+        }
         config.set_param(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, false)?;
 
         let implementer_playbook = if implementer_is_acp {
@@ -455,7 +495,7 @@ impl CliSession {
             output::show_thinking();
             let reviewer_system = role_system_prompt(REVIEW_SYSTEM_PROMPT, reviewer_role);
             let (review_text, review_usage) = if let Some(timeout) = role_idle_timeout {
-                let completion = stream_role_completion_status(
+                let completion = match stream_role_completion_status(
                     &reviewer,
                     &reviewer_model,
                     &reviewer_system,
@@ -464,10 +504,32 @@ impl CliSession {
                     self.debug,
                     Some(timeout),
                 )
-                .await?;
+                .await
+                {
+                    Ok(completion) => completion,
+                    Err(err) => {
+                        if let Some(partial_text) = partial_completion_text(&err) {
+                            persist_artifact(
+                                &workspace.original_dir,
+                                &run_id,
+                                &format!("review-c{}.partial.md", cycle),
+                                partial_text,
+                            );
+                        }
+                        return handle_phase_error(
+                            err,
+                            "reviewer",
+                            reviewer_role,
+                            &run_id,
+                            task,
+                            reviewer_role,
+                            &pending_review_archives,
+                        );
+                    }
+                };
                 (completion.text, completion.usage)
             } else {
-                stream_role_completion(
+                match stream_role_completion(
                     &reviewer,
                     &reviewer_model,
                     &reviewer_system,
@@ -475,7 +537,29 @@ impl CliSession {
                     &self.session_id,
                     self.debug,
                 )
-                .await?
+                .await
+                {
+                    Ok(completion) => completion,
+                    Err(err) => {
+                        if let Some(partial_text) = partial_completion_text(&err) {
+                            persist_artifact(
+                                &workspace.original_dir,
+                                &run_id,
+                                &format!("review-c{}.partial.md", cycle),
+                                partial_text,
+                            );
+                        }
+                        return handle_phase_error(
+                            err,
+                            "reviewer",
+                            reviewer_role,
+                            &run_id,
+                            task,
+                            reviewer_role,
+                            &pending_review_archives,
+                        );
+                    }
+                }
             };
             output::hide_thinking();
             persist_artifact(

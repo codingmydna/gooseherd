@@ -2,6 +2,7 @@ use anyhow::Result;
 use goose::config::Config;
 
 mod gates;
+mod limits;
 mod phases;
 mod planner;
 mod roles;
@@ -22,6 +23,7 @@ pub enum OrchOutcome {
     MaxCycles,
     GateFailed,
     Aborted,
+    LimitError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

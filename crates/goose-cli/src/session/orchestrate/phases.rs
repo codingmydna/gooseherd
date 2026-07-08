@@ -3,6 +3,7 @@ use goose::config::Config;
 use goose::conversation::message::Message;
 use goose::providers::base::{Provider, ProviderUsage};
 use goose::utils::safe_truncate;
+use goose_providers::errors::ProviderError;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -198,6 +199,30 @@ pub(super) struct RoleCompletion {
     pub(super) idle_timed_out: bool,
 }
 
+#[derive(Debug)]
+struct PartialRoleCompletionError {
+    partial_text: String,
+    source: ProviderError,
+}
+
+impl std::fmt::Display for PartialRoleCompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for PartialRoleCompletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub(super) fn partial_completion_text(err: &anyhow::Error) -> Option<&str> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<PartialRoleCompletionError>())
+        .map(|err| err.partial_text.as_str())
+}
+
 pub(super) async fn stream_role_completion(
     provider: &Arc<dyn Provider>,
     model_config: &goose_providers::model::ModelConfig,
@@ -269,6 +294,7 @@ pub(super) async fn stream_role_completion_status(
     let idle_sleep = tokio::time::sleep(idle_timeout.unwrap_or(Duration::from_secs(1)));
     tokio::pin!(idle_sleep);
     let mut timeout_error: Option<String> = None;
+    let mut stream_error: Option<ProviderError> = None;
     let mut idle_timed_out = false;
 
     loop {
@@ -277,7 +303,13 @@ pub(super) async fn stream_role_completion_status(
                 let Some(next) = next else {
                     break;
                 };
-                let (message, message_usage) = next?;
+                let (message, message_usage) = match next {
+                    Ok(next) => next,
+                    Err(err) => {
+                        stream_error = Some(err);
+                        break;
+                    }
+                };
                 if let Some(message) = message {
                     for content in &message.content {
                         if let goose::conversation::message::MessageContent::Text(t) = content {
@@ -326,6 +358,16 @@ pub(super) async fn stream_role_completion_status(
     output::reset_response_bullet();
     if let Some(error) = timeout_error {
         anyhow::bail!(error);
+    }
+    if let Some(source) = stream_error {
+        if text.trim().is_empty() {
+            return Err(source.into());
+        }
+        return Err(PartialRoleCompletionError {
+            partial_text: text,
+            source,
+        }
+        .into());
     }
     Ok(RoleCompletion {
         text,

@@ -41,6 +41,39 @@ impl goose::providers::base::Provider for SilentProvider {
     }
 }
 
+#[derive(Debug)]
+struct PartialThenErrorProvider;
+
+#[async_trait::async_trait]
+impl goose::providers::base::Provider for PartialThenErrorProvider {
+    fn get_name(&self) -> &str {
+        "partial-then-error-provider"
+    }
+
+    async fn stream(
+        &self,
+        _model_config: &goose_providers::model::ModelConfig,
+        _system: &str,
+        _messages: &[goose::conversation::message::Message],
+        _tools: &[rmcp::model::Tool],
+    ) -> std::result::Result<
+        goose::providers::base::MessageStream,
+        goose_providers::errors::ProviderError,
+    > {
+        let items = vec![
+            Ok((
+                Some(goose::conversation::message::Message::assistant().with_text("partial plan")),
+                None,
+            )),
+            Err(goose_providers::errors::ProviderError::RequestFailed(
+                "Internal error: You've reached your Fable 5 limit.: { \"errorKind\": \"rate_limit\" }"
+                    .to_string(),
+            )),
+        ];
+        Ok(Box::pin(futures::stream::iter(items)))
+    }
+}
+
 #[tokio::test]
 async fn stream_role_completion_returns_partial_text_after_idle_timeout() {
     let provider: Arc<dyn goose::providers::base::Provider> = Arc::new(SilentProvider {
@@ -87,6 +120,32 @@ async fn stream_role_completion_errors_when_idle_timeout_has_no_text() {
             .contains("orchestration phase timed out after 0s without assistant text"),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn stream_role_completion_error_preserves_partial_text() {
+    let provider: Arc<dyn goose::providers::base::Provider> = Arc::new(PartialThenErrorProvider);
+    let request = goose::conversation::message::Message::user().with_text("plan this");
+
+    let err = match super::stream_role_completion_status(
+        &provider,
+        &goose_providers::model::ModelConfig::new("test-model"),
+        "",
+        std::slice::from_ref(&request),
+        "test-session",
+        false,
+        None,
+    )
+    .await
+    {
+        Ok(_) => panic!("expected provider error"),
+        Err(err) => err,
+    };
+
+    assert_eq!(super::partial_completion_text(&err), Some("partial plan"));
+    assert!(err.chain().any(|cause| cause
+        .downcast_ref::<goose_providers::errors::ProviderError>()
+        .is_some()));
 }
 
 #[test]

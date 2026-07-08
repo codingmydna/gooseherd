@@ -1076,7 +1076,7 @@ enum Command {
     /// Run the plan → implement → review orchestration headlessly
     #[command(
         about = "Run the multi-model plan → implement → review loop headlessly",
-        long_about = "Runs the same plan → implement → review orchestration as the /orch slash command, without an interactive session. In git repositories, orch creates an isolated worktree, commits approved changes on orch/<run_id>, and prints a merge command. Use --merge or GOOSE_ORCH_AUTO_MERGE=true to merge approved changes back automatically. If GOOSE_ORCH_GATES are configured, they run after each implement phase before review; gate failures re-dispatch to the implementer up to GOOSE_ORCH_MAX_GATE_RETRIES times (default 2), then orch exits 1. During planning, GOOSE_ORCH_ASK=off disables planner question blocks and GOOSE_ORCH_MAX_QUESTIONS bounds question rounds (default 2); headless runs auto-select planner recommendations. Fable 5's playbook and plan/review exemplars are injected into planner/reviewer roles whose serving model is not Fable; GOOSE_ORCH_PLAYBOOK=auto|always|never, GOOSE_PLAN_EXEMPLARS_INJECT=auto|always|never, and GOOSE_REVIEW_EXEMPLARS_INJECT=auto|always|never override that. Exits 0 when the reviewer approves the implementation, 1 otherwise."
+        long_about = "Runs the same plan → implement → review orchestration as the /orch slash command, without an interactive session. In git repositories, orch creates an isolated worktree, commits approved changes on orch/<run_id>, and prints a merge command. Use --merge or GOOSE_ORCH_AUTO_MERGE=true to merge approved changes back automatically. If GOOSE_ORCH_GATES are configured, they run after each implement phase before review; gate failures re-dispatch to the implementer up to GOOSE_ORCH_MAX_GATE_RETRIES times (default 2), then orch exits 1. During planning, GOOSE_ORCH_ASK=off disables planner question blocks and GOOSE_ORCH_MAX_QUESTIONS bounds question rounds (default 2); headless runs auto-select planner recommendations. Fable 5's playbook and plan/review exemplars are injected into planner/reviewer roles whose serving model is not Fable; GOOSE_ORCH_PLAYBOOK=auto|always|never, GOOSE_PLAN_EXEMPLARS_INJECT=auto|always|never, and GOOSE_REVIEW_EXEMPLARS_INJECT=auto|always|never override that. Exits 0 when the reviewer approves the implementation, 3 on a provider usage/quota/auth limit with recovery guidance, 1 otherwise."
     )]
     Orch {
         /// Task to orchestrate
@@ -2211,8 +2211,10 @@ async fn handle_orch_command(text: String, max_cycles: Option<u32>, merge: bool)
     let outcome = session
         .handle_orchestrate(text, max_cycles, merge, false)
         .await?;
-    if outcome != crate::session::OrchOutcome::Approved {
-        std::process::exit(1);
+    match outcome {
+        crate::session::OrchOutcome::Approved => {}
+        crate::session::OrchOutcome::LimitError => std::process::exit(3),
+        _ => std::process::exit(1),
     }
     Ok(())
 }

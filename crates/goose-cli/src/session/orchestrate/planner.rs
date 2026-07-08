@@ -10,9 +10,10 @@ use crate::session::{orch_ask, output, plan_exemplars};
 
 use super::phases::{
     orch_ask_enabled, orch_max_question_rounds, orch_min_plan_chars, orch_phase_idle_timeout,
-    persist_artifact, phase_banner, plan_quality_action, plan_round_action, planner_prompt,
-    record_phase, record_question_round, render_auto_answer_banner, stream_role_completion_status,
-    PhaseMeta, PlanQualityAction, PlanRoundAction,
+    partial_completion_text, persist_artifact, phase_banner, plan_quality_action,
+    plan_round_action, planner_prompt, record_phase, record_question_round,
+    render_auto_answer_banner, stream_role_completion_status, PhaseMeta, PlanQualityAction,
+    PlanRoundAction,
 };
 use super::roles::{build_role_provider, playbook_banner_fragment, role_system_prompt, RoleConfig};
 
@@ -87,7 +88,7 @@ pub(super) async fn run_plan_phase(
 
     let (mut plan_text, plan_usage) = loop {
         output::show_thinking();
-        let completion = if let Some(timeout) = role_idle_timeout {
+        let completion_result = if let Some(timeout) = role_idle_timeout {
             stream_role_completion_status(
                 &planner,
                 &planner_model,
@@ -97,7 +98,7 @@ pub(super) async fn run_plan_phase(
                 debug,
                 Some(timeout),
             )
-            .await?
+            .await
         } else {
             stream_role_completion_status(
                 &planner,
@@ -108,7 +109,16 @@ pub(super) async fn run_plan_phase(
                 debug,
                 None,
             )
-            .await?
+            .await
+        };
+        let completion = match completion_result {
+            Ok(completion) => completion,
+            Err(err) => {
+                if let Some(partial_text) = partial_completion_text(&err) {
+                    persist_artifact(artifact_dir, run_id, "plan.partial.md", partial_text);
+                }
+                return Err(err);
+            }
         };
         output::hide_thinking();
         let planner_text = completion.text;
