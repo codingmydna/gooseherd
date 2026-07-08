@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::Command;
@@ -8,7 +8,8 @@ use console::style;
 use goose::config::search_path::SearchPaths;
 use goose::config::Config;
 use goose::providers::generic_acp::{
-    generic_acp_provider_name, parse_acp_command, read_acp_agents, GOOSE_ACP_AGENTS_KEY,
+    env_var_refs, generic_acp_provider_name, parse_acp_command, read_acp_agents,
+    GOOSE_ACP_AGENTS_KEY,
 };
 
 const CLAUDE_ADAPTER: &str = "claude-agent-acp";
@@ -143,32 +144,45 @@ fn check_generic_acp_agents(config: &Config) -> Vec<Check> {
         }
     };
 
-    agents
-        .into_iter()
-        .map(|(key, command)| {
-            let provider_name = generic_acp_provider_name(&key);
-            let (program, _) = match parse_acp_command(&command) {
-                Ok(parsed) => parsed,
-                Err(_) => {
-                    return Check::fail(
-                        format!("{provider_name} agent"),
-                        format!("set {GOOSE_ACP_AGENTS_KEY}.{key} to a command such as `{key} --acp`"),
-                    );
-                }
-            };
-
-            match resolve_binary(&program) {
-                Some(path) => Check::ok(
+    let mut checks = Vec::new();
+    for (key, spec) in agents {
+        let provider_name = generic_acp_provider_name(&key);
+        match parse_acp_command(spec.command()) {
+            Ok((program, _)) => match resolve_binary(&program) {
+                Some(path) => checks.push(Check::ok(
                     format!("{provider_name} agent ({program})"),
                     Some(path.display().to_string()),
-                ),
-                None => Check::fail(
+                )),
+                None => checks.push(Check::fail(
                     format!("{provider_name} agent ({program})"),
-                    format!("install the ACP agent CLI for `{key}` or update {GOOSE_ACP_AGENTS_KEY}.{key}"),
+                    format!(
+                        "install the ACP agent CLI for `{key}` or update {GOOSE_ACP_AGENTS_KEY}.{key}"
+                    ),
+                )),
+            },
+            Err(_) => checks.push(Check::fail(
+                format!("{provider_name} agent"),
+                format!(
+                    "set {GOOSE_ACP_AGENTS_KEY}.{key} to a command such as `{key} --acp`"
                 ),
-            }
-        })
-        .collect()
+            )),
+        }
+
+        let missing_refs = spec
+            .env()
+            .values()
+            .flat_map(|value| env_var_refs(value))
+            .filter(|name| config.get_secret::<String>(name).is_err())
+            .collect::<BTreeSet<_>>();
+        for name in missing_refs {
+            checks.push(Check::fail(
+                format!("{provider_name} env {name}"),
+                format!("export {name}, or store it with `goose configure` (secret {name})"),
+            ));
+        }
+    }
+
+    checks
 }
 
 fn roles_configured(config: &Config) -> bool {
@@ -322,6 +336,7 @@ pub async fn handle_herd() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use goose::providers::generic_acp::AcpAgentSpec;
 
     fn test_config() -> Config {
         let config_file = tempfile::NamedTempFile::new().unwrap();
@@ -336,7 +351,10 @@ mod tests {
         let command = "sh --acp";
         #[cfg(windows)]
         let command = "cmd /C acp";
-        let agents = BTreeMap::from([("fake".to_string(), command.to_string())]);
+        let agents = BTreeMap::from([(
+            "fake".to_string(),
+            AcpAgentSpec::Command(command.to_string()),
+        )]);
         config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
 
         let checks = check_generic_acp_agents(&config);
@@ -351,7 +369,7 @@ mod tests {
         let config = test_config();
         let agents = BTreeMap::from([(
             "missing".to_string(),
-            "missing-acp-binary-for-goose-herd-test --acp".to_string(),
+            AcpAgentSpec::Command("missing-acp-binary-for-goose-herd-test --acp".to_string()),
         )]);
         config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
 
@@ -370,7 +388,10 @@ mod tests {
     #[test]
     fn generic_acp_checks_report_invalid_command() {
         let config = test_config();
-        let agents = BTreeMap::from([("empty".to_string(), "   ".to_string())]);
+        let agents = BTreeMap::from([(
+            "empty".to_string(),
+            AcpAgentSpec::Command("   ".to_string()),
+        )]);
         config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
 
         let checks = check_generic_acp_agents(&config);
@@ -378,6 +399,73 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(!checks[0].ok);
         assert_eq!(checks[0].label, "empty-acp agent");
+    }
+
+    #[test]
+    fn generic_acp_checks_report_missing_env_reference() {
+        let config = test_config();
+        #[cfg(unix)]
+        let command = "sh --acp";
+        #[cfg(windows)]
+        let command = "cmd /C acp";
+        let agents = BTreeMap::from([(
+            "glm".to_string(),
+            AcpAgentSpec::Detailed {
+                command: command.to_string(),
+                env: BTreeMap::from([(
+                    "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    "${GOOSE_TEST_HERD_MISSING_ZAI_KEY}".to_string(),
+                )]),
+                env_remove: vec![],
+            },
+        )]);
+        config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
+
+        let checks = check_generic_acp_agents(&config);
+
+        let missing = checks
+            .iter()
+            .find(|check| check.label.contains("GOOSE_TEST_HERD_MISSING_ZAI_KEY"))
+            .expect("missing env advisory");
+        assert!(!missing.ok);
+        assert!(missing.fix.as_ref().unwrap().contains("goose configure"));
+        assert!(!missing.label.contains("dummy"));
+        assert!(!missing.fix.as_ref().unwrap().contains("dummy"));
+    }
+
+    #[test]
+    fn generic_acp_checks_skip_env_reference_advisory_when_secret_exists() {
+        let config = test_config();
+        config
+            .set_secret("GOOSE_TEST_HERD_PRESENT_ZAI_KEY", &"dummy")
+            .unwrap();
+        #[cfg(unix)]
+        let command = "sh --acp";
+        #[cfg(windows)]
+        let command = "cmd /C acp";
+        let agents = BTreeMap::from([(
+            "glm".to_string(),
+            AcpAgentSpec::Detailed {
+                command: command.to_string(),
+                env: BTreeMap::from([(
+                    "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    "${GOOSE_TEST_HERD_PRESENT_ZAI_KEY}".to_string(),
+                )]),
+                env_remove: vec![],
+            },
+        )]);
+        config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
+
+        let checks = check_generic_acp_agents(&config);
+
+        assert!(!checks
+            .iter()
+            .any(|check| check.label.contains("GOOSE_TEST_HERD_PRESENT_ZAI_KEY")));
+        assert!(!checks.iter().any(|check| check
+            .fix
+            .as_deref()
+            .unwrap_or_default()
+            .contains("dummy")));
     }
 
     #[test]

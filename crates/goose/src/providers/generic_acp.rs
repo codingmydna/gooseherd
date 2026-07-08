@@ -1,4 +1,7 @@
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +18,44 @@ use crate::providers::provider_registry::{ProviderConstructor, ProviderRegistry}
 pub const GOOSE_ACP_AGENTS_KEY: &str = "GOOSE_ACP_AGENTS";
 const GENERIC_ACP_DOC_URL: &str = "https://agentclientprotocol.com";
 const ACP_DEFAULT_MODEL_ALIAS: &str = "default";
+static EMPTY_ENV: Lazy<BTreeMap<String, String>> = Lazy::new(BTreeMap::new);
+static ENV_REF_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap());
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum AcpAgentSpec {
+    Command(String),
+    Detailed {
+        command: String,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+        #[serde(default)]
+        env_remove: Vec<String>,
+    },
+}
+
+impl AcpAgentSpec {
+    pub fn command(&self) -> &str {
+        match self {
+            Self::Command(command) | Self::Detailed { command, .. } => command,
+        }
+    }
+
+    pub fn env(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::Command(_) => &EMPTY_ENV,
+            Self::Detailed { env, .. } => env,
+        }
+    }
+
+    pub fn env_remove(&self) -> &[String] {
+        match self {
+            Self::Command(_) => &[],
+            Self::Detailed { env_remove, .. } => env_remove,
+        }
+    }
+}
 
 pub fn parse_acp_command(command: &str) -> Result<(String, Vec<String>)> {
     let mut parts = command.split_whitespace();
@@ -55,12 +96,19 @@ pub fn is_default_model_alias(model: &str) -> bool {
     matches!(model, ACP_CURRENT_MODEL | ACP_DEFAULT_MODEL_ALIAS)
 }
 
-pub fn read_acp_agents(config: &Config) -> Result<BTreeMap<String, String>> {
-    match config.get_param::<BTreeMap<String, String>>(GOOSE_ACP_AGENTS_KEY) {
+pub fn read_acp_agents(config: &Config) -> Result<BTreeMap<String, AcpAgentSpec>> {
+    match config.get_param::<BTreeMap<String, AcpAgentSpec>>(GOOSE_ACP_AGENTS_KEY) {
         Ok(agents) => Ok(agents),
         Err(ConfigError::NotFound(_)) => Ok(BTreeMap::new()),
         Err(err) => Err(err.into()),
     }
+}
+
+pub fn env_var_refs(value: &str) -> Vec<String> {
+    ENV_REF_RE
+        .captures_iter(value)
+        .filter_map(|captures| captures.get(1).map(|match_| match_.as_str().to_string()))
+        .collect()
 }
 
 pub fn generic_acp_metadata(key: &str) -> ProviderMetadata {
@@ -113,11 +161,11 @@ pub fn register_generic_acp_providers_from_config(
 
 pub fn register_generic_acp_providers_from_agents(
     registry: &mut ProviderRegistry,
-    agents: &BTreeMap<String, String>,
+    agents: &BTreeMap<String, AcpAgentSpec>,
 ) -> usize {
     let mut registered = 0;
 
-    for (key, command) in agents {
+    for (key, spec) in agents {
         let provider_name = generic_acp_provider_name(key);
         if registry.entries.contains_key(&provider_name) {
             tracing::warn!(
@@ -128,7 +176,7 @@ pub fn register_generic_acp_providers_from_agents(
             continue;
         }
 
-        let (program, args) = match parse_acp_command(command) {
+        let (program, args) = match parse_acp_command(spec.command()) {
             Ok(parsed) => parsed,
             Err(error) => {
                 tracing::warn!(
@@ -142,7 +190,13 @@ pub fn register_generic_acp_providers_from_agents(
 
         let metadata = generic_acp_metadata(key);
         let inventory = generic_acp_inventory(provider_name.clone(), program.clone());
-        let constructor = generic_acp_constructor(provider_name, program, args);
+        let constructor = generic_acp_constructor(
+            provider_name,
+            program,
+            args,
+            spec.env().clone(),
+            spec.env_remove().to_vec(),
+        );
         registry.register_acp_agent(metadata, ProviderType::Custom, Some(inventory), constructor);
         registered += 1;
     }
@@ -167,16 +221,22 @@ fn generic_acp_constructor(
     provider_name: String,
     program: String,
     args: Vec<String>,
+    env: BTreeMap<String, String>,
+    env_remove: Vec<String>,
 ) -> ProviderConstructor {
     Arc::new(move |extensions, working_dir, _tls_config| {
         let provider_name = provider_name.clone();
         let program = program.clone();
         let args = args.clone();
+        let env = env.clone();
+        let env_remove = env_remove.clone();
         Box::pin(async move {
             let provider = connect_generic_acp_provider(
                 provider_name,
                 program,
                 args,
+                env,
+                env_remove,
                 extensions,
                 working_dir.unwrap_or_else(current_working_dir),
             )
@@ -190,6 +250,8 @@ async fn connect_generic_acp_provider(
     provider_name: String,
     program: String,
     args: Vec<String>,
+    env: BTreeMap<String, String>,
+    env_remove: Vec<String>,
     extensions: Vec<ExtensionConfig>,
     working_dir: PathBuf,
 ) -> Result<AcpProvider> {
@@ -203,12 +265,13 @@ async fn connect_generic_acp_provider(
     let model = config
         .get_goose_model()
         .unwrap_or_else(|_| ACP_CURRENT_MODEL.to_string());
+    let resolved_env = resolve_agent_env(&provider_name, &env, config)?;
 
     let provider_config = AcpProviderConfig {
         command: resolved_command,
         args,
-        env: vec![],
-        env_remove: vec![],
+        env: resolved_env,
+        env_remove,
         work_dir: working_dir,
         mcp_servers: extension_configs_to_mcp_servers(&extensions),
         session_mode_id: None,
@@ -220,6 +283,63 @@ async fn connect_generic_acp_provider(
     };
 
     AcpProvider::connect(provider_name, goose_mode, provider_config).await
+}
+
+fn resolve_agent_env(
+    provider_name: &str,
+    env: &BTreeMap<String, String>,
+    config: &Config,
+) -> Result<Vec<(String, String)>> {
+    env.iter()
+        .map(|(name, value)| {
+            Ok((
+                name.clone(),
+                resolve_agent_env_value(provider_name, name, value, config)?,
+            ))
+        })
+        .collect()
+}
+
+fn resolve_agent_env_value(
+    provider_name: &str,
+    env_name: &str,
+    value: &str,
+    config: &Config,
+) -> Result<String> {
+    let mut resolved = String::with_capacity(value.len());
+    let mut last = 0;
+
+    for captures in ENV_REF_RE.captures_iter(value) {
+        let Some(full_match) = captures.get(0) else {
+            continue;
+        };
+        let Some(var_match) = captures.get(1) else {
+            continue;
+        };
+        let prefix = value.get(last..full_match.start()).ok_or_else(|| {
+            anyhow!("{provider_name}: invalid env `{env_name}` reference boundary")
+        })?;
+        resolved.push_str(prefix);
+        let key = var_match.as_str();
+        let secret = config
+            .get_secret::<String>(key)
+            .map_err(|error| match error {
+                ConfigError::NotFound(_) => anyhow!(
+                    "{provider_name}: env `{env_name}` references `{key}` which is not set; export {key} or store it with `goose configure` (secret {key})"
+                ),
+                other => anyhow!(
+                    "{provider_name}: failed to resolve env `{env_name}` reference `{key}`: {other}"
+                ),
+            })?;
+        resolved.push_str(&secret);
+        last = full_match.end();
+    }
+
+    let suffix = value
+        .get(last..)
+        .ok_or_else(|| anyhow!("{provider_name}: invalid env `{env_name}` reference boundary"))?;
+    resolved.push_str(suffix);
+    Ok(resolved)
 }
 
 fn resolve_acp_program(program: &str) -> Result<PathBuf> {
@@ -237,7 +357,14 @@ mod tests {
     use super::*;
     use crate::providers::base::ProviderDescriptor;
     use crate::providers::claude_acp::ClaudeAcpProvider;
+    use serial_test::serial;
     use test_case::test_case;
+
+    fn test_config() -> Config {
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        let secrets_file = tempfile::NamedTempFile::new().unwrap();
+        Config::new_with_file_secrets(config_file.path(), secrets_file.path()).unwrap()
+    }
 
     #[test_case("gemini --acp", "gemini", vec!["--acp"])]
     #[test_case("  opencode   acp  --stdio  ", "opencode", vec!["acp", "--stdio"])]
@@ -282,13 +409,16 @@ mod tests {
 
     #[test]
     fn read_acp_agents_reads_btreemap_from_config() {
-        let config_file = tempfile::NamedTempFile::new().unwrap();
-        let secrets_file = tempfile::NamedTempFile::new().unwrap();
-        let config =
-            Config::new_with_file_secrets(config_file.path(), secrets_file.path()).unwrap();
+        let config = test_config();
         let agents = BTreeMap::from([
-            ("gemini".to_string(), "gemini --acp".to_string()),
-            ("opencode".to_string(), "opencode acp".to_string()),
+            (
+                "gemini".to_string(),
+                AcpAgentSpec::Command("gemini --acp".to_string()),
+            ),
+            (
+                "opencode".to_string(),
+                AcpAgentSpec::Command("opencode acp".to_string()),
+            ),
         ]);
         config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
 
@@ -296,9 +426,126 @@ mod tests {
     }
 
     #[test]
+    fn read_acp_agents_accepts_string_and_detailed_specs() {
+        let config = test_config();
+        let agents = BTreeMap::from([
+            (
+                "gemini".to_string(),
+                AcpAgentSpec::Command("gemini --acp".to_string()),
+            ),
+            (
+                "glm".to_string(),
+                AcpAgentSpec::Detailed {
+                    command: "claude-agent-acp".to_string(),
+                    env: BTreeMap::from([
+                        (
+                            "ANTHROPIC_BASE_URL".to_string(),
+                            "https://api.z.ai/api/anthropic".to_string(),
+                        ),
+                        (
+                            "ANTHROPIC_AUTH_TOKEN".to_string(),
+                            "${ZAI_API_KEY}".to_string(),
+                        ),
+                    ]),
+                    env_remove: vec!["CLAUDECODE".to_string()],
+                },
+            ),
+        ]);
+        config.set_param(GOOSE_ACP_AGENTS_KEY, &agents).unwrap();
+
+        let parsed = read_acp_agents(&config).unwrap();
+
+        assert_eq!(parsed.get("gemini").unwrap().command(), "gemini --acp");
+        assert!(parsed.get("gemini").unwrap().env().is_empty());
+        assert!(parsed.get("gemini").unwrap().env_remove().is_empty());
+        assert_eq!(parsed.get("glm").unwrap().command(), "claude-agent-acp");
+        assert_eq!(
+            parsed.get("glm").unwrap().env().get("ANTHROPIC_BASE_URL"),
+            Some(&"https://api.z.ai/api/anthropic".to_string())
+        );
+        assert_eq!(
+            parsed.get("glm").unwrap().env().get("ANTHROPIC_AUTH_TOKEN"),
+            Some(&"${ZAI_API_KEY}".to_string())
+        );
+        assert_eq!(
+            parsed.get("glm").unwrap().env_remove(),
+            ["CLAUDECODE".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_agent_env_passes_literals_and_secret_refs() {
+        let config = test_config();
+        config.set_secret("ZAI_API_KEY", &"secret-token").unwrap();
+        let env = BTreeMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://api.z.ai/api/anthropic".to_string(),
+            ),
+            (
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                "${ZAI_API_KEY}".to_string(),
+            ),
+        ]);
+
+        let resolved = resolve_agent_env("glm-acp", &env, &config).unwrap();
+
+        assert_eq!(
+            resolved,
+            vec![
+                (
+                    "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    "secret-token".to_string()
+                ),
+                (
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "https://api.z.ai/api/anthropic".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_agent_env_expands_process_env_refs() {
+        let config = test_config();
+        let key = "GOOSE_TEST_GENERIC_ACP_ENV_TOKEN";
+        std::env::set_var(key, "from-env");
+        let env = BTreeMap::from([("ANTHROPIC_AUTH_TOKEN".to_string(), format!("${{{key}}}"))]);
+
+        let resolved = resolve_agent_env("glm-acp", &env, &config).unwrap();
+        std::env::remove_var(key);
+
+        assert_eq!(
+            resolved,
+            vec![("ANTHROPIC_AUTH_TOKEN".to_string(), "from-env".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_agent_env_reports_missing_ref_without_secret_value() {
+        let config = test_config();
+        let env = BTreeMap::from([(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            "${GOOSE_TEST_MISSING_ZAI_KEY}".to_string(),
+        )]);
+
+        let err = resolve_agent_env("glm-acp", &env, &config).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("glm-acp"));
+        assert!(message.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(message.contains("GOOSE_TEST_MISSING_ZAI_KEY"));
+        assert!(!message.contains("secret-token"));
+    }
+
+    #[test]
     fn register_generic_acp_providers_registers_configured_agent() {
         let mut registry = ProviderRegistry::new(None);
-        let agents = BTreeMap::from([("gemini".to_string(), "gemini --acp".to_string())]);
+        let agents = BTreeMap::from([(
+            "gemini".to_string(),
+            AcpAgentSpec::Command("gemini --acp".to_string()),
+        )]);
 
         let registered = register_generic_acp_providers_from_agents(&mut registry, &agents);
 
@@ -313,7 +560,10 @@ mod tests {
     fn register_generic_acp_providers_skips_builtin_collisions() {
         let mut registry = ProviderRegistry::new(None);
         registry.register::<ClaudeAcpProvider>(false);
-        let agents = BTreeMap::from([("claude".to_string(), "custom-claude --acp".to_string())]);
+        let agents = BTreeMap::from([(
+            "claude".to_string(),
+            AcpAgentSpec::Command("custom-claude --acp".to_string()),
+        )]);
         let builtin_display = ClaudeAcpProvider::metadata().display_name;
 
         let registered = register_generic_acp_providers_from_agents(&mut registry, &agents);
@@ -329,7 +579,7 @@ mod tests {
         let mut registry = ProviderRegistry::new(None);
         let agents = BTreeMap::from([(
             "missing".to_string(),
-            "missing-acp-binary-for-goose-test --acp".to_string(),
+            AcpAgentSpec::Command("missing-acp-binary-for-goose-test --acp".to_string()),
         )]);
         register_generic_acp_providers_from_agents(&mut registry, &agents);
 
@@ -350,7 +600,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn constructor_spawns_command_with_parsed_args() {
+    async fn constructor_spawns_command_with_parsed_args_and_env() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -358,7 +608,7 @@ mod tests {
         let log = dir.path().join("args.log");
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args.log\"\nexit 1\n",
+            "#!/bin/sh\n{\nprintf 'arg:%s\\n' \"$@\"\nprintf 'base:%s\\n' \"$ANTHROPIC_BASE_URL\"\nprintf 'token:%s\\n' \"$ANTHROPIC_AUTH_TOKEN\"\n} > \"$(dirname \"$0\")/args.log\"\nexit 1\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
@@ -368,7 +618,17 @@ mod tests {
         let mut registry = ProviderRegistry::new(None);
         let agents = BTreeMap::from([(
             "fake".to_string(),
-            format!("{} --acp extra", script.display()),
+            AcpAgentSpec::Detailed {
+                command: format!("{} --acp extra", script.display()),
+                env: BTreeMap::from([
+                    (
+                        "ANTHROPIC_BASE_URL".to_string(),
+                        "https://api.z.ai/api/anthropic".to_string(),
+                    ),
+                    ("ANTHROPIC_AUTH_TOKEN".to_string(), "dummy".to_string()),
+                ]),
+                env_remove: vec![],
+            },
         )]);
         register_generic_acp_providers_from_agents(&mut registry, &agents);
 
@@ -386,6 +646,9 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        assert_eq!(std::fs::read_to_string(log).unwrap(), "--acp\nextra\n");
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "arg:--acp\narg:extra\nbase:https://api.z.ai/api/anthropic\ntoken:dummy\n"
+        );
     }
 }

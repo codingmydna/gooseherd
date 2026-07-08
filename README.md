@@ -66,6 +66,20 @@ GOOSE_ACP_AGENTS:
 Each entry becomes a provider (`gemini-acp`, …) assignable to any role — handy
 for cheap or free implementer models.
 
+Entries may also use a map form with `command`, optional `env`, and optional
+`env_remove`. `${VAR}` references in `env` are resolved from your shell or goose
+secret store when the agent starts, so tokens do not need to live in shared
+config:
+
+```yaml
+GOOSE_ACP_AGENTS:
+  glm:
+    command: claude-agent-acp
+    env:
+      ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
+      ANTHROPIC_AUTH_TOKEN: ${ZAI_API_KEY}
+```
+
 **Plan-Explore permission policy** — the planner and reviewer run as full
 agents but cannot write. Instead of goose's all-or-nothing modes, permission
 requests are judged by ACP tool kind: reads, searches, and parallel subagent
@@ -177,6 +191,30 @@ under the hood.
 
 Run `goose herd` for a first-time checkup that verifies logins and adapters
 and offers to write the recommended role config.
+
+### Using GLM 5.2 / any Anthropic-compatible endpoint
+
+GLM 5.2 (Zhipu / Z.ai) exposes an Anthropic-compatible endpoint, so it can run
+through the `claude-agent-acp` adapter as a generic ACP provider:
+
+```yaml
+GOOSE_ACP_AGENTS:
+  glm:
+    command: claude-agent-acp
+    env:
+      ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
+      ANTHROPIC_AUTH_TOKEN: ${ZAI_API_KEY}
+
+GOOSE_IMPLEMENTER_PROVIDER: glm-acp
+GOOSE_IMPLEMENTER_MODEL: <z.ai model id>
+```
+
+Set `ZAI_API_KEY` in your shell (`export ZAI_API_KEY=...`) or store it with
+`goose configure`; keep the config value as `${ZAI_API_KEY}`. Use `glm-acp` for
+the planner, implementer, reviewer, or a saved role preset just like any other
+provider. If you prefer not to use the ACP adapter, point the existing `openai`
+provider at Z.ai's OpenAI-compatible endpoint with `OPENAI_BASE_URL` and
+`OPENAI_API_KEY`.
 
 ## Troubleshooting
 
