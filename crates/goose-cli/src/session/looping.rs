@@ -1,14 +1,13 @@
 use anyhow::Result;
-use console::style;
+use console::{measure_text_width, style};
 use goose::conversation::message::Message;
 use goose_providers::conversation::token_usage::Usage;
+use std::io::{IsTerminal, Write};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(unix)]
-use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
@@ -111,6 +110,19 @@ enum LoopWaitOutcome {
 enum WaitInputEvent {
     Escape,
     Line(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WaitInputClass {
+    BareEsc,
+    EscapeSequence { len: usize, complete: bool },
+    Ordinary,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WaitEditStep {
+    None,
+    Submit(String),
 }
 
 pub(crate) fn parse_interval(input: &str) -> std::result::Result<Duration, String> {
@@ -253,6 +265,94 @@ fn format_interval(duration: Duration) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+fn classify_wait_input(bytes: &[u8]) -> WaitInputClass {
+    if bytes.first() != Some(&0x1b) {
+        return WaitInputClass::Ordinary;
+    }
+    if bytes.len() == 1 {
+        return WaitInputClass::BareEsc;
+    }
+    if bytes[1] == b'[' || bytes[1] == b'O' {
+        let (tail_len, complete) = escape_sequence_tail_len(&bytes[2..]);
+        return WaitInputClass::EscapeSequence {
+            len: 2 + tail_len,
+            complete,
+        };
+    }
+
+    WaitInputClass::BareEsc
+}
+
+fn escape_sequence_tail_len(bytes: &[u8]) -> (usize, bool) {
+    for (index, &byte) in bytes.iter().enumerate() {
+        if (0x30..=0x3f).contains(&byte) || (0x20..=0x2f).contains(&byte) {
+            continue;
+        }
+        return (index + 1, true);
+    }
+
+    (bytes.len(), false)
+}
+
+fn apply_wait_edit(line: &mut String, byte: u8) -> WaitEditStep {
+    match byte {
+        b'\n' | b'\r' => WaitEditStep::Submit(std::mem::take(line)),
+        0x7f | 0x08 => {
+            line.pop();
+            WaitEditStep::None
+        }
+        b' '..=b'~' => {
+            line.push(byte as char);
+            WaitEditStep::None
+        }
+        _ => WaitEditStep::None,
+    }
+}
+
+fn render_wait_status_line(label: &str, input: &str, width: usize) -> String {
+    let line = if input.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}  > {input}")
+    };
+    truncate_to_width(&line, width)
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut rendered = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let mut buf = [0; 4];
+        let ch_width = measure_text_width(ch.encode_utf8(&mut buf));
+        if used + ch_width > width {
+            break;
+        }
+        rendered.push(ch);
+        used += ch_width;
+    }
+    rendered
+}
+
+fn terminal_width() -> usize {
+    let (_, cols) = console::Term::stdout().size();
+    cols as usize
+}
+
+fn paint_wait_status_line(label: &str, input: &str) {
+    let line = render_wait_status_line(label, input, terminal_width());
+    print!("\r\x1b[2K{}", style(line).dim());
+    let _ = std::io::stdout().flush();
+}
+
+fn clear_wait_status_line() {
+    print!("\r\x1b[2K");
+    let _ = std::io::stdout().flush();
 }
 
 fn fmt_tokens(tokens: i64) -> String {
@@ -406,14 +506,12 @@ impl CliSession {
         interactive: bool,
     ) -> Result<LoopWaitOutcome> {
         let started = Instant::now();
-        self.set_loop_status(Some(loop_status_label(next_iteration, every)));
-        println!(
-            "  {}",
-            style(loop_status_label(next_iteration, every)).dim()
-        );
+        let initial_label = loop_status_label(next_iteration, every);
+        self.set_loop_status(Some(initial_label.clone()));
 
         let mut sleep = Box::pin(tokio::time::sleep(every));
         if !interactive {
+            println!("  {}", style(initial_label).dim());
             tokio::select! {
                 _ = &mut sleep => return Ok(LoopWaitOutcome::Continue),
                 _ = ctrl_c() => return Ok(LoopWaitOutcome::Stop),
@@ -421,37 +519,66 @@ impl CliSession {
         }
 
         let mut input = LoopWaitStdin::enable();
+        let repaint = input.is_some() && std::io::stdout().is_terminal();
+        if repaint {
+            paint_wait_status_line(&initial_label, "");
+        } else {
+            println!("  {}", style(&initial_label).dim());
+        }
+
         let mut tick = tokio::time::interval(Duration::from_millis(150));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_remaining = every.as_secs().saturating_add(1);
 
-        loop {
+        let outcome = 'wait: loop {
             tokio::select! {
-                _ = &mut sleep => return Ok(LoopWaitOutcome::Continue),
-                _ = ctrl_c() => return Ok(LoopWaitOutcome::Stop),
+                _ = &mut sleep => break 'wait LoopWaitOutcome::Continue,
+                _ = ctrl_c() => break 'wait LoopWaitOutcome::Stop,
                 _ = tick.tick() => {
                     let remaining = every.saturating_sub(started.elapsed());
+                    let current_label = loop_status_label(next_iteration, remaining);
                     if remaining.as_secs() != last_remaining {
                         last_remaining = remaining.as_secs();
-                        self.set_loop_status(Some(loop_status_label(next_iteration, remaining)));
+                        self.set_loop_status(Some(current_label.clone()));
                     }
 
-                    if let Some(input) = input.as_mut() {
-                        for event in input.poll_events() {
-                            match event {
-                                WaitInputEvent::Escape => return Ok(LoopWaitOutcome::Stop),
-                                WaitInputEvent::Line(line) => {
-                                    match self.handle_loop_wait_line(&line).await {
-                                        LoopWaitOutcome::Continue => {}
-                                        other => return Ok(other),
-                                    }
+                    let events = if let Some(input) = input.as_mut() {
+                        input.poll_events()
+                    } else {
+                        Vec::new()
+                    };
+
+                    for event in events {
+                        match event {
+                            WaitInputEvent::Escape => break 'wait LoopWaitOutcome::Stop,
+                            WaitInputEvent::Line(line) => {
+                                if repaint {
+                                    clear_wait_status_line();
+                                }
+                                match self.handle_loop_wait_line(&line).await {
+                                    LoopWaitOutcome::Continue => {}
+                                    other => break 'wait other,
                                 }
                             }
                         }
                     }
+
+                    if repaint {
+                        let current_input = input
+                            .as_ref()
+                            .map(LoopWaitStdin::current_input)
+                            .unwrap_or("");
+                        paint_wait_status_line(&current_label, current_input);
+                    }
                 }
             }
+        };
+
+        if repaint {
+            clear_wait_status_line();
         }
+
+        Ok(outcome)
     }
 
     async fn handle_loop_wait_line(&self, line: &str) -> LoopWaitOutcome {
@@ -571,6 +698,9 @@ struct LoopWaitStdin {
     prev_flags: i32,
     prev_termios: libc::termios,
     buf: Vec<u8>,
+    line: String,
+    esc_deferred: bool,
+    escape_sequence_pending: bool,
 }
 
 #[cfg(unix)]
@@ -591,7 +721,7 @@ impl LoopWaitStdin {
             return None;
         }
         let mut raw = prev_termios;
-        raw.c_lflag &= !libc::ICANON;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } < 0 {
@@ -608,6 +738,9 @@ impl LoopWaitStdin {
             prev_flags,
             prev_termios,
             buf: Vec::new(),
+            line: String::new(),
+            esc_deferred: false,
+            escape_sequence_pending: false,
         })
     }
 
@@ -627,23 +760,56 @@ impl LoopWaitStdin {
         }
 
         let mut events = Vec::new();
-        while let Some(pos) = self
-            .buf
-            .iter()
-            .position(|&b| b == b'\n' || b == b'\r' || b == 0x1b)
-        {
-            let byte = self.buf[pos];
-            if byte == 0x1b {
-                self.buf.drain(..=pos);
-                events.push(WaitInputEvent::Escape);
+        loop {
+            if self.escape_sequence_pending {
+                let (len, complete) = escape_sequence_tail_len(&self.buf);
+                if len == 0 {
+                    break;
+                }
+                self.buf.drain(..len);
+                self.escape_sequence_pending = !complete;
+                if !complete {
+                    break;
+                }
                 continue;
             }
 
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line).trim().to_string();
-            events.push(WaitInputEvent::Line(line));
+            if self.buf.is_empty() {
+                break;
+            }
+
+            match classify_wait_input(&self.buf) {
+                WaitInputClass::BareEsc => {
+                    if self.buf.len() == 1 && !self.esc_deferred {
+                        self.esc_deferred = true;
+                        break;
+                    }
+                    self.buf.drain(..1);
+                    self.esc_deferred = false;
+                    events.push(WaitInputEvent::Escape);
+                }
+                WaitInputClass::EscapeSequence { len, complete } => {
+                    self.buf.drain(..len);
+                    self.esc_deferred = false;
+                    self.escape_sequence_pending = !complete;
+                    if !complete {
+                        break;
+                    }
+                }
+                WaitInputClass::Ordinary => {
+                    let byte = self.buf.remove(0);
+                    self.esc_deferred = false;
+                    if let WaitEditStep::Submit(line) = apply_wait_edit(&mut self.line, byte) {
+                        events.push(WaitInputEvent::Line(line.trim().to_string()));
+                    }
+                }
+            }
         }
         events
+    }
+
+    fn current_input(&self) -> &str {
+        &self.line
     }
 }
 
@@ -668,6 +834,10 @@ impl LoopWaitStdin {
 
     fn poll_events(&mut self) -> Vec<WaitInputEvent> {
         Vec::new()
+    }
+
+    fn current_input(&self) -> &str {
+        ""
     }
 }
 
@@ -709,5 +879,62 @@ mod tests {
             loop_status_label(4, Duration::from_secs(90)),
             "↻ loop #4 · next run in 90s"
         );
+    }
+
+    #[test]
+    fn classifies_bare_escape_vs_escape_sequences() {
+        assert_eq!(classify_wait_input(&[0x1b]), WaitInputClass::BareEsc);
+        assert_eq!(
+            classify_wait_input(&[0x1b, b'[', b'A']),
+            WaitInputClass::EscapeSequence {
+                len: 3,
+                complete: true
+            }
+        );
+        assert_eq!(
+            classify_wait_input(&[0x1b, b'O', b'P']),
+            WaitInputClass::EscapeSequence {
+                len: 3,
+                complete: true
+            }
+        );
+        assert_eq!(
+            classify_wait_input(&[0x1b, b'[', b'1', b';', b'2', b'A']),
+            WaitInputClass::EscapeSequence {
+                len: 6,
+                complete: true
+            }
+        );
+        assert_eq!(classify_wait_input(b"x"), WaitInputClass::Ordinary);
+    }
+
+    #[test]
+    fn edits_wait_input_and_submits_lines() {
+        let mut line = String::new();
+
+        assert_eq!(apply_wait_edit(&mut line, b'/'), WaitEditStep::None);
+        assert_eq!(apply_wait_edit(&mut line, b's'), WaitEditStep::None);
+        assert_eq!(apply_wait_edit(&mut line, b't'), WaitEditStep::None);
+        assert_eq!(line, "/st");
+
+        assert_eq!(apply_wait_edit(&mut line, 0x7f), WaitEditStep::None);
+        assert_eq!(line, "/s");
+
+        assert_eq!(apply_wait_edit(&mut line, b'a'), WaitEditStep::None);
+        assert_eq!(
+            apply_wait_edit(&mut line, b'\r'),
+            WaitEditStep::Submit("/sa".to_string())
+        );
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn renders_wait_status_line_with_input_and_width_limit() {
+        assert_eq!(render_wait_status_line("next in 5s", "", 80), "next in 5s");
+        assert_eq!(
+            render_wait_status_line("next in 5s", "/status", 80),
+            "next in 5s  > /status"
+        );
+        assert_eq!(render_wait_status_line("abcdef", "", 3), "abc");
     }
 }
