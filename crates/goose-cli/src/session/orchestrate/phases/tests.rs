@@ -1,0 +1,209 @@
+use super::super::roles::RoleConfig;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Debug)]
+struct SilentProvider {
+    first_text: Option<&'static str>,
+}
+
+#[async_trait::async_trait]
+impl goose::providers::base::Provider for SilentProvider {
+    fn get_name(&self) -> &str {
+        "silent-provider"
+    }
+
+    async fn stream(
+        &self,
+        _model_config: &goose_providers::model::ModelConfig,
+        _system: &str,
+        _messages: &[goose::conversation::message::Message],
+        _tools: &[rmcp::model::Tool],
+    ) -> std::result::Result<
+        goose::providers::base::MessageStream,
+        goose_providers::errors::ProviderError,
+    > {
+        use futures::StreamExt;
+
+        let first_text = self.first_text;
+        let pending = futures::stream::pending();
+        if let Some(first_text) = first_text {
+            let first = futures::stream::once(async move {
+                Ok((
+                    Some(goose::conversation::message::Message::assistant().with_text(first_text)),
+                    None,
+                ))
+            });
+            Ok(Box::pin(first.chain(pending)))
+        } else {
+            Ok(Box::pin(pending))
+        }
+    }
+}
+
+#[tokio::test]
+async fn stream_role_completion_returns_partial_text_after_idle_timeout() {
+    let provider: Arc<dyn goose::providers::base::Provider> = Arc::new(SilentProvider {
+        first_text: Some("partial plan"),
+    });
+    let request = goose::conversation::message::Message::user().with_text("plan this");
+
+    let (text, usage) = super::stream_role_completion_with_idle_timeout(
+        &provider,
+        &goose_providers::model::ModelConfig::new("test-model"),
+        "",
+        std::slice::from_ref(&request),
+        "test-session",
+        false,
+        Some(Duration::from_millis(10)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(text, "partial plan");
+    assert!(usage.is_none());
+}
+
+#[tokio::test]
+async fn stream_role_completion_errors_when_idle_timeout_has_no_text() {
+    let provider: Arc<dyn goose::providers::base::Provider> =
+        Arc::new(SilentProvider { first_text: None });
+    let request = goose::conversation::message::Message::user().with_text("plan this");
+
+    let err = super::stream_role_completion_with_idle_timeout(
+        &provider,
+        &goose_providers::model::ModelConfig::new("test-model"),
+        "",
+        std::slice::from_ref(&request),
+        "test-session",
+        false,
+        Some(Duration::from_millis(10)),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("orchestration phase timed out after 0s without assistant text"),
+        "{err}"
+    );
+}
+
+#[test]
+fn archive_pending_reviews_flushes_all_review_cycles() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let root_path = root.path().display().to_string();
+    let _guard = env_lock::lock_env([
+        ("GOOSE_PATH_ROOT", Some(root_path)),
+        ("GOOSE_REVIEW_EXEMPLARS", Some("true".to_string())),
+    ]);
+    let reviewer_role = RoleConfig {
+        provider_name: "fable".to_string(),
+        model: "fable-5".to_string(),
+        effort: None,
+    };
+    let pending_reviews = vec![
+        super::PendingReviewArchive {
+            cycle: 1,
+            verdict: "REVISE".to_string(),
+            review_text: "VERDICT: REVISE\n\n1. Fix it.".to_string(),
+            reviewer_context_limit: Some(200_000),
+            reviewed_at_ms: 100,
+        },
+        super::PendingReviewArchive {
+            cycle: 2,
+            verdict: "APPROVED".to_string(),
+            review_text: "VERDICT: APPROVED".to_string(),
+            reviewer_context_limit: Some(200_000),
+            reviewed_at_ms: 200,
+        },
+    ];
+
+    super::archive_pending_reviews(
+        &pending_reviews,
+        "run-1",
+        "Add review exemplar archive and injection",
+        &reviewer_role,
+    );
+
+    let state_dir = root.path().join("state").join("review_exemplars");
+    assert_eq!(
+        std::fs::read_to_string(state_dir.join("run-1-review-c1.md")).expect("review c1"),
+        "VERDICT: REVISE\n\n1. Fix it."
+    );
+    assert_eq!(
+        std::fs::read_to_string(state_dir.join("run-1-review-c2.md")).expect("review c2"),
+        "VERDICT: APPROVED"
+    );
+    let index = std::fs::read_to_string(state_dir.join("exemplars.jsonl")).expect("index");
+    let records = index
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["cycle"], 1);
+    assert_eq!(records[0]["verdict"], "REVISE");
+    assert_eq!(records[1]["cycle"], 2);
+    assert_eq!(records[1]["verdict"], "APPROVED");
+}
+
+#[test]
+fn plan_round_action_respects_question_round_cap_and_toggle() {
+    assert_eq!(
+        super::plan_round_action(0, 2, true, false),
+        super::PlanRoundAction::Finalize
+    );
+    assert_eq!(
+        super::plan_round_action(0, 2, true, true),
+        super::PlanRoundAction::Ask
+    );
+    assert_eq!(
+        super::plan_round_action(2, 2, true, true),
+        super::PlanRoundAction::Finalize
+    );
+    assert_eq!(
+        super::plan_round_action(0, 2, false, true),
+        super::PlanRoundAction::Finalize
+    );
+}
+
+#[test]
+fn short_headless_plan_retries_once_then_aborts() {
+    assert_eq!(
+        super::plan_quality_action("too short", 3000, 0),
+        super::PlanQualityAction::Retry
+    );
+    assert_eq!(
+        super::plan_quality_action("too short", 3000, 1),
+        super::PlanQualityAction::Abort
+    );
+    assert_eq!(
+        super::plan_quality_action(&"x".repeat(3000), 3000, 0),
+        super::PlanQualityAction::Accept
+    );
+}
+
+#[test]
+fn orch_min_plan_chars_reads_env_override() {
+    let _guard = env_lock::lock_env([("GOOSE_ORCH_MIN_PLAN_CHARS", Some("1200".to_string()))]);
+
+    assert_eq!(super::orch_min_plan_chars(), 1200);
+}
+
+#[test]
+fn planner_prompt_omits_question_protocol_when_disabled() {
+    assert!(!super::planner_prompt(false).contains("orch-question"));
+    assert!(super::planner_prompt(true).contains("orch-question"));
+}
+
+#[test]
+fn review_prompt_contains_reinforced_rubric() {
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("독립 재검증"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("수용 기준"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("실패 귀속"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("수정 불요 관찰"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("위치"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("메커니즘"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("재현"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("수정 방향"));
+}

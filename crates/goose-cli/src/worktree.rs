@@ -34,6 +34,7 @@ pub struct PrunableWorktree {
     pub path: PathBuf,
     pub branch: Option<String>,
     pub reason: String,
+    pub disk_usage_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +278,7 @@ pub fn prunable_goose_worktrees(start: &Path) -> Result<Vec<PrunableWorktree>> {
                 "clean"
             }
             .to_string(),
+            disk_usage_bytes: disk_usage_bytes(&entry.path),
             path: entry.path,
             branch: entry.branch,
         })
@@ -364,12 +366,52 @@ fn is_dirty(worktree_path: &Path) -> Result<bool> {
 }
 
 fn branch_merged(repo_root: &Path, branch: &str) -> Result<bool> {
+    if branch_merged_into(repo_root, branch, "HEAD")? {
+        return Ok(true);
+    }
+    if ref_exists(repo_root, "refs/heads/main")? && branch_merged_into(repo_root, branch, "main")? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn branch_merged_into(repo_root: &Path, branch: &str, target: &str) -> Result<bool> {
     let status = Command::new("git")
-        .args(["merge-base", "--is-ancestor", branch, "HEAD"])
+        .args(["merge-base", "--is-ancestor", branch, target])
         .current_dir(repo_root)
         .status()
         .context("failed to check whether branch is merged")?;
     Ok(status.success())
+}
+
+fn ref_exists(repo_root: &Path, refname: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", refname])
+        .current_dir(repo_root)
+        .status()
+        .context("failed to check git ref")?;
+    Ok(status.success())
+}
+
+fn disk_usage_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.is_file() || metadata.file_type().is_symlink() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+
+    let mut total = metadata.len();
+    let Ok(entries) = fs::read_dir(path) else {
+        return total;
+    };
+    for entry in entries.flatten() {
+        total = total.saturating_add(disk_usage_bytes(&entry.path()));
+    }
+    total
 }
 
 fn is_git_ignored(repo_root: &Path, path: &str) -> Result<bool> {
@@ -562,6 +604,32 @@ mod tests {
         super::remove_worktrees(repo.path(), &candidates).expect("remove clean worktrees");
         assert!(!clean.path.exists());
         assert!(dirty.path.exists());
+    }
+
+    #[test]
+    fn prune_marks_orch_worktree_branch_merged_into_main_from_other_branch() {
+        let repo = init_repo();
+        git(repo.path(), ["branch", "-M", "main"]);
+        let created = super::create_named_worktree(repo.path(), "orch-merged", Some("orch/merged"))
+            .expect("orch worktree");
+        fs::write(created.path.join("README.md"), "merged orch change\n").expect("change readme");
+        assert!(
+            super::commit_all(&created.path, "test: orch merged change", &[])
+                .expect("commit branch")
+        );
+        git(repo.path(), ["checkout", "-b", "feature/prune"]);
+        git(repo.path(), ["checkout", "main"]);
+        git(repo.path(), ["merge", "--no-ff", "orch/merged"]);
+        git(repo.path(), ["checkout", "feature/prune"]);
+
+        let candidates = super::prunable_goose_worktrees(repo.path()).expect("candidates");
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.path == created.path)
+            .expect("merged orch worktree candidate");
+
+        assert_eq!(candidate.reason, "merged");
+        assert!(candidate.disk_usage_bytes > 0);
     }
 
     #[test]

@@ -73,12 +73,7 @@ pub fn handle_prune() -> Result<()> {
 
     println!("The following worktrees can be removed:");
     for candidate in &candidates {
-        println!(
-            "  {}  {}  {}",
-            candidate.path.display(),
-            branch_label(candidate.branch.as_deref()),
-            candidate.reason
-        );
+        println!("{}", format_prune_candidate(candidate));
     }
     print!("Remove these worktrees? [y/N] ");
     std::io::stdout().flush()?;
@@ -97,4 +92,51 @@ pub fn handle_prune() -> Result<()> {
 
 fn branch_label(branch: Option<&str>) -> String {
     branch.unwrap_or("(detached)").to_string()
+}
+
+fn format_prune_candidate(candidate: &crate::worktree::PrunableWorktree) -> String {
+    format!(
+        "  {}  {}  {}  {}",
+        candidate.path.display(),
+        branch_label(candidate.branch.as_deref()),
+        candidate.reason,
+        format_bytes(candidate.disk_usage_bytes)
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes_f < MIB {
+        format!("{:.1} KiB", bytes_f / KIB)
+    } else if bytes_f < GIB {
+        format!("{:.1} MiB", bytes_f / MIB)
+    } else {
+        format!("{:.1} GiB", bytes_f / GIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    #[test]
+    fn prune_candidate_line_includes_human_readable_size() {
+        let candidate = crate::worktree::PrunableWorktree {
+            path: PathBuf::from("/repo/.goose/worktrees/orch-merged"),
+            branch: Some("orch/merged".to_string()),
+            reason: "merged".to_string(),
+            disk_usage_bytes: 1536,
+        };
+
+        let line = super::format_prune_candidate(&candidate);
+
+        assert!(line.contains("1.5 KiB"), "{line}");
+        assert!(line.contains("orch/merged"), "{line}");
+        assert!(line.contains("merged"), "{line}");
+    }
 }
