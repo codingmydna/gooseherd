@@ -1,12 +1,12 @@
 use goose::config::{paths::Paths, Config};
 use goose::utils::safe_truncate;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+pub(super) use super::exemplars::InjectionMode;
+use super::exemplars::{self, ExemplarInjection, SimilarityRecord};
 
 const EXEMPLARS_DIR: &str = "plan_exemplars";
-const INDEX_FILE: &str = "exemplars.jsonl";
 const ENABLED_KEY: &str = "GOOSE_PLAN_EXEMPLARS";
 const INJECT_KEY: &str = "GOOSE_PLAN_EXEMPLARS_INJECT";
 const K_KEY: &str = "GOOSE_PLAN_EXEMPLARS_K";
@@ -25,6 +25,16 @@ pub(super) struct ExemplarIndexRecord {
     pub(super) path: String,
 }
 
+impl SimilarityRecord for ExemplarIndexRecord {
+    fn task(&self) -> &str {
+        &self.task
+    }
+
+    fn recency_ms(&self) -> u128 {
+        self.approved_at_ms
+    }
+}
+
 pub(super) struct ArchiveRequest<'a> {
     pub(super) run_id: &'a str,
     pub(super) task: &'a str,
@@ -35,32 +45,7 @@ pub(super) struct ArchiveRequest<'a> {
     pub(super) approved_at_ms: u128,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum InjectionMode {
-    Always,
-    Never,
-    Auto,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
-pub(super) struct PlanExemplarInjection {
-    pub(super) injected: bool,
-    pub(super) selected_run_ids: Vec<String>,
-    pub(super) prompt_section: Option<String>,
-}
-
-impl PlanExemplarInjection {
-    pub(super) fn banner_fragment(&self) -> String {
-        if self.injected {
-            format!(
-                " · exemplars injected [{}]",
-                self.selected_run_ids.join(", ")
-            )
-        } else {
-            " · exemplars skipped".to_string()
-        }
-    }
-}
+pub(super) type PlanExemplarInjection = ExemplarInjection;
 
 pub(super) fn build_injection(task: &str, planner_provider: &str) -> PlanExemplarInjection {
     if !exemplars_enabled() {
@@ -92,17 +77,10 @@ fn exemplars_enabled() -> bool {
 }
 
 fn injection_mode() -> InjectionMode {
-    match Config::global()
+    let raw = Config::global()
         .get_param::<String>(INJECT_KEY)
-        .unwrap_or_else(|_| "auto".to_string())
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "always" => InjectionMode::Always,
-        "never" => InjectionMode::Never,
-        _ => InjectionMode::Auto,
-    }
+        .unwrap_or_else(|_| "auto".to_string());
+    exemplars::parse_injection_mode(&raw)
 }
 
 fn configured_k() -> usize {
@@ -121,14 +99,6 @@ fn configured_char_limit() -> usize {
         .unwrap_or(DEFAULT_CHAR_LIMIT)
 }
 
-fn should_inject(planner_provider: &str, mode: InjectionMode) -> bool {
-    match mode {
-        InjectionMode::Always => true,
-        InjectionMode::Never => false,
-        InjectionMode::Auto => !planner_provider.eq_ignore_ascii_case("claude-acp"),
-    }
-}
-
 fn build_injection_from_state_dir(
     state_dir: &Path,
     task: &str,
@@ -137,7 +107,7 @@ fn build_injection_from_state_dir(
     k: usize,
     char_limit: usize,
 ) -> PlanExemplarInjection {
-    if !should_inject(planner_provider, mode) {
+    if !exemplars::should_inject(planner_provider, mode) {
         return PlanExemplarInjection::default();
     }
 
@@ -184,34 +154,7 @@ fn select_similar_records(
     task: &str,
     k: usize,
 ) -> Vec<ExemplarIndexRecord> {
-    if records.is_empty() || k == 0 {
-        return Vec::new();
-    }
-
-    let query_tokens = tokenize(task);
-    if query_tokens.is_empty() {
-        return Vec::new();
-    }
-
-    let mut scored = records
-        .iter()
-        .filter_map(|record| {
-            let score = jaccard(&query_tokens, &tokenize(&record.task));
-            (score > 0.0).then_some((score, record))
-        })
-        .collect::<Vec<_>>();
-
-    scored.sort_by(|(left_score, left), (right_score, right)| {
-        right_score
-            .total_cmp(left_score)
-            .then_with(|| right.approved_at_ms.cmp(&left.approved_at_ms))
-    });
-
-    scored
-        .into_iter()
-        .take(k)
-        .map(|(_, record)| record.clone())
-        .collect()
+    exemplars::select_similar_records(records, task, k)
 }
 
 fn archive_approval_in_state_dir(
@@ -223,16 +166,8 @@ fn archive_approval_in_state_dir(
         return false;
     }
 
-    let dir = exemplars_dir(state_dir);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return false;
-    }
-
-    let plan_path = dir.join(format!("{}.md", request.run_id));
-    if std::fs::write(&plan_path, request.plan_text).is_err() {
-        return false;
-    }
-
+    let file_name = format!("{}.md", request.run_id);
+    let plan_path = exemplars::artifact_path(state_dir, EXEMPLARS_DIR, &file_name);
     let record = ExemplarIndexRecord {
         run_id: request.run_id.to_string(),
         task: request.task.to_string(),
@@ -242,107 +177,18 @@ fn archive_approval_in_state_dir(
         planner_context_limit: request.planner_context_limit,
         path: plan_path.display().to_string(),
     };
-    let Ok(json) = serde_json::to_string(&record) else {
-        return false;
-    };
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(index_path(state_dir))
-    else {
-        return false;
-    };
 
-    writeln!(file, "{json}").is_ok()
+    exemplars::archive_text_and_record(
+        state_dir,
+        EXEMPLARS_DIR,
+        &file_name,
+        request.plan_text,
+        &record,
+    )
 }
 
 fn read_index_from_state_dir(state_dir: &Path) -> Option<Vec<ExemplarIndexRecord>> {
-    let content = match std::fs::read_to_string(index_path(state_dir)) {
-        Ok(content) => content,
-        Err(_) => return Some(Vec::new()),
-    };
-
-    let mut records = Vec::new();
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(record) = serde_json::from_str::<ExemplarIndexRecord>(line) else {
-            return None;
-        };
-        records.push(record);
-    }
-    Some(records)
-}
-
-fn exemplars_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join(EXEMPLARS_DIR)
-}
-
-fn index_path(state_dir: &Path) -> PathBuf {
-    exemplars_dir(state_dir).join(INDEX_FILE)
-}
-
-fn jaccard(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
-    if left.is_empty() || right.is_empty() {
-        return 0.0;
-    }
-
-    let intersection = left.intersection(right).count();
-    let union = left.union(right).count();
-    intersection as f64 / union as f64
-}
-
-fn tokenize(text: &str) -> HashSet<String> {
-    let mut tokens = HashSet::new();
-    let mut ascii = String::new();
-    let mut cjk = Vec::new();
-
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() {
-            flush_cjk(&mut cjk, &mut tokens);
-            ascii.push(ch.to_ascii_lowercase());
-        } else if is_cjk(ch) {
-            flush_ascii(&mut ascii, &mut tokens);
-            cjk.push(ch);
-        } else {
-            flush_ascii(&mut ascii, &mut tokens);
-            flush_cjk(&mut cjk, &mut tokens);
-        }
-    }
-
-    flush_ascii(&mut ascii, &mut tokens);
-    flush_cjk(&mut cjk, &mut tokens);
-    tokens
-}
-
-fn flush_ascii(ascii: &mut String, tokens: &mut HashSet<String>) {
-    if !ascii.is_empty() {
-        tokens.insert(std::mem::take(ascii));
-    }
-}
-
-fn flush_cjk(cjk: &mut Vec<char>, tokens: &mut HashSet<String>) {
-    match cjk.len() {
-        0 => {}
-        1 => {
-            tokens.insert(cjk[0].to_string());
-        }
-        _ => {
-            for pair in cjk.windows(2) {
-                tokens.insert(pair.iter().collect());
-            }
-        }
-    }
-    cjk.clear();
-}
-
-fn is_cjk(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3040..=0x30ff
-            | 0x3400..=0x4dbf
-            | 0x4e00..=0x9fff
-            | 0xac00..=0xd7af
-            | 0xf900..=0xfaff
-    )
+    exemplars::read_index(state_dir, EXEMPLARS_DIR)
 }
 
 #[cfg(test)]

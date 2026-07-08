@@ -32,6 +32,10 @@ pub struct PhaseRecord {
     pub plan_exemplars_injected: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_exemplar_run_ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_exemplars_injected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_exemplar_run_ids: Option<Vec<String>>,
 }
 
 fn ledger_path() -> PathBuf {

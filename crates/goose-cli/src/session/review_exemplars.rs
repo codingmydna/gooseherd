@@ -1,0 +1,435 @@
+use goose::config::{paths::Paths, Config};
+use goose::utils::safe_truncate;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+use super::exemplars::{self, ExemplarInjection, InjectionMode, SimilarityRecord};
+
+const EXEMPLARS_DIR: &str = "review_exemplars";
+const ENABLED_KEY: &str = "GOOSE_REVIEW_EXEMPLARS";
+const INJECT_KEY: &str = "GOOSE_REVIEW_EXEMPLARS_INJECT";
+const K_KEY: &str = "GOOSE_REVIEW_EXEMPLARS_K";
+const CHAR_LIMIT_KEY: &str = "GOOSE_REVIEW_EXEMPLARS_CHAR_LIMIT";
+const DEFAULT_K: usize = 1;
+const DEFAULT_CHAR_LIMIT: usize = 8_000;
+const REVIEW_LABELS: &[&str] = &["APPROVED", "REVISE"];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct ReviewExemplarIndexRecord {
+    pub(super) run_id: String,
+    pub(super) cycle: u32,
+    pub(super) verdict: String,
+    pub(super) task: String,
+    pub(super) reviewed_at_ms: u128,
+    pub(super) reviewer_provider: String,
+    pub(super) reviewer_model: String,
+    pub(super) reviewer_context_limit: Option<usize>,
+    pub(super) path: String,
+}
+
+impl SimilarityRecord for ReviewExemplarIndexRecord {
+    fn task(&self) -> &str {
+        &self.task
+    }
+
+    fn recency_ms(&self) -> u128 {
+        self.reviewed_at_ms
+    }
+
+    fn label(&self) -> Option<&str> {
+        Some(&self.verdict)
+    }
+}
+
+pub(super) struct ArchiveReviewRequest<'a> {
+    pub(super) run_id: &'a str,
+    pub(super) cycle: u32,
+    pub(super) verdict: &'a str,
+    pub(super) task: &'a str,
+    pub(super) review_text: &'a str,
+    pub(super) reviewer_provider: &'a str,
+    pub(super) reviewer_model: &'a str,
+    pub(super) reviewer_context_limit: Option<usize>,
+    pub(super) reviewed_at_ms: u128,
+}
+
+pub(super) type ReviewExemplarInjection = ExemplarInjection;
+
+pub(super) fn build_injection(
+    task: &str,
+    reviewer_provider: &str,
+    current_run_id: Option<&str>,
+) -> ReviewExemplarInjection {
+    if !exemplars_enabled() {
+        return ReviewExemplarInjection::default();
+    }
+
+    build_injection_from_state_dir(
+        &Paths::state_dir(),
+        task,
+        reviewer_provider,
+        injection_mode(),
+        configured_k(),
+        configured_char_limit(),
+        current_run_id,
+    )
+}
+
+pub(super) fn archive_review(request: &ArchiveReviewRequest<'_>) -> bool {
+    archive_review_in_state_dir(&Paths::state_dir(), exemplars_enabled(), request)
+}
+
+fn exemplars_enabled() -> bool {
+    Config::global()
+        .get_param::<bool>(ENABLED_KEY)
+        .unwrap_or(true)
+}
+
+fn injection_mode() -> InjectionMode {
+    let raw = Config::global()
+        .get_param::<String>(INJECT_KEY)
+        .unwrap_or_else(|_| "auto".to_string());
+    exemplars::parse_injection_mode(&raw)
+}
+
+fn configured_k() -> usize {
+    Config::global()
+        .get_param::<usize>(K_KEY)
+        .ok()
+        .filter(|k| *k > 0)
+        .unwrap_or(DEFAULT_K)
+}
+
+fn configured_char_limit() -> usize {
+    Config::global()
+        .get_param::<usize>(CHAR_LIMIT_KEY)
+        .ok()
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_CHAR_LIMIT)
+}
+
+fn archive_review_in_state_dir(
+    state_dir: &Path,
+    enabled: bool,
+    request: &ArchiveReviewRequest<'_>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+
+    let file_name = format!("{}-review-c{}.md", request.run_id, request.cycle);
+    let review_path = exemplars::artifact_path(state_dir, EXEMPLARS_DIR, &file_name);
+    let record = ReviewExemplarIndexRecord {
+        run_id: request.run_id.to_string(),
+        cycle: request.cycle,
+        verdict: request.verdict.to_string(),
+        task: request.task.to_string(),
+        reviewed_at_ms: request.reviewed_at_ms,
+        reviewer_provider: request.reviewer_provider.to_string(),
+        reviewer_model: request.reviewer_model.to_string(),
+        reviewer_context_limit: request.reviewer_context_limit,
+        path: review_path.display().to_string(),
+    };
+
+    exemplars::archive_text_and_record(
+        state_dir,
+        EXEMPLARS_DIR,
+        &file_name,
+        request.review_text,
+        &record,
+    )
+}
+
+fn build_injection_from_state_dir(
+    state_dir: &Path,
+    task: &str,
+    reviewer_provider: &str,
+    mode: InjectionMode,
+    k: usize,
+    char_limit: usize,
+    current_run_id: Option<&str>,
+) -> ReviewExemplarInjection {
+    if !exemplars::should_inject(reviewer_provider, mode) {
+        return ReviewExemplarInjection::default();
+    }
+
+    let Some(mut records) = read_index_from_state_dir(state_dir) else {
+        return ReviewExemplarInjection::default();
+    };
+    if let Some(current_run_id) = current_run_id {
+        records.retain(|record| record.run_id != current_run_id);
+    }
+    let selected = exemplars::select_similar_records_by_label(&records, task, k, REVIEW_LABELS);
+    if selected.is_empty() {
+        return ReviewExemplarInjection::default();
+    }
+
+    let mut selected_run_ids = Vec::new();
+    let mut examples = String::from(
+        "참고: 유사 과제에서의 리뷰 예시 (판정 기준과 형식을 참고하되 판정은 현재 증거 기준으로)\n\n",
+    );
+
+    for record in selected {
+        let Ok(review) = std::fs::read_to_string(&record.path) else {
+            continue;
+        };
+        selected_run_ids.push(record.run_id.clone());
+        examples.push_str(&format!(
+            "예시 {} (run_id: {}, cycle: {}, verdict: {})\n<review_example run_id=\"{}\" cycle=\"{}\" verdict=\"{}\">\n{}\n</review_example>\n\n",
+            selected_run_ids.len(),
+            record.run_id,
+            record.cycle,
+            record.verdict,
+            record.run_id,
+            record.cycle,
+            record.verdict,
+            safe_truncate(&review, char_limit)
+        ));
+    }
+
+    if selected_run_ids.is_empty() {
+        return ReviewExemplarInjection::default();
+    }
+
+    ReviewExemplarInjection {
+        injected: true,
+        selected_run_ids,
+        prompt_section: Some(examples.trim_end().to_string()),
+    }
+}
+
+fn read_index_from_state_dir(state_dir: &Path) -> Option<Vec<ReviewExemplarIndexRecord>> {
+    exemplars::read_index(state_dir, EXEMPLARS_DIR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::exemplars::InjectionMode;
+    use std::fs;
+    use std::path::Path;
+
+    fn request<'a>(
+        run_id: &'a str,
+        cycle: u32,
+        verdict: &'a str,
+        review_text: &'a str,
+    ) -> ArchiveReviewRequest<'a> {
+        ArchiveReviewRequest {
+            run_id,
+            cycle,
+            verdict,
+            task: "Add review exemplar archive and injection",
+            review_text,
+            reviewer_provider: "fable",
+            reviewer_model: "fable-5",
+            reviewer_context_limit: Some(200_000),
+            reviewed_at_ms: 123,
+        }
+    }
+
+    fn write_review_record(
+        state_dir: &Path,
+        run_id: &str,
+        cycle: u32,
+        verdict: &str,
+        task: &str,
+        reviewed_at_ms: u128,
+        review_text: &str,
+    ) {
+        let path = state_dir
+            .join("review_exemplars")
+            .join(format!("{run_id}-review-c{cycle}.md"));
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, review_text).expect("write review");
+        let record = ReviewExemplarIndexRecord {
+            run_id: run_id.to_string(),
+            cycle,
+            verdict: verdict.to_string(),
+            task: task.to_string(),
+            reviewed_at_ms,
+            reviewer_provider: "fable".to_string(),
+            reviewer_model: "fable-5".to_string(),
+            reviewer_context_limit: Some(200_000),
+            path: path.display().to_string(),
+        };
+        let index = state_dir.join("review_exemplars").join("exemplars.jsonl");
+        let mut line = serde_json::to_string(&record).expect("json");
+        line.push('\n');
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(index)
+            .expect("open index");
+        file.write_all(line.as_bytes()).expect("write index");
+    }
+
+    #[test]
+    fn archive_review_writes_text_and_index_record() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let req = request(
+            "run-1",
+            2,
+            "REVISE",
+            "VERDICT: REVISE\n\n1. crates/x.rs: missing gate rerun.",
+        );
+
+        assert!(archive_review_in_state_dir(state.path(), true, &req));
+
+        let review_path = state
+            .path()
+            .join("review_exemplars")
+            .join("run-1-review-c2.md");
+        assert_eq!(
+            fs::read_to_string(review_path).expect("review"),
+            "VERDICT: REVISE\n\n1. crates/x.rs: missing gate rerun."
+        );
+
+        let records = read_index_from_state_dir(state.path()).expect("index");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "run-1");
+        assert_eq!(records[0].cycle, 2);
+        assert_eq!(records[0].verdict, "REVISE");
+        assert_eq!(records[0].task, "Add review exemplar archive and injection");
+        assert_eq!(records[0].reviewer_provider, "fable");
+        assert_eq!(records[0].reviewer_model, "fable-5");
+        assert_eq!(records[0].reviewer_context_limit, Some(200_000));
+        assert!(records[0].path.ends_with("run-1-review-c2.md"));
+    }
+
+    #[test]
+    fn archive_review_respects_disabled_toggle() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let req = request("run-1", 1, "APPROVED", "VERDICT: APPROVED");
+
+        assert!(!archive_review_in_state_dir(state.path(), false, &req));
+        assert!(!state.path().join("review_exemplars").exists());
+    }
+
+    #[test]
+    fn archive_review_respects_goose_review_exemplars_false() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().display().to_string();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_REVIEW_EXEMPLARS", Some("false".to_string())),
+            ("GOOSE_PATH_ROOT", Some(root_path)),
+        ]);
+        let req = request("run-1", 1, "APPROVED", "VERDICT: APPROVED");
+
+        assert!(!archive_review(&req));
+        assert!(!root.path().join("state").join("review_exemplars").exists());
+    }
+
+    #[test]
+    fn injection_auto_skips_claude_acp_reviewer() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_review_record(
+            state.path(),
+            "run-approved",
+            1,
+            "APPROVED",
+            "Add review exemplar archive and injection",
+            100,
+            "VERDICT: APPROVED",
+        );
+
+        let injection = build_injection_from_state_dir(
+            state.path(),
+            "Inject review exemplars into orch review prompt",
+            "claude-acp",
+            InjectionMode::Auto,
+            1,
+            8_000,
+            None,
+        );
+
+        assert!(!injection.injected);
+        assert!(injection.selected_run_ids.is_empty());
+        assert!(injection.prompt_section.is_none());
+    }
+
+    #[test]
+    fn injection_includes_approved_and_revise_examples_when_available() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_review_record(
+            state.path(),
+            "run-approved",
+            1,
+            "APPROVED",
+            "Add review exemplar archive and injection",
+            100,
+            "VERDICT: APPROVED\nNo defects.",
+        );
+        write_review_record(
+            state.path(),
+            "run-revise",
+            2,
+            "REVISE",
+            "Fix review exemplar archive missing revise verdict",
+            200,
+            "VERDICT: REVISE\n\n1. Missing archive call.",
+        );
+
+        let injection = build_injection_from_state_dir(
+            state.path(),
+            "Inject review exemplars into orch review prompt and archive verdicts",
+            "fable",
+            InjectionMode::Auto,
+            1,
+            80,
+            None,
+        );
+
+        assert!(injection.injected);
+        assert_eq!(
+            injection.selected_run_ids,
+            vec!["run-approved".to_string(), "run-revise".to_string()]
+        );
+        let prompt = injection.prompt_section.expect("prompt");
+        assert!(prompt.contains("유사 과제에서의 리뷰 예시"));
+        assert!(prompt.contains("verdict=\"APPROVED\""));
+        assert!(prompt.contains("verdict=\"REVISE\""));
+        assert!(prompt.contains("cycle=\"2\""));
+    }
+
+    #[test]
+    fn injection_excludes_current_run_records() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_review_record(
+            state.path(),
+            "current-run",
+            1,
+            "REVISE",
+            "Inject review exemplars into orch review prompt",
+            300,
+            "VERDICT: REVISE\n\n1. Current run defect.",
+        );
+        write_review_record(
+            state.path(),
+            "past-run",
+            1,
+            "REVISE",
+            "Inject review exemplars into orch review prompt",
+            100,
+            "VERDICT: REVISE\n\n1. Past run defect.",
+        );
+
+        let injection = build_injection_from_state_dir(
+            state.path(),
+            "Inject review exemplars into orch review prompt",
+            "fable",
+            InjectionMode::Auto,
+            1,
+            8_000,
+            Some("current-run"),
+        );
+
+        assert!(injection.injected);
+        assert_eq!(injection.selected_run_ids, vec!["past-run".to_string()]);
+        assert!(!injection
+            .prompt_section
+            .expect("prompt")
+            .contains("Current run defect"));
+    }
+}

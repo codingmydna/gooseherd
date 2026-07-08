@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::{ledger, orch_ask, output, plan_exemplars, CliSession};
+use super::{exemplars, ledger, orch_ask, output, plan_exemplars, review_exemplars, CliSession};
 
 const MAX_CYCLES_KEY: &str = "GOOSE_ORCH_MAX_CYCLES";
 const PHASE_IDLE_TIMEOUT_KEY: &str = "GOOSE_ORCH_PHASE_IDLE_TIMEOUT_SECS";
@@ -51,6 +51,13 @@ Ask 1-3 questions at a time. Each question must have 2-4 options. Put your own p
 const REVIEW_SYSTEM_PROMPT: &str = r#"You are the reviewing lead in a two-model workflow. An implementer model has just attempted the task. You receive the original task, the plan, the git evidence of what changed, and the implementer's report. Your session is read-only: you can inspect files in the working directory but cannot modify anything.
 
 Judge whether the implementation correctly and completely fulfills the task and plan. Inspect files in the working directory if the evidence is insufficient. Some tool calls (especially shell commands) may be denied by policy; do not retry them — judge from file reads and the provided evidence instead. You must always deliver a verdict.
+
+Review rubric:
+- 독립 재검증: when possible, directly open files and run the relevant gates yourself; if denied, say what evidence you used instead.
+- Judge plan deviations against the task and plan 수용 기준, not against incidental plan wording.
+- For any failure, make a 실패 귀속 judgment: implementation defect, plan ambiguity, external/tool failure, or insufficient evidence; block only when the current implementation fails the task.
+- Keep 수정 불요 관찰 separate from blocking defects.
+- If REVISE, use a numbered list where each defect includes 위치, 메커니즘, 재현/evidence, and 수정 방향.
 
 Your reply MUST start with exactly one of these lines:
 VERDICT: APPROVED
@@ -756,6 +763,8 @@ fn record_gate_phase(
         permission_denials: None,
         plan_exemplars_injected: None,
         plan_exemplar_run_ids: None,
+        review_exemplars_injected: None,
+        review_exemplar_run_ids: None,
     });
 }
 
@@ -980,6 +989,35 @@ struct PhasePolicySummary {
     denials: u64,
 }
 
+struct PendingReviewArchive {
+    cycle: u32,
+    verdict: String,
+    review_text: String,
+    reviewer_context_limit: Option<usize>,
+    reviewed_at_ms: u128,
+}
+
+fn archive_pending_reviews(
+    pending_reviews: &[PendingReviewArchive],
+    run_id: &str,
+    task: &str,
+    reviewer_role: &RoleConfig,
+) {
+    for review in pending_reviews {
+        review_exemplars::archive_review(&review_exemplars::ArchiveReviewRequest {
+            run_id,
+            cycle: review.cycle,
+            verdict: &review.verdict,
+            task,
+            review_text: &review.review_text,
+            reviewer_provider: &reviewer_role.provider_name,
+            reviewer_model: &reviewer_role.model,
+            reviewer_context_limit: review.reviewer_context_limit,
+            reviewed_at_ms: review.reviewed_at_ms,
+        });
+    }
+}
+
 /// Print a phase summary line, warn when the reported model doesn't match
 /// GOOSE_<ROLE>_EXPECT_MODEL, and append the phase to the run ledger.
 #[allow(clippy::too_many_arguments)]
@@ -994,7 +1032,8 @@ fn record_phase(
     elapsed_ms: u64,
     verdict: Option<&str>,
     policy: Option<&PhasePolicySummary>,
-    exemplar_injection: Option<&plan_exemplars::PlanExemplarInjection>,
+    plan_exemplar_injection: Option<&exemplars::ExemplarInjection>,
+    review_exemplar_injection: Option<&exemplars::ExemplarInjection>,
 ) {
     let reported_model = usage.map(|u| u.model.clone());
     let (input_tokens, output_tokens) = usage
@@ -1080,8 +1119,11 @@ fn record_phase(
         permission_policy: policy.map(|policy| policy.name.clone()),
         permission_denials: policy.map(|policy| policy.denials),
         task_preview: safe_truncate(meta.task, 120),
-        plan_exemplars_injected: exemplar_injection.map(|injection| injection.injected),
-        plan_exemplar_run_ids: exemplar_injection
+        plan_exemplars_injected: plan_exemplar_injection.map(|injection| injection.injected),
+        plan_exemplar_run_ids: plan_exemplar_injection
+            .map(|injection| injection.selected_run_ids.clone()),
+        review_exemplars_injected: review_exemplar_injection.map(|injection| injection.injected),
+        review_exemplar_run_ids: review_exemplar_injection
             .map(|injection| injection.selected_run_ids.clone()),
     });
 }
@@ -1150,6 +1192,8 @@ fn record_question_round(
         task_preview: safe_truncate(meta.task, 120),
         plan_exemplars_injected: None,
         plan_exemplar_run_ids: None,
+        review_exemplars_injected: None,
+        review_exemplar_run_ids: None,
     });
 }
 
@@ -1531,6 +1575,7 @@ impl CliSession {
             None,
             None,
             Some(&plan_exemplar_injection),
+            None,
         );
 
         persist_artifact(&workspace.original_dir, &run_id, "plan.md", &plan_text);
@@ -1590,6 +1635,7 @@ impl CliSession {
             .unwrap_or(DEFAULT_MAX_GATE_RETRIES);
         let mut gate_retries = 0;
         let gate_note = gate_passed_review_note(&gates);
+        let mut pending_review_archives = Vec::new();
 
         for cycle in 1..=max_cycles {
             loop {
@@ -1658,6 +1704,7 @@ impl CliSession {
                     None,
                     Some(&policy_summary),
                     None,
+                    None,
                 );
 
                 if gates.is_empty() {
@@ -1699,6 +1746,12 @@ impl CliSession {
                             .red()
                             .bold()
                         );
+                        archive_pending_reviews(
+                            &pending_review_archives,
+                            &run_id,
+                            task,
+                            reviewer_role,
+                        );
                         return Ok(OrchOutcome::GateFailed);
                     }
                 }
@@ -1708,10 +1761,19 @@ impl CliSession {
                 role: output::ActiveRole::Reviewer,
                 cycle: Some((cycle, max_cycles)),
             }));
+            let review_exemplar_injection = review_exemplars::build_injection(
+                task,
+                &reviewer_role.provider_name,
+                Some(&run_id),
+            );
             phase_banner(
                 &format!(
-                    "phase: review (cycle {}/{}) · {}/{}",
-                    cycle, max_cycles, reviewer_role.provider_name, reviewer_role.model
+                    "phase: review (cycle {}/{}) · {}/{}{}",
+                    cycle,
+                    max_cycles,
+                    reviewer_role.provider_name,
+                    reviewer_role.model,
+                    review_exemplar_injection.banner_fragment_with_label("review exemplars")
                 ),
                 output::ActiveRole::Reviewer,
             );
@@ -1747,7 +1809,7 @@ impl CliSession {
             if evidence.truncated {
                 warn_truncated("git evidence", evidence.full.len(), &run_id);
             }
-            let review_request = Message::user().with_text(format!(
+            let mut review_request_text = format!(
                 "{}\n\n---\n\nTask:\n{}\n\nPlan:\n{}\n\nGit evidence:\n{}\n\nImplementer report:\n{}\n\nWorking directory: {}{}",
                 REVIEW_SYSTEM_PROMPT,
                 task,
@@ -1756,7 +1818,12 @@ impl CliSession {
                 safe_truncate(&implementer_report, EVIDENCE_CHAR_LIMIT),
                 working_dir,
                 gate_note
-            ));
+            );
+            if let Some(prompt_section) = &review_exemplar_injection.prompt_section {
+                review_request_text.push_str("\n\n---\n\n");
+                review_request_text.push_str(prompt_section);
+            }
+            let review_request = Message::user().with_text(review_request_text);
             output::show_thinking();
             let reviewer_system = role_system_prompt(REVIEW_SYSTEM_PROMPT, reviewer_role);
             let (review_text, review_usage) = if let Some(timeout) = role_idle_timeout {
@@ -1788,6 +1855,7 @@ impl CliSession {
                 &format!("review-c{}.md", cycle),
                 &review_text,
             );
+            let reviewer_context_limit = reviewer.get_context_limit(&reviewer_model).await.ok();
             let approved = parse_verdict_approved(&review_text);
             let verdict = if approved {
                 "APPROVED"
@@ -1796,6 +1864,13 @@ impl CliSession {
             } else {
                 "NO_VERDICT"
             };
+            pending_review_archives.push(PendingReviewArchive {
+                cycle,
+                verdict: verdict.to_string(),
+                review_text: review_text.clone(),
+                reviewer_context_limit,
+                reviewed_at_ms: ledger::now_ms(),
+            });
             record_phase(
                 &meta,
                 "review",
@@ -1803,14 +1878,16 @@ impl CliSession {
                 "reviewer",
                 reviewer_role,
                 review_usage.as_ref(),
-                None,
+                reviewer_context_limit,
                 phase_started.elapsed().as_millis() as u64,
                 Some(verdict),
                 None,
                 None,
+                Some(&review_exemplar_injection),
             );
 
             if approved {
+                archive_pending_reviews(&pending_review_archives, &run_id, task, reviewer_role);
                 plan_exemplars::archive_approved_plan(
                     true,
                     &plan_exemplars::ArchiveRequest {
@@ -1833,6 +1910,7 @@ impl CliSession {
                 return Ok(OrchOutcome::Approved);
             }
             if cycle == max_cycles {
+                archive_pending_reviews(&pending_review_archives, &run_id, task, reviewer_role);
                 println!(
                     "{}",
                     console::style(format!(
@@ -2215,6 +2293,64 @@ mod tests {
     }
 
     #[test]
+    fn archive_pending_reviews_flushes_all_review_cycles() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = root.path().display().to_string();
+        let _guard = env_lock::lock_env([
+            ("GOOSE_PATH_ROOT", Some(root_path)),
+            ("GOOSE_REVIEW_EXEMPLARS", Some("true".to_string())),
+        ]);
+        let reviewer_role = super::RoleConfig {
+            provider_name: "fable".to_string(),
+            model: "fable-5".to_string(),
+            effort: None,
+        };
+        let pending_reviews = vec![
+            super::PendingReviewArchive {
+                cycle: 1,
+                verdict: "REVISE".to_string(),
+                review_text: "VERDICT: REVISE\n\n1. Fix it.".to_string(),
+                reviewer_context_limit: Some(200_000),
+                reviewed_at_ms: 100,
+            },
+            super::PendingReviewArchive {
+                cycle: 2,
+                verdict: "APPROVED".to_string(),
+                review_text: "VERDICT: APPROVED".to_string(),
+                reviewer_context_limit: Some(200_000),
+                reviewed_at_ms: 200,
+            },
+        ];
+
+        super::archive_pending_reviews(
+            &pending_reviews,
+            "run-1",
+            "Add review exemplar archive and injection",
+            &reviewer_role,
+        );
+
+        let state_dir = root.path().join("state").join("review_exemplars");
+        assert_eq!(
+            fs::read_to_string(state_dir.join("run-1-review-c1.md")).expect("review c1"),
+            "VERDICT: REVISE\n\n1. Fix it."
+        );
+        assert_eq!(
+            fs::read_to_string(state_dir.join("run-1-review-c2.md")).expect("review c2"),
+            "VERDICT: APPROVED"
+        );
+        let index = fs::read_to_string(state_dir.join("exemplars.jsonl")).expect("index");
+        let records = index
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["cycle"], 1);
+        assert_eq!(records[0]["verdict"], "REVISE");
+        assert_eq!(records[1]["cycle"], 2);
+        assert_eq!(records[1]["verdict"], "APPROVED");
+    }
+
+    #[test]
     fn plan_round_action_respects_question_round_cap_and_toggle() {
         assert_eq!(
             super::plan_round_action(0, 2, true, false),
@@ -2238,5 +2374,17 @@ mod tests {
     fn planner_prompt_omits_question_protocol_when_disabled() {
         assert!(!super::planner_prompt(false).contains("orch-question"));
         assert!(super::planner_prompt(true).contains("orch-question"));
+    }
+
+    #[test]
+    fn review_prompt_contains_reinforced_rubric() {
+        assert!(super::REVIEW_SYSTEM_PROMPT.contains("독립 재검증"));
+        assert!(super::REVIEW_SYSTEM_PROMPT.contains("수용 기준"));
+        assert!(super::REVIEW_SYSTEM_PROMPT.contains("실패 귀속"));
+        assert!(super::REVIEW_SYSTEM_PROMPT.contains("수정 불요 관찰"));
+        assert!(super::REVIEW_SYSTEM_PROMPT.contains("위치"));
+        assert!(super::REVIEW_SYSTEM_PROMPT.contains("메커니즘"));
+        assert!(super::REVIEW_SYSTEM_PROMPT.contains("재현"));
+        assert!(super::REVIEW_SYSTEM_PROMPT.contains("수정 방향"));
     }
 }
