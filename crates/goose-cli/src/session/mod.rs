@@ -8,6 +8,7 @@ mod export;
 mod input;
 mod ledger;
 mod live_input;
+mod looping;
 mod model_picker;
 mod orch_ask;
 mod orchestrate;
@@ -42,6 +43,7 @@ use goose::permission::PermissionConfirmation;
 use goose::providers::base::Provider;
 use goose::providers::base::ProviderUsage;
 use goose::utils::safe_truncate;
+pub(crate) use looping::{parse_interval as parse_loop_interval, LoopCommand, LOOP_USAGE};
 pub use orchestrate::OrchOutcome;
 
 use anyhow::{Context, Result};
@@ -65,6 +67,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio;
@@ -196,6 +199,8 @@ pub struct CliSession {
     /// Live steering messages sent to the active turn; queued only if they
     /// are not injected before the turn ends.
     sent_steers: std::sync::Mutex<Vec<String>>,
+    loop_active: AtomicBool,
+    loop_stop_requested: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +315,8 @@ impl CliSession {
             stats,
             queued_inputs: std::sync::Mutex::new(Vec::new()),
             sent_steers: std::sync::Mutex::new(Vec::new()),
+            loop_active: AtomicBool::new(false),
+            loop_stop_requested: AtomicBool::new(false),
         }
     }
 
@@ -692,6 +699,20 @@ impl CliSession {
                 history.save(editor);
                 if let Err(e) = self.handle_orchestrate(task, None, false, true).await {
                     output::render_error(&e.to_string());
+                }
+            }
+            InputResult::Loop(command) => {
+                history.save(editor);
+                if let Err(e) = self.run_loop(command, true).await {
+                    output::render_error(&e.to_string());
+                }
+            }
+            InputResult::LoopStop => {
+                if self.loop_active.load(Ordering::SeqCst) {
+                    self.loop_stop_requested.store(true, Ordering::SeqCst);
+                    println!("{}", console::style("Loop stop requested.").yellow());
+                } else {
+                    output::render_error("No active loop is running.");
                 }
             }
             InputResult::Status => {

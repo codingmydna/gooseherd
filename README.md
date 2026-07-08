@@ -148,6 +148,7 @@ Most of what your hands already know keeps working. The mapping:
 | `claude --continue` | `goose session -r` |
 | Plan mode / read-only exploration | automatic for the planner and reviewer roles in `/orch` |
 | `/compact`, `/clear`, `/model` | same commands |
+| `/loop <interval> <prompt>` | same command; headless: `goose loop -t "<prompt>" --every <interval>` |
 | Shift+Tab mode cycling | Shift+Tab cycles role presets (`/preset save <name>` first) |
 | `/cost`, `/context` | `/usage`, `/status`, `/stats` |
 | Side questions without derailing the session | `/btw <question>` |

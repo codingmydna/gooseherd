@@ -3,6 +3,7 @@ use console::style;
 use goose::config::{Config, GooseMode};
 use goose::conversation::message::Message;
 use goose::utils::safe_truncate;
+use std::sync::atomic::Ordering;
 
 use super::ledger;
 use super::orchestrate::{build_role_provider, resolve_all_roles, RoleConfig};
@@ -202,6 +203,14 @@ impl CliSession {
     /// commands only; anything else gets a hint instead of mutating state
     /// mid-turn.
     pub(super) async fn handle_live_command(&self, line: &str) {
+        self.handle_live_command_inner(line, true, true).await;
+    }
+
+    pub(super) async fn handle_live_command_during_wait(&self, line: &str) {
+        self.handle_live_command_inner(line, false, false).await;
+    }
+
+    async fn handle_live_command_inner(&self, line: &str, restore_thinking: bool, steer: bool) {
         let cmd = line.trim();
         if cmd.is_empty() {
             return;
@@ -215,6 +224,17 @@ impl CliSession {
             self.handle_usage().await
         } else if cmd == "/roles" {
             self.handle_roles(None).await
+        } else if cmd == "/loop stop" {
+            if self.loop_active.load(Ordering::SeqCst) {
+                self.loop_stop_requested.store(true, Ordering::SeqCst);
+                println!(
+                    "\n  {}",
+                    style("loop will stop after the current turn").yellow()
+                );
+            } else {
+                println!("\n  {}", style("no active loop is running").dim());
+            }
+            Ok(())
         } else if let Some(q) = cmd.strip_prefix("/btw") {
             self.handle_btw(q.trim().to_string(), Some(StdoutPrinter))
                 .await
@@ -222,12 +242,12 @@ impl CliSession {
             println!(
                 "\n  {}",
                 style(
-                    "live commands while the agent runs: /status /stats /usage /roles /btw <question>"
+                    "live commands while the agent runs: /loop stop /status /stats /usage /roles /btw <question>"
                 )
                 .dim()
             );
             Ok(())
-        } else {
+        } else if steer {
             self.sent_steers.lock().unwrap().push(cmd.to_string());
             self.agent
                 .steer(&self.session_id, Message::user().with_text(cmd))
@@ -237,11 +257,22 @@ impl CliSession {
                 style("↪ steering — will be injected after the current tool call finishes").cyan()
             );
             Ok(())
+        } else {
+            println!(
+                "\n  {}",
+                style(
+                    "loop wait commands: /loop stop /status /stats /usage /roles /btw <question>"
+                )
+                .dim()
+            );
+            Ok(())
         };
         if let Err(e) = result {
             output::render_error(&e.to_string());
         }
-        output::show_thinking();
+        if restore_thinking {
+            output::show_thinking();
+        }
     }
 
     pub(super) async fn handle_status(&self) -> Result<()> {

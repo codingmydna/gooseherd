@@ -1,4 +1,5 @@
 use super::completion::GooseCompleter;
+use super::looping::{self, ParsedLoopCommand};
 use super::{CompletionCache, HintStatus};
 use anyhow::Result;
 use goose::config::{Config, GooseMode};
@@ -39,6 +40,8 @@ pub enum InputResult {
     Remember(String),
     Arena(String),
     Worktree(String),
+    Loop(looping::LoopCommand),
+    LoopStop,
     Clear,
     Recipe(Option<String>),
     Compact,
@@ -336,6 +339,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_PLAN: &str = "/plan";
     const CMD_ENDPLAN: &str = "/endplan";
     const CMD_ORCH: &str = "/orch";
+    const CMD_LOOP: &str = "/loop";
     const CMD_STATUS: &str = "/status";
     const CMD_USAGE: &str = "/usage";
     const CMD_EFFORT: &str = "/effort";
@@ -426,6 +430,16 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_ORCH || s.starts_with(&format!("{CMD_ORCH} ")) => Some(
             InputResult::Orchestrate(s.get(CMD_ORCH.len()..).unwrap_or("").trim().to_string()),
         ),
+        s if s == CMD_LOOP || s.starts_with(&format!("{CMD_LOOP} ")) => {
+            match looping::parse_loop_command_args(s.get(CMD_LOOP.len()..).unwrap_or("").trim()) {
+                Ok(ParsedLoopCommand::Start(command)) => Some(InputResult::Loop(command)),
+                Ok(ParsedLoopCommand::Stop) => Some(InputResult::LoopStop),
+                Err(error) => {
+                    println!("{}", console::style(error).red());
+                    Some(InputResult::Retry)
+                }
+            }
+        }
         s if s == CMD_STATUS => Some(InputResult::Status),
         s if s == CMD_USAGE => Some(InputResult::UsageInfo),
         "/stats" => Some(InputResult::Stats),

@@ -43,6 +43,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/worktree", "Create a named git worktree"),
     ("/orch", "Plan → implement → review loop across models"),
+    (
+        "/loop",
+        "Repeat a prompt on an interval until stopped or done",
+    ),
     ("/roles", "Show or change orchestration roles/effort"),
     ("/preset", "Save/apply role presets; Shift+Tab cycles"),
     ("/init", "Analyze the repo and write AGENTS.md"),
@@ -91,6 +95,12 @@ fn slash_command_hint(line: &str) -> Option<String> {
         None => (line, false),
     };
     if has_args {
+        if token == "/loop" {
+            return Some(
+                "   ↻ /loop <30s|5m|1h|90> [--max N] [--until-done] <prompt> · /loop stop"
+                    .to_string(),
+            );
+        }
         return match SLASH_COMMANDS.iter().find(|(c, _)| *c == token) {
             Some((_, desc)) => Some(format!("   ✓ {}", desc)),
             None => Some("   ✗ unknown command".to_string()),
@@ -367,6 +377,47 @@ impl GooseCompleter {
         Ok((line.len(), vec![]))
     }
 
+    fn complete_loop_args(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
+        if line == "/loop " {
+            return Ok((
+                line.len(),
+                vec![
+                    Pair {
+                        display: "stop".to_string(),
+                        replacement: "stop".to_string(),
+                    },
+                    Pair {
+                        display: "--max".to_string(),
+                        replacement: "--max ".to_string(),
+                    },
+                    Pair {
+                        display: "--until-done".to_string(),
+                        replacement: "--until-done ".to_string(),
+                    },
+                ],
+            ));
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(last) = parts.last() {
+            if last.starts_with('-') {
+                let pos = line.len() - last.len();
+                let flags = ["--max", "--until-done"];
+                let candidates = flags
+                    .iter()
+                    .filter(|flag| flag.starts_with(last))
+                    .map(|flag| Pair {
+                        display: flag.to_string(),
+                        replacement: format!("{flag} "),
+                    })
+                    .collect();
+                return Ok((pos, candidates));
+            }
+        }
+
+        Ok((line.len(), vec![]))
+    }
+
     /// Complete argument keys for a specific prompt
     fn complete_argument_keys(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
         let parts: Vec<&str> = line.get(8..).unwrap_or("").split_whitespace().collect();
@@ -591,6 +642,10 @@ impl Completer for GooseCompleter {
 
             if line.starts_with("/skills ") {
                 return self.complete_skill_names(line);
+            }
+
+            if line.starts_with("/loop ") {
+                return self.complete_loop_args(line);
             }
 
             return Ok((pos, vec![]));

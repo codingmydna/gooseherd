@@ -32,7 +32,9 @@ use crate::commands::session::{handle_session_list, handle_session_remove};
 use crate::commands::skills::handle_skills_list;
 use crate::recipes::extract_from_cli::extract_recipe_info_from_cli;
 use crate::recipes::recipe::{explain_recipe, render_recipe_as_yaml};
-use crate::session::{build_session, SessionBuilderConfig};
+use crate::session::{
+    build_session, parse_loop_interval, LoopCommand, SessionBuilderConfig, LOOP_USAGE,
+};
 use goose::agents::Container;
 use goose::session::session_manager::SessionType;
 use goose::session::SessionManager;
@@ -1004,6 +1006,41 @@ enum Command {
         model_opts: ModelOptions,
     },
 
+    /// Run a prompt repeatedly at a fixed time interval
+    #[command(
+        about = "Run a prompt repeatedly at a fixed interval",
+        long_about = "Run a normal goose prompt, wait the requested interval, then run the same prompt again until stopped, a --max cap is reached, or --until-done detects a final LOOP_DONE marker. Intervals accept 30s, 5m, 1h, or plain seconds such as 90."
+    )]
+    Loop {
+        /// Prompt to repeat
+        #[arg(short = 't', long = "text", help = "Prompt to repeat")]
+        text: String,
+
+        /// Interval between completed turns
+        #[arg(long = "every", help = "Interval: 30s, 5m, 1h, or 90 for seconds")]
+        every: String,
+
+        /// Maximum number of iterations
+        #[arg(long = "max", help = "Stop after N iterations")]
+        max: Option<u32>,
+
+        /// Stop when the model ends its reply with LOOP_DONE
+        #[arg(
+            long = "until-done",
+            help = "Stop when the model emits final LOOP_DONE"
+        )]
+        until_done: bool,
+
+        #[command(flatten)]
+        session_opts: SessionOptions,
+
+        #[command(flatten)]
+        extension_opts: ExtensionOptions,
+
+        #[command(flatten)]
+        model_opts: ModelOptions,
+    },
+
     /// Run the plan → implement → review orchestration headlessly
     #[command(
         about = "Run the multi-model plan → implement → review loop headlessly",
@@ -1404,6 +1441,7 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Worktree { .. }) => "worktree",
         Some(Command::Projects) => "projects",
         Some(Command::Run { .. }) => "run",
+        Some(Command::Loop { .. }) => "loop",
         Some(Command::Orch { .. }) => "orch",
         Some(Command::Gateway { .. }) => "gateway",
         Some(Command::Schedule { .. }) => "schedule",
@@ -1993,6 +2031,72 @@ async fn handle_run_command(
     }
 }
 
+async fn handle_loop_command(
+    text: String,
+    every: String,
+    max: Option<u32>,
+    until_done: bool,
+    session_opts: SessionOptions,
+    extension_opts: ExtensionOptions,
+    model_opts: ModelOptions,
+) -> Result<()> {
+    let every = match parse_loop_interval(&every) {
+        Ok(every) => every,
+        Err(error) => {
+            eprintln!("{}", console::style(error).red());
+            std::process::exit(2);
+        }
+    };
+    if max == Some(0) {
+        eprintln!("{}", console::style(LOOP_USAGE).red());
+        std::process::exit(2);
+    }
+
+    let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
+    let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
+    let mut session = build_session(SessionBuilderConfig {
+        session_id,
+        resume: false,
+        fork: false,
+        no_session: false,
+        extensions: extension_opts.extensions,
+        streamable_http_extensions: extension_opts.streamable_http_extensions,
+        builtins: extension_opts.builtins,
+        no_profile: extension_opts.no_profile,
+        recipe: None,
+        additional_system_prompt: None,
+        provider: model_opts.provider,
+        model: model_opts.model,
+        debug: session_opts.debug,
+        max_tool_repetitions: session_opts.max_tool_repetitions,
+        max_turns: session_opts.max_turns,
+        scheduled_job_id: None,
+        interactive: false,
+        quiet: false,
+        output_format: "text".to_string(),
+        container: session_opts.container.map(Container::new),
+        stats: false,
+    })
+    .await;
+
+    let command = LoopCommand {
+        every,
+        prompt: text,
+        max_iterations: max,
+        until_done,
+    };
+    let session_start = std::time::Instant::now();
+    tracing::info!(
+        monotonic_counter.goose.session_starts = 1,
+        session_type = "loop",
+        interactive = false,
+        "Headless loop session started"
+    );
+    let result = session.headless_loop(command).await;
+    log_session_completion(&session, session_start, "loop", result.is_ok()).await;
+    result
+}
+
 async fn handle_orch_command(text: String, max_cycles: Option<u32>, merge: bool) -> Result<()> {
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
     let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
@@ -2382,6 +2486,26 @@ pub async fn cli() -> anyhow::Result<()> {
                 session_opts,
                 extension_opts,
                 output_opts,
+                model_opts,
+            )
+            .await
+        }
+        Some(Command::Loop {
+            text,
+            every,
+            max,
+            until_done,
+            session_opts,
+            extension_opts,
+            model_opts,
+        }) => {
+            handle_loop_command(
+                text,
+                every,
+                max,
+                until_done,
+                session_opts,
+                extension_opts,
                 model_opts,
             )
             .await
