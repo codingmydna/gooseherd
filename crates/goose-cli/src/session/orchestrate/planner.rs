@@ -14,7 +14,7 @@ use super::phases::{
     record_phase, record_question_round, render_auto_answer_banner, stream_role_completion_status,
     PhaseMeta, PlanQualityAction, PlanRoundAction,
 };
-use super::roles::{build_role_provider, role_system_prompt, RoleConfig};
+use super::roles::{build_role_provider, playbook_banner_fragment, role_system_prompt, RoleConfig};
 
 pub(super) struct PlanPhaseOutput {
     pub(super) plan_text: String,
@@ -42,7 +42,7 @@ pub(super) async fn run_plan_phase(
         Some(orch_phase_idle_timeout())
     };
     let plan_exemplar_injection =
-        plan_exemplars::build_injection(task, &planner_role.provider_name);
+        plan_exemplars::build_injection(task, &planner_role.provider_name, &planner_role.model);
 
     output::set_active_role_status(Some(output::ActiveRoleStatus {
         role: output::ActiveRole::Planner,
@@ -50,10 +50,11 @@ pub(super) async fn run_plan_phase(
     }));
     phase_banner(
         &format!(
-            "phase: plan · {}/{}{}",
+            "phase: plan · {}/{}{}{}",
             planner_role.provider_name,
             planner_role.model,
-            plan_exemplar_injection.banner_fragment()
+            plan_exemplar_injection.banner_fragment(),
+            playbook_banner_fragment(planner_role)
         ),
         output::ActiveRole::Planner,
     );

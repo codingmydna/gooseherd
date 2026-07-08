@@ -422,10 +422,10 @@ pub(super) fn record_phase(
     if let Ok(expected) =
         Config::global().get_param::<String>(&format!("GOOSE_{}_EXPECT_MODEL", role.to_uppercase()))
     {
-        let generic = match reported_model.as_deref().map(|m| m.to_lowercase()) {
-            None => true,
-            Some(m) => m.is_empty() || m == "default" || m == "current" || m == "unknown",
-        };
+        let generic = reported_model
+            .as_deref()
+            .map(exemplars::is_generic_model)
+            .unwrap_or(true);
         let matched = reported_model
             .as_deref()
             .map(|m| m.to_lowercase().contains(&expected.to_lowercase()))

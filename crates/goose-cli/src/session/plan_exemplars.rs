@@ -47,7 +47,11 @@ pub(super) struct ArchiveRequest<'a> {
 
 pub(super) type PlanExemplarInjection = ExemplarInjection;
 
-pub(super) fn build_injection(task: &str, planner_provider: &str) -> PlanExemplarInjection {
+pub(super) fn build_injection(
+    task: &str,
+    planner_provider: &str,
+    planner_model: &str,
+) -> PlanExemplarInjection {
     if !exemplars_enabled() {
         return PlanExemplarInjection::default();
     }
@@ -56,6 +60,7 @@ pub(super) fn build_injection(task: &str, planner_provider: &str) -> PlanExempla
         &Paths::state_dir(),
         task,
         planner_provider,
+        planner_model,
         injection_mode(),
         configured_k(),
         configured_char_limit(),
@@ -103,11 +108,12 @@ fn build_injection_from_state_dir(
     state_dir: &Path,
     task: &str,
     planner_provider: &str,
+    planner_model: &str,
     mode: InjectionMode,
     k: usize,
     char_limit: usize,
 ) -> PlanExemplarInjection {
-    if !exemplars::should_inject(planner_provider, mode) {
+    if !exemplars::should_inject(planner_provider, planner_model, mode) {
         return PlanExemplarInjection::default();
     }
 
@@ -342,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn injection_auto_skips_claude_acp_planner() {
+    fn injection_auto_injects_claude_acp_opus_planner() {
         let state = tempfile::tempdir().expect("tempdir");
         write_record_with_plan(
             state.path(),
@@ -356,13 +362,79 @@ mod tests {
             state.path(),
             "Inject approved plan exemplars into the orch planner prompt",
             "claude-acp",
+            "opus",
             InjectionMode::Auto,
             2,
             8_000,
         );
 
-        assert!(!injection.injected);
-        assert!(injection.selected_run_ids.is_empty());
-        assert!(injection.prompt_section.is_none());
+        assert!(injection.injected);
+        assert_eq!(injection.selected_run_ids, vec!["orch-plan".to_string()]);
+        assert!(injection
+            .prompt_section
+            .expect("prompt")
+            .contains("approved plan shape"));
+    }
+
+    #[test]
+    fn injection_auto_skips_fable_planner_models() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_record_with_plan(
+            state.path(),
+            "orch-plan",
+            "Add approved plan exemplar injection to the orch planner",
+            100,
+            "approved plan shape",
+        );
+
+        for model in ["default", "claude-fable-5"] {
+            let injection = build_injection_from_state_dir(
+                state.path(),
+                "Inject approved plan exemplars into the orch planner prompt",
+                "claude-acp",
+                model,
+                InjectionMode::Auto,
+                2,
+                8_000,
+            );
+
+            assert!(!injection.injected);
+            assert!(injection.selected_run_ids.is_empty());
+            assert!(injection.prompt_section.is_none());
+        }
+    }
+
+    #[test]
+    fn injection_explicit_modes_override_planner_model_identity() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_record_with_plan(
+            state.path(),
+            "orch-plan",
+            "Add approved plan exemplar injection to the orch planner",
+            100,
+            "approved plan shape",
+        );
+
+        let always = build_injection_from_state_dir(
+            state.path(),
+            "Inject approved plan exemplars into the orch planner prompt",
+            "claude-acp",
+            "claude-fable-5",
+            InjectionMode::Always,
+            2,
+            8_000,
+        );
+        assert!(always.injected);
+
+        let never = build_injection_from_state_dir(
+            state.path(),
+            "Inject approved plan exemplars into the orch planner prompt",
+            "claude-acp",
+            "opus",
+            InjectionMode::Never,
+            2,
+            8_000,
+        );
+        assert!(!never.injected);
     }
 }

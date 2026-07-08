@@ -54,11 +54,22 @@ pub(super) fn parse_injection_mode(raw: &str) -> InjectionMode {
     }
 }
 
-pub(super) fn should_inject(provider_name: &str, mode: InjectionMode) -> bool {
+pub(super) fn is_generic_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.is_empty() || model == "default" || model == "current" || model == "unknown"
+}
+
+pub(super) fn is_fable_model(provider_name: &str, model: &str) -> bool {
+    let provider_name = provider_name.trim().to_ascii_lowercase();
+    model.to_ascii_lowercase().contains("fable")
+        || (provider_name == "claude-acp" && is_generic_model(model))
+}
+
+pub(super) fn should_inject(provider_name: &str, model: &str, mode: InjectionMode) -> bool {
     match mode {
         InjectionMode::Always => true,
         InjectionMode::Never => false,
-        InjectionMode::Auto => !provider_name.eq_ignore_ascii_case("claude-acp"),
+        InjectionMode::Auto => !is_fable_model(provider_name, model),
     }
 }
 
@@ -282,6 +293,48 @@ mod tests {
         fn label(&self) -> Option<&str> {
             self.label
         }
+    }
+
+    #[test]
+    fn fable_model_identity_uses_model_not_transport() {
+        assert!(!is_fable_model("claude-acp", "opus"));
+        assert!(is_fable_model("claude-acp", "default"));
+        assert!(is_fable_model("claude-acp", "claude-fable-5"));
+        assert!(!is_fable_model("codex-acp", "default"));
+        assert!(!is_fable_model("anthropic", "claude-opus"));
+        assert!(is_fable_model("anthropic", "claude-fable-5"));
+        assert!(!is_fable_model("openai", "gpt-5.5"));
+    }
+
+    #[test]
+    fn should_inject_auto_skips_only_fable_models() {
+        assert!(should_inject("claude-acp", "opus", InjectionMode::Auto));
+        assert!(!should_inject("claude-acp", "default", InjectionMode::Auto));
+        assert!(!should_inject(
+            "claude-acp",
+            "claude-fable-5",
+            InjectionMode::Auto
+        ));
+        assert!(should_inject(
+            "anthropic",
+            "claude-opus",
+            InjectionMode::Auto
+        ));
+        assert!(!should_inject(
+            "anthropic",
+            "claude-fable-5",
+            InjectionMode::Auto
+        ));
+    }
+
+    #[test]
+    fn should_inject_explicit_modes_override_model_identity() {
+        assert!(should_inject(
+            "claude-acp",
+            "claude-fable-5",
+            InjectionMode::Always
+        ));
+        assert!(!should_inject("claude-acp", "opus", InjectionMode::Never));
     }
 
     #[test]

@@ -44,10 +44,14 @@ implementer without spending reviewer tokens. On approval the run auto-commits
 to its branch and prints the merge command (`--merge` merges for you).
 Approved plans are archived and similar past plans are injected as few-shot
 exemplars for future planners (`GOOSE_PLAN_EXEMPLARS`), so the expensive
-model's planning shape survives into cheaper ones. An allowlist permission
-policy (`GOOSE_ORCH_IMPLEMENT_POLICY: allowlist`) confines the implementer to
-the workspace and an approved command list — for running orchestration on
-repos you actually care about.
+model's planning shape survives into cheaper ones. Fable 5's playbook and
+plan/review exemplars are injected into planner/reviewer roles whose serving
+model is not Fable; use `GOOSE_ORCH_PLAYBOOK=auto|always|never`,
+`GOOSE_PLAN_EXEMPLARS_INJECT=auto|always|never`, or
+`GOOSE_REVIEW_EXEMPLARS_INJECT=auto|always|never` to override. An allowlist
+permission policy (`GOOSE_ORCH_IMPLEMENT_POLICY: allowlist`) confines the
+implementer to the workspace and an approved command list — for running
+orchestration on repos you actually care about.
 
 **Bring any ACP agent** — besides the built-in claude/codex/copilot/amp/pi
 adapters, any ACP-speaking CLI plugs in via config:

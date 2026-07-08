@@ -55,9 +55,16 @@ pub(super) struct ArchiveReviewRequest<'a> {
 
 pub(super) type ReviewExemplarInjection = ExemplarInjection;
 
+#[derive(Clone, Copy)]
+struct ReviewerServingModel<'a> {
+    provider_name: &'a str,
+    model: &'a str,
+}
+
 pub(super) fn build_injection(
     task: &str,
     reviewer_provider: &str,
+    reviewer_model: &str,
     current_run_id: Option<&str>,
 ) -> ReviewExemplarInjection {
     if !exemplars_enabled() {
@@ -67,7 +74,10 @@ pub(super) fn build_injection(
     build_injection_from_state_dir(
         &Paths::state_dir(),
         task,
-        reviewer_provider,
+        ReviewerServingModel {
+            provider_name: reviewer_provider,
+            model: reviewer_model,
+        },
         injection_mode(),
         configured_k(),
         configured_char_limit(),
@@ -143,13 +153,13 @@ fn archive_review_in_state_dir(
 fn build_injection_from_state_dir(
     state_dir: &Path,
     task: &str,
-    reviewer_provider: &str,
+    reviewer: ReviewerServingModel<'_>,
     mode: InjectionMode,
     k: usize,
     char_limit: usize,
     current_run_id: Option<&str>,
 ) -> ReviewExemplarInjection {
-    if !exemplars::should_inject(reviewer_provider, mode) {
+    if !exemplars::should_inject(reviewer.provider_name, reviewer.model, mode) {
         return ReviewExemplarInjection::default();
     }
 
@@ -208,6 +218,13 @@ mod tests {
     use crate::session::exemplars::InjectionMode;
     use std::fs;
     use std::path::Path;
+
+    fn reviewer<'a>(provider_name: &'a str, model: &'a str) -> ReviewerServingModel<'a> {
+        ReviewerServingModel {
+            provider_name,
+            model,
+        }
+    }
 
     fn request<'a>(
         run_id: &'a str,
@@ -322,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn injection_auto_skips_claude_acp_reviewer() {
+    fn injection_auto_injects_claude_acp_opus_reviewer() {
         let state = tempfile::tempdir().expect("tempdir");
         write_review_record(
             state.path(),
@@ -337,16 +354,85 @@ mod tests {
         let injection = build_injection_from_state_dir(
             state.path(),
             "Inject review exemplars into orch review prompt",
-            "claude-acp",
+            reviewer("claude-acp", "opus"),
             InjectionMode::Auto,
             1,
             8_000,
             None,
         );
 
-        assert!(!injection.injected);
-        assert!(injection.selected_run_ids.is_empty());
-        assert!(injection.prompt_section.is_none());
+        assert!(injection.injected);
+        assert_eq!(injection.selected_run_ids, vec!["run-approved".to_string()]);
+        assert!(injection
+            .prompt_section
+            .expect("prompt")
+            .contains("VERDICT: APPROVED"));
+    }
+
+    #[test]
+    fn injection_auto_skips_fable_reviewer_models() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_review_record(
+            state.path(),
+            "run-approved",
+            1,
+            "APPROVED",
+            "Add review exemplar archive and injection",
+            100,
+            "VERDICT: APPROVED",
+        );
+
+        for model in ["default", "claude-fable-5"] {
+            let injection = build_injection_from_state_dir(
+                state.path(),
+                "Inject review exemplars into orch review prompt",
+                reviewer("claude-acp", model),
+                InjectionMode::Auto,
+                1,
+                8_000,
+                None,
+            );
+
+            assert!(!injection.injected);
+            assert!(injection.selected_run_ids.is_empty());
+            assert!(injection.prompt_section.is_none());
+        }
+    }
+
+    #[test]
+    fn injection_explicit_modes_override_reviewer_model_identity() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_review_record(
+            state.path(),
+            "run-approved",
+            1,
+            "APPROVED",
+            "Add review exemplar archive and injection",
+            100,
+            "VERDICT: APPROVED",
+        );
+
+        let always = build_injection_from_state_dir(
+            state.path(),
+            "Inject review exemplars into orch review prompt",
+            reviewer("claude-acp", "claude-fable-5"),
+            InjectionMode::Always,
+            1,
+            8_000,
+            None,
+        );
+        assert!(always.injected);
+
+        let never = build_injection_from_state_dir(
+            state.path(),
+            "Inject review exemplars into orch review prompt",
+            reviewer("claude-acp", "opus"),
+            InjectionMode::Never,
+            1,
+            8_000,
+            None,
+        );
+        assert!(!never.injected);
     }
 
     #[test]
@@ -374,7 +460,7 @@ mod tests {
         let injection = build_injection_from_state_dir(
             state.path(),
             "Inject review exemplars into orch review prompt and archive verdicts",
-            "fable",
+            reviewer("anthropic", "claude-opus"),
             InjectionMode::Auto,
             1,
             80,
@@ -418,7 +504,7 @@ mod tests {
         let injection = build_injection_from_state_dir(
             state.path(),
             "Inject review exemplars into orch review prompt",
-            "fable",
+            reviewer("anthropic", "claude-opus"),
             InjectionMode::Auto,
             1,
             8_000,

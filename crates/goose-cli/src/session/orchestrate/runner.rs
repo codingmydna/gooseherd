@@ -21,8 +21,8 @@ use super::phases::{
 };
 use super::planner::run_plan_phase;
 use super::roles::{
-    build_role_provider, implement_policy_label, is_acp_provider, playbook_text, resolve_all_roles,
-    role_system_prompt, RoleConfig,
+    build_role_provider, implement_policy_label, is_acp_provider, playbook_banner_fragment,
+    playbook_text, resolve_all_roles, role_system_prompt, RoleConfig,
 };
 use super::workspace::{
     finalize_worktree_approval, git_evidence, render_workspace_banner, setup_orch_workspace,
@@ -390,16 +390,18 @@ impl CliSession {
             let review_exemplar_injection = review_exemplars::build_injection(
                 task,
                 &reviewer_role.provider_name,
+                &reviewer_role.model,
                 Some(&run_id),
             );
             phase_banner(
                 &format!(
-                    "phase: review (cycle {}/{}) · {}/{}{}",
+                    "phase: review (cycle {}/{}) · {}/{}{}{}",
                     cycle,
                     max_cycles,
                     reviewer_role.provider_name,
                     reviewer_role.model,
-                    review_exemplar_injection.banner_fragment_with_label("review exemplars")
+                    review_exemplar_injection.banner_fragment_with_label("review exemplars"),
+                    playbook_banner_fragment(reviewer_role)
                 ),
                 output::ActiveRole::Reviewer,
             );

@@ -66,6 +66,10 @@ Use the plan and review exemplar archives plus the distillation playbook
 workflow when production runs should improve future runs. Approved plans and
 review verdicts become examples for later planner/reviewer prompts, turning
 successful orchestration traces into a better harness.
+By default the playbook and exemplars are injected unless the planner/reviewer
+serving model is Fable; `GOOSE_ORCH_PLAYBOOK=auto|always|never`,
+`GOOSE_PLAN_EXEMPLARS_INJECT=auto|always|never`, and
+`GOOSE_REVIEW_EXEMPLARS_INJECT=auto|always|never` override that gate.
 
 Example:
 
