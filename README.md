@@ -32,6 +32,33 @@ VERDICT: APPROVED
   ⎿ review done · model default · in 2 / out 224 · 6.7s · APPROVED
 ```
 
+**A full run lifecycle around the loop** — each `/orch` run isolates itself in
+a git worktree (`.goose/worktrees/orch-<run_id>`, env files symlinked), so
+parallel runs on one repo don't contaminate each other's evidence. Configured
+quality gates (`GOOSE_ORCH_GATES`, e.g. fmt/lint/test) run *before* the
+reviewer is called — mechanical failures bounce straight back to the
+implementer without spending reviewer tokens. On approval the run auto-commits
+to its branch and prints the merge command (`--merge` merges for you).
+Approved plans are archived and similar past plans are injected as few-shot
+exemplars for future planners (`GOOSE_PLAN_EXEMPLARS`), so the expensive
+model's planning shape survives into cheaper ones. An allowlist permission
+policy (`GOOSE_ORCH_IMPLEMENT_POLICY: allowlist`) confines the implementer to
+the workspace and an approved command list — for running orchestration on
+repos you actually care about.
+
+**Bring any ACP agent** — besides the built-in claude/codex/copilot/amp/pi
+adapters, any ACP-speaking CLI plugs in via config:
+
+```yaml
+GOOSE_ACP_AGENTS:
+  gemini: gemini --acp
+  opencode: opencode acp
+  kimi: kimi acp
+```
+
+Each entry becomes a provider (`gemini-acp`, …) assignable to any role — handy
+for cheap or free implementer models.
+
 **Plan-Explore permission policy** — the planner and reviewer run as full
 agents but cannot write. Instead of goose's all-or-nothing modes, permission
 requests are judged by ACP tool kind: reads, searches, and parallel subagent
@@ -60,10 +87,17 @@ limit (a useful fingerprint for catching silent model downgrades —
 
 **Quality-of-life commands** — `/status` (roles, connection type, effort,
 usage), `/usage`, `/roles` (change role assignments without leaving the
-session), `/btw` (ask a side question in the background without touching the
-session history), a copy-pasteable resume command on exit, slash-command
-typing hints, per-role reasoning effort, and Claude-Code-style tool rendering
-(diff coloring, edit previews, response bullets).
+session), `/model provider/model` (switch the live session and persist it),
+`/btw` (ask a side question in the background without touching the
+session history), `goose worktree new/list/prune` (parallel-session worktrees
+with env symlinks), `/terminal-setup` (make Shift+Enter insert a newline in
+terminals that swallow the modifier), a copy-pasteable resume command on exit,
+slash-command typing hints, per-role reasoning effort, and Claude-Code-style
+rendering: diff coloring, edit previews, a bordered input box with a status
+line, todo checklists (`☐/◐/✔`), role-colored response bullets during
+orchestration (planner cyan, implementer yellow, reviewer magenta), a live
+spinner with elapsed time and running tools, and mid-turn steering — type
+while a turn is running and it's injected at the next tool boundary.
 
 ## Setup
 
@@ -117,6 +151,10 @@ Most of what your hands already know keeps working. The mapping:
 | Shift+Tab mode cycling | Shift+Tab cycles role presets (`/preset save <name>` first) |
 | `/cost`, `/context` | `/usage`, `/status`, `/stats` |
 | Side questions without derailing the session | `/btw <question>` |
+| Typing mid-turn to steer | same — injected at the next tool boundary |
+| `/terminal-setup` for Shift+Enter | same command |
+| TodoWrite checklist rendering | automatic (`☐/◐/✔`) |
+| Background agents committing to a branch | `/orch` auto-worktree + auto-commit on approval |
 | `!command` shell passthrough | same — `!command`, output joins the context |
 | `/init` writing CLAUDE.md | `/init` writes AGENTS.md |
 | `#note` quick memory | `/remember <note>` → .goosehints |
