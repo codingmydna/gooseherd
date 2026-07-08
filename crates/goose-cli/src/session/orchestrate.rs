@@ -16,7 +16,9 @@ const PHASE_IDLE_TIMEOUT_KEY: &str = "GOOSE_ORCH_PHASE_IDLE_TIMEOUT_SECS";
 const GATES_KEY: &str = "GOOSE_ORCH_GATES";
 const MAX_GATE_RETRIES_KEY: &str = "GOOSE_ORCH_MAX_GATE_RETRIES";
 const DEFAULT_MAX_CYCLES: u32 = 3;
-const DEFAULT_PHASE_IDLE_TIMEOUT_SECS: u64 = 120;
+// Reviewers legitimately go quiet for minutes while a delegated test/build
+// command runs; 120s produced false-positive timeouts on healthy reviews.
+const DEFAULT_PHASE_IDLE_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_MAX_GATE_RETRIES: u32 = 2;
 const EVIDENCE_CHAR_LIMIT: usize = 30_000;
 const GATE_OUTPUT_TAIL_LIMIT: usize = 4_000;
