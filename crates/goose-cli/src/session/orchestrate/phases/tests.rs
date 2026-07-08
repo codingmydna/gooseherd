@@ -250,6 +250,27 @@ fn orch_min_plan_chars_reads_env_override() {
 }
 
 #[test]
+fn orch_progress_cadence_defaults_to_sixty_seconds() {
+    let _guard = env_lock::lock_env([("GOOSE_ORCH_PROGRESS_SECS", None::<String>)]);
+
+    assert_eq!(super::orch_progress_cadence(), Duration::from_secs(60));
+}
+
+#[test]
+fn orch_progress_cadence_reads_env_override() {
+    let _guard = env_lock::lock_env([("GOOSE_ORCH_PROGRESS_SECS", Some("120".to_string()))]);
+
+    assert_eq!(super::orch_progress_cadence(), Duration::from_secs(120));
+}
+
+#[test]
+fn orch_progress_cadence_allows_zero_to_disable() {
+    let _guard = env_lock::lock_env([("GOOSE_ORCH_PROGRESS_SECS", Some("0".to_string()))]);
+
+    assert_eq!(super::orch_progress_cadence(), Duration::ZERO);
+}
+
+#[test]
 fn planner_prompt_omits_question_protocol_when_disabled() {
     assert!(!super::planner_prompt(false).contains("orch-question"));
     assert!(super::planner_prompt(true).contains("orch-question"));

@@ -112,11 +112,22 @@ static ACTIVE_ROLE: AtomicU8 = AtomicU8::new(ACTIVE_ROLE_NONE);
 static ACTIVE_ROLE_CYCLE: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_ROLE_MAX_CYCLES: AtomicU32 = AtomicU32::new(0);
 static TOOL_STARTED: OnceLock<Mutex<HashMap<String, RunningTool>>> = OnceLock::new();
+static PHASE_PROGRESS: OnceLock<Mutex<Option<PhaseProgress>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct RunningTool {
     started_at: Instant,
     summary: String,
+}
+
+struct PhaseProgress {
+    label: String,
+    cycle: Option<(u32, u32)>,
+    started_at: Instant,
+    last_activity: Instant,
+    cadence: Duration,
+    tool_calls: u32,
+    last_summary: Option<String>,
 }
 
 pub fn set_active_role(role: Option<ActiveRole>) {
@@ -172,6 +183,91 @@ fn tool_started() -> &'static Mutex<HashMap<String, RunningTool>> {
     TOOL_STARTED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn phase_progress() -> &'static Mutex<Option<PhaseProgress>> {
+    PHASE_PROGRESS.get_or_init(|| Mutex::new(None))
+}
+
+pub fn begin_phase_progress(label: &str, cycle: Option<(u32, u32)>, cadence: Duration) {
+    let Ok(mut progress) = phase_progress().lock() else {
+        return;
+    };
+    if cadence.is_zero() {
+        *progress = None;
+        return;
+    }
+
+    let now = Instant::now();
+    *progress = Some(PhaseProgress {
+        label: label.to_string(),
+        cycle,
+        started_at: now,
+        last_activity: now,
+        cadence,
+        tool_calls: 0,
+        last_summary: None,
+    });
+}
+
+pub fn end_phase_progress() {
+    if let Ok(mut progress) = phase_progress().lock() {
+        *progress = None;
+    }
+}
+
+fn note_phase_activity() {
+    if let Ok(mut progress) = phase_progress().lock() {
+        if let Some(progress) = progress.as_mut() {
+            progress.last_activity = Instant::now();
+        }
+    }
+}
+
+fn note_phase_tool_start(started_at: Instant, summary: &str) {
+    if let Ok(mut progress) = phase_progress().lock() {
+        if let Some(progress) = progress.as_mut() {
+            progress.tool_calls = progress.tool_calls.saturating_add(1);
+            progress.last_summary = Some(summary.to_string());
+            progress.last_activity = started_at;
+        }
+    }
+}
+
+pub fn phase_progress_tick() {
+    let snapshot = {
+        let Ok(mut progress) = phase_progress().lock() else {
+            return;
+        };
+        let Some(progress) = progress.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        if now.duration_since(progress.last_activity) < progress.cadence {
+            return;
+        }
+        progress.last_activity = now;
+        (
+            progress.label.clone(),
+            progress.cycle,
+            now.duration_since(progress.started_at),
+            progress.tool_calls,
+            progress.last_summary.clone(),
+        )
+    };
+
+    let (label, cycle, elapsed, tool_calls, last_summary) = snapshot;
+    let content = format_phase_progress(PhaseProgressInput {
+        label: &label,
+        cycle,
+        elapsed,
+        tool_calls,
+        last_summary: last_summary.as_deref(),
+        terminal_width: thinking_status_width(),
+    });
+    hide_thinking();
+    println!("  {}", style(format!("⋯ {content}")).dim());
+    let _ = std::io::stdout().flush();
+}
+
 /// Spinner label showing which model is currently in control
 /// (e.g. "claude-acp/default working…"). None falls back to fun messages.
 pub fn set_thinking_context(context: Option<String>) {
@@ -219,6 +315,43 @@ pub fn build_thinking_status_label(input: ThinkingStatusLabelInput<'_>) -> Strin
     if let Some(hint) = input.hint {
         label.push_str("  ");
         label.push_str(hint);
+    }
+
+    match input.terminal_width {
+        Some(width) => truncate_to_display_width(&label, width),
+        None => label,
+    }
+}
+
+struct PhaseProgressInput<'a> {
+    label: &'a str,
+    cycle: Option<(u32, u32)>,
+    elapsed: Duration,
+    tool_calls: u32,
+    last_summary: Option<&'a str>,
+    terminal_width: Option<usize>,
+}
+
+fn format_phase_progress(input: PhaseProgressInput<'_>) -> String {
+    let mut label = input.label.to_string();
+    if let Some((cycle, max_cycles)) = input.cycle {
+        label.push_str(&format!(" c{cycle}/{max_cycles}"));
+    }
+    label.push_str(" · ");
+    label.push_str(&format_elapsed(input.elapsed));
+
+    if input.tool_calls > 0 {
+        label.push_str(&format!(
+            " · {} tool call{}",
+            input.tool_calls,
+            if input.tool_calls == 1 { "" } else { "s" }
+        ));
+        if let Some(last_summary) = input.last_summary {
+            label.push_str(" · last: ");
+            label.push_str(last_summary);
+        }
+    } else {
+        label.push_str(" · working…");
     }
 
     match input.terminal_width {
@@ -642,6 +775,7 @@ pub fn render_message_streaming(
     thinking_header_shown: &mut bool,
     debug: bool,
 ) {
+    note_phase_activity();
     let theme = get_theme();
 
     for content in &message.content {
@@ -848,6 +982,8 @@ fn render_thinking_streaming(
 }
 
 fn remember_tool_start(id: &str, summary: Option<String>) {
+    let started_at = Instant::now();
+    let summary = summary.unwrap_or_else(|| "tool".to_string());
     if let Ok(mut started) = tool_started().lock() {
         if started.len() >= MAX_TRACKED_TOOL_CALLS {
             started.clear();
@@ -855,11 +991,12 @@ fn remember_tool_start(id: &str, summary: Option<String>) {
         started.insert(
             id.to_string(),
             RunningTool {
-                started_at: Instant::now(),
-                summary: summary.unwrap_or_else(|| "tool".to_string()),
+                started_at,
+                summary: summary.clone(),
             },
         );
     }
+    note_phase_tool_start(started_at, &summary);
 }
 
 fn take_tool_elapsed(id: &str) -> Option<Duration> {
@@ -2402,6 +2539,69 @@ mod tests {
 
         assert_eq!(measure_text_width(&label), 24);
         assert_eq!(label, "planner · very-long-m...");
+    }
+
+    #[test]
+    fn phase_progress_formats_cycle_tools_and_last_summary() {
+        let label = format_phase_progress(PhaseProgressInput {
+            label: "implement",
+            cycle: Some((1, 3)),
+            elapsed: Duration::from_secs(372),
+            tool_calls: 14,
+            last_summary: Some("edit runner.rs"),
+            terminal_width: None,
+        });
+
+        assert_eq!(
+            label,
+            "implement c1/3 · 6m 12s · 14 tool calls · last: edit runner.rs"
+        );
+    }
+
+    #[test]
+    fn phase_progress_formats_single_tool_without_plural_suffix() {
+        let label = format_phase_progress(PhaseProgressInput {
+            label: "implement",
+            cycle: Some((1, 3)),
+            elapsed: Duration::from_secs(1),
+            tool_calls: 1,
+            last_summary: Some("cargo test -p goose-cli"),
+            terminal_width: None,
+        });
+
+        assert_eq!(
+            label,
+            "implement c1/3 · 1s · 1 tool call · last: cargo test -p goose-cli"
+        );
+    }
+
+    #[test]
+    fn phase_progress_describes_text_only_phase_as_working() {
+        let label = format_phase_progress(PhaseProgressInput {
+            label: "review",
+            cycle: None,
+            elapsed: Duration::from_secs(123),
+            tool_calls: 0,
+            last_summary: None,
+            terminal_width: None,
+        });
+
+        assert_eq!(label, "review · 2m 3s · working…");
+    }
+
+    #[test]
+    fn phase_progress_truncates_to_display_width() {
+        let label = format_phase_progress(PhaseProgressInput {
+            label: "implement",
+            cycle: Some((1, 3)),
+            elapsed: Duration::from_secs(372),
+            tool_calls: 14,
+            last_summary: Some("a very long command that should not fill the terminal"),
+            terminal_width: Some(36),
+        });
+
+        assert_eq!(measure_text_width(&label), 36);
+        assert!(label.ends_with("..."));
     }
 
     #[test]

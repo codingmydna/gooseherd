@@ -16,9 +16,11 @@ const PHASE_IDLE_TIMEOUT_KEY: &str = "GOOSE_ORCH_PHASE_IDLE_TIMEOUT_SECS";
 const MIN_PLAN_CHARS_KEY: &str = "GOOSE_ORCH_MIN_PLAN_CHARS";
 const MAX_QUESTIONS_KEY: &str = "GOOSE_ORCH_MAX_QUESTIONS";
 const ASK_KEY: &str = "GOOSE_ORCH_ASK";
+const PROGRESS_SECS_KEY: &str = "GOOSE_ORCH_PROGRESS_SECS";
 const DEFAULT_PHASE_IDLE_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_MIN_PLAN_CHARS: usize = 3_000;
 const DEFAULT_MAX_QUESTION_ROUNDS: u32 = 2;
+const DEFAULT_PROGRESS_SECS: u64 = 60;
 pub(super) const EVIDENCE_CHAR_LIMIT: usize = 30_000;
 
 const PLAN_SYSTEM_PROMPT: &str = r#"You are the planning lead in a two-model workflow. A separate implementer model will execute your plan with file-editing and shell tools. Your session is read-only: you can explore the working directory but cannot modify anything.
@@ -142,6 +144,14 @@ pub(super) fn orch_phase_idle_timeout() -> Duration {
         .ok()
         .filter(|secs| *secs > 0)
         .unwrap_or(DEFAULT_PHASE_IDLE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+pub(super) fn orch_progress_cadence() -> Duration {
+    let secs = Config::global()
+        .get_param::<u64>(PROGRESS_SECS_KEY)
+        .ok()
+        .unwrap_or(DEFAULT_PROGRESS_SECS);
     Duration::from_secs(secs)
 }
 
@@ -332,6 +342,7 @@ pub(super) async fn stream_role_completion_status(
                 }
             }
             _ = status_tick.tick() => {
+                output::phase_progress_tick();
                 output::refresh_thinking_status();
             }
             _ = &mut idle_sleep, if idle_timeout.is_some() => {

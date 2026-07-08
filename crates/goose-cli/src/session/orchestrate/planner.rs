@@ -10,8 +10,8 @@ use crate::session::{orch_ask, output, plan_exemplars};
 
 use super::phases::{
     orch_ask_enabled, orch_max_question_rounds, orch_min_plan_chars, orch_phase_idle_timeout,
-    partial_completion_text, persist_artifact, phase_banner, plan_quality_action,
-    plan_round_action, planner_prompt, record_phase, record_question_round,
+    orch_progress_cadence, partial_completion_text, persist_artifact, phase_banner,
+    plan_quality_action, plan_round_action, planner_prompt, record_phase, record_question_round,
     render_auto_answer_banner, stream_role_completion_status, PhaseMeta, PlanQualityAction,
     PlanRoundAction,
 };
@@ -88,6 +88,7 @@ pub(super) async fn run_plan_phase(
 
     let (mut plan_text, plan_usage) = loop {
         output::show_thinking();
+        output::begin_phase_progress("plan", None, orch_progress_cadence());
         let completion_result = if let Some(timeout) = role_idle_timeout {
             stream_role_completion_status(
                 &planner,
@@ -111,6 +112,7 @@ pub(super) async fn run_plan_phase(
             )
             .await
         };
+        output::end_phase_progress();
         let completion = match completion_result {
             Ok(completion) => completion,
             Err(err) => {

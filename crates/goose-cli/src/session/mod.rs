@@ -2027,8 +2027,11 @@ impl CliSession {
                         }
                     }
                 }
-                _ = status_tick.tick(), if interactive => {
-                    output::refresh_thinking_status();
+                _ = status_tick.tick() => {
+                    output::phase_progress_tick();
+                    if interactive {
+                        output::refresh_thinking_status();
+                    }
                 }
             }
         }

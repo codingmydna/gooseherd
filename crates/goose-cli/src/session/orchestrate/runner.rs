@@ -15,10 +15,10 @@ use super::gates::{
 };
 use super::limits::handle_phase_error;
 use super::phases::{
-    archive_pending_reviews, gate_banner, orch_phase_idle_timeout, parse_verdict_approved,
-    partial_completion_text, persist_artifact, phase_banner, record_phase, stream_role_completion,
-    stream_role_completion_status, warn_truncated, PendingReviewArchive, PhaseMeta,
-    PhasePolicySummary, EVIDENCE_CHAR_LIMIT, REVIEW_SYSTEM_PROMPT,
+    archive_pending_reviews, gate_banner, orch_phase_idle_timeout, orch_progress_cadence,
+    parse_verdict_approved, partial_completion_text, persist_artifact, phase_banner, record_phase,
+    stream_role_completion, stream_role_completion_status, warn_truncated, PendingReviewArchive,
+    PhaseMeta, PhasePolicySummary, EVIDENCE_CHAR_LIMIT, REVIEW_SYSTEM_PROMPT,
 };
 use super::planner::run_plan_phase;
 use super::roles::{
@@ -110,6 +110,7 @@ impl CliSession {
             .await;
 
         output::set_active_role(None);
+        output::end_phase_progress();
         output::set_thinking_context(None);
         if let Err(e) = config.set_param("GOOSE_ACP_PLAN_EXPLORE", false) {
             output::render_error(&format!("Failed to reset plan-explore flag: {}", e));
@@ -328,10 +329,16 @@ impl CliSession {
                     .unwrap_or_default();
                 self.push_message(Message::user().with_text(&instruction));
                 output::show_thinking();
+                output::begin_phase_progress(
+                    "implement",
+                    Some((cycle, max_cycles)),
+                    orch_progress_cadence(),
+                );
                 goose::acp::reset_orch_implement_denial_count();
                 self.process_agent_response(interactive, CancellationToken::default())
                     .await?;
                 output::hide_thinking();
+                output::end_phase_progress();
                 let policy_summary = PhasePolicySummary {
                     name: implement_policy_label(implement_policy, implementer_is_acp),
                     denials: goose::acp::orch_implement_denial_count(),
@@ -493,6 +500,11 @@ impl CliSession {
             }
             let review_request = Message::user().with_text(review_request_text);
             output::show_thinking();
+            output::begin_phase_progress(
+                "review",
+                Some((cycle, max_cycles)),
+                orch_progress_cadence(),
+            );
             let reviewer_system = role_system_prompt(REVIEW_SYSTEM_PROMPT, reviewer_role);
             let (review_text, review_usage) = if let Some(timeout) = role_idle_timeout {
                 let completion = match stream_role_completion_status(
@@ -516,6 +528,7 @@ impl CliSession {
                                 partial_text,
                             );
                         }
+                        output::end_phase_progress();
                         return handle_phase_error(
                             err,
                             "reviewer",
@@ -549,6 +562,7 @@ impl CliSession {
                                 partial_text,
                             );
                         }
+                        output::end_phase_progress();
                         return handle_phase_error(
                             err,
                             "reviewer",
@@ -562,6 +576,7 @@ impl CliSession {
                 }
             };
             output::hide_thinking();
+            output::end_phase_progress();
             persist_artifact(
                 &workspace.original_dir,
                 &run_id,
