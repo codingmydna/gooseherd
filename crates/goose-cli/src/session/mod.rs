@@ -7,6 +7,7 @@ mod export;
 mod input;
 mod ledger;
 mod live_input;
+mod model_picker;
 mod orchestrate;
 mod output;
 mod plan_exemplars;
@@ -711,6 +712,12 @@ impl CliSession {
                     output::render_error(&e.to_string());
                 }
             }
+            InputResult::Effort(args) => {
+                history.save(editor);
+                if let Err(e) = self.handle_effort(args).await {
+                    output::render_error(&e.to_string());
+                }
+            }
             InputResult::Bash(cmd) => {
                 history.save(editor);
                 if let Err(e) = self.handle_bash(cmd).await {
@@ -947,7 +954,286 @@ impl CliSession {
         Ok(())
     }
 
+    async fn model_picker_statuses(&self) -> Result<Vec<model_picker::TargetStatus>> {
+        let config = Config::global();
+        let provider = self.agent.provider().await?;
+        let current_provider_name = provider.get_name().to_string();
+        let current_model_config = self
+            .agent
+            .model_config_for_session(&self.session_id)
+            .await?;
+        let session_effort = current_model_config
+            .thinking_effort()
+            .or(config.get_goose_thinking_effort())
+            .map(effort_label);
+
+        let roles = orchestrate::resolve_all_roles()?;
+        let mut statuses = vec![model_picker::TargetStatus {
+            target: model_picker::ModelPickerTarget::Session,
+            provider: current_provider_name,
+            model: current_model_config.model_name.clone(),
+            effort: session_effort,
+        }];
+
+        for (target, role) in [
+            (model_picker::ModelPickerTarget::Planner, roles.planner),
+            (
+                model_picker::ModelPickerTarget::Implementer,
+                roles.implementer,
+            ),
+            (model_picker::ModelPickerTarget::Reviewer, roles.reviewer),
+        ] {
+            statuses.push(model_picker::TargetStatus {
+                target,
+                provider: role.provider_name,
+                model: role.model,
+                effort: role
+                    .effort
+                    .as_deref()
+                    .and_then(model_picker::normalize_effort_label)
+                    .map(ToString::to_string),
+            });
+        }
+
+        Ok(statuses)
+    }
+
+    async fn model_picker_providers(&self) -> Vec<model_picker::ModelPickerProvider> {
+        goose::providers::providers()
+            .await
+            .into_iter()
+            .map(|(metadata, _)| metadata.into())
+            .collect()
+    }
+
+    async fn handle_model_picker(&self) -> Result<()> {
+        let statuses = self.model_picker_statuses().await?;
+        let providers = self.model_picker_providers().await;
+        if providers.is_empty() {
+            output::render_error("No providers are available.");
+            return Ok(());
+        }
+
+        let state = model_picker::ModelPickerState::new();
+        let mut target_select = cliclack::select("Select model target");
+        for option in model_picker::build_target_options(&statuses) {
+            target_select =
+                target_select.item(option.value.label().to_string(), option.label, option.hint);
+        }
+        let target_value: String = match target_select.interact() {
+            Ok(value) => value,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                println!("{}", console::style("Model change cancelled.").yellow());
+                return self.apply_model_picker_outcome(state.cancel()).await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let Some(target) = model_picker::parse_target(&target_value) else {
+            output::render_error("Invalid model target.");
+            return Ok(());
+        };
+        let Some(current) = statuses.iter().find(|status| status.target == target) else {
+            output::render_error("Could not resolve current target model.");
+            return Ok(());
+        };
+        let state = state.select_target(target);
+
+        let mut provider_select = cliclack::select("Select provider");
+        for option in model_picker::build_provider_options(&providers, Some(&current.provider)) {
+            provider_select = provider_select.item(option.value, option.label, option.hint);
+        }
+        let provider_name: String = match provider_select.interact() {
+            Ok(value) => value,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                println!("{}", console::style("Model change cancelled.").yellow());
+                return self.apply_model_picker_outcome(state.cancel()).await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let state = state.select_provider(provider_name.clone());
+
+        let Some(provider) = providers
+            .iter()
+            .find(|provider| provider.name == provider_name)
+        else {
+            output::render_error("Selected provider is no longer available.");
+            return Ok(());
+        };
+        let current_model = (provider_name == current.provider).then_some(current.model.as_str());
+        let mut model_select = cliclack::select("Select model");
+        for option in model_picker::build_model_options(provider, current_model) {
+            model_select = model_select.item(option.value, option.label, option.hint);
+        }
+        let selected_model: String = match model_select.interact() {
+            Ok(value) => value,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                println!("{}", console::style("Model change cancelled.").yellow());
+                return self.apply_model_picker_outcome(state.cancel()).await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let model = if selected_model == model_picker::DIRECT_MODEL_INPUT {
+            match cliclack::input("Enter model id").interact() {
+                Ok(value) => value,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    println!("{}", console::style("Model change cancelled.").yellow());
+                    return self.apply_model_picker_outcome(state.cancel()).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            selected_model
+        };
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            output::render_error("Model name cannot be empty");
+            return Ok(());
+        }
+
+        let outcome = state.select_model(model);
+        self.apply_model_picker_outcome(outcome).await
+    }
+
+    async fn apply_model_picker_outcome(
+        &self,
+        outcome: model_picker::ModelPickerOutcome,
+    ) -> Result<()> {
+        match outcome {
+            model_picker::ModelPickerOutcome::Selected {
+                target,
+                provider,
+                model,
+            } => match target.role_name() {
+                Some(role) => {
+                    self.handle_roles(Some(format!("{role}={provider}/{model}")))
+                        .await
+                }
+                None => self.switch_model(&format!("{provider}/{model}")).await,
+            },
+            model_picker::ModelPickerOutcome::Cancelled => Ok(()),
+        }
+    }
+
+    async fn handle_effort(&self, args: Option<String>) -> Result<()> {
+        let args = args.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if let Some(args) = args {
+            match parse_effort_args(&args) {
+                Ok((target, effort)) => self.apply_effort(target, &effort).await,
+                Err(message) => {
+                    output::render_error(&message);
+                    self.print_effort_status().await
+                }
+            }
+        } else if std::io::stdout().is_terminal() {
+            self.handle_effort_picker().await
+        } else {
+            self.print_effort_status().await
+        }
+    }
+
+    async fn handle_effort_picker(&self) -> Result<()> {
+        let statuses = self.model_picker_statuses().await?;
+        let mut target_select = cliclack::select("Select effort target");
+        for option in model_picker::build_target_options(&statuses) {
+            target_select =
+                target_select.item(option.value.label().to_string(), option.label, option.hint);
+        }
+        let target_value: String = match target_select.interact() {
+            Ok(value) => value,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                println!("{}", console::style("Effort change cancelled.").yellow());
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let Some(target) = model_picker::parse_target(&target_value) else {
+            output::render_error("Invalid effort target.");
+            return Ok(());
+        };
+        let current_effort = statuses
+            .iter()
+            .find(|status| status.target == target)
+            .and_then(|status| status.effort.as_deref());
+
+        let mut effort_select = cliclack::select("Select reasoning effort");
+        for option in model_picker::build_effort_options(current_effort) {
+            effort_select = effort_select.item(option.value, option.label, option.hint);
+        }
+        let effort: String = match effort_select.interact() {
+            Ok(value) => value,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                println!("{}", console::style("Effort change cancelled.").yellow());
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        self.apply_effort(target, &effort).await
+    }
+
+    async fn apply_effort(
+        &self,
+        target: model_picker::ModelPickerTarget,
+        effort: &str,
+    ) -> Result<()> {
+        let effort = match model_picker::normalize_effort_label(effort) {
+            Some(effort) => effort,
+            None => {
+                output::render_error("Effort must be one of: low, medium, high, xhigh");
+                return Ok(());
+            }
+        };
+
+        match target.role_name() {
+            Some(role) => {
+                self.handle_roles(Some(format!("{role}.effort={effort}")))
+                    .await
+            }
+            None => {
+                let parsed = effort
+                    .parse::<goose_providers::thinking::ThinkingEffort>()
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                self.agent
+                    .update_thinking_effort(&self.session_id, parsed)
+                    .await?;
+                if let Err(e) = Config::global().set_param("GOOSE_THINKING_EFFORT", effort) {
+                    output::render_error(&format!(
+                        "Session effort changed, but failed to save default effort: {e}"
+                    ));
+                }
+                output::goose_mode_message(&format!(
+                    "Session effort set to '{effort}' (saved as default)"
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    async fn print_effort_status(&self) -> Result<()> {
+        let statuses = self.model_picker_statuses().await?;
+        output::goose_mode_message("Current reasoning effort:");
+        for status in statuses {
+            output::goose_mode_message(&format!(
+                "  {:<11} {}",
+                status.target.label(),
+                status.effort.as_deref().unwrap_or("default")
+            ));
+        }
+        output::goose_mode_message(
+            "Use /effort <low|medium|high|xhigh> or /effort <target> <level>.",
+        );
+        Ok(())
+    }
+
     async fn handle_model(&self, model: Option<&str>) -> Result<()> {
+        if let Some(model) = model {
+            return self.switch_model(model).await;
+        }
+
+        if std::io::stdout().is_terminal() {
+            return self.handle_model_picker().await;
+        }
+
         let provider = self.agent.provider().await?;
         let current_provider_name = provider.get_name().to_string();
         let current_model_config = self
@@ -957,28 +1243,36 @@ impl CliSession {
         let current_model_name = current_model_config.model_name.clone();
         let provider_metadata = goose::providers::providers().await;
 
-        if model.is_none() {
+        output::goose_mode_message(&format!(
+            "Current session model: '{}/{}'",
+            current_provider_name, current_model_name
+        ));
+        output::goose_mode_message("Available providers:");
+        for (metadata, _) in &provider_metadata {
+            let marker = if metadata.name == current_provider_name {
+                "*"
+            } else {
+                " "
+            };
             output::goose_mode_message(&format!(
-                "Current session model: '{}/{}'",
-                current_provider_name, current_model_name
+                "{} {} ({}) default: {}",
+                marker, metadata.name, metadata.display_name, metadata.default_model
             ));
-            output::goose_mode_message("Available providers:");
-            for (metadata, _) in &provider_metadata {
-                let marker = if metadata.name == current_provider_name {
-                    "*"
-                } else {
-                    " "
-                };
-                output::goose_mode_message(&format!(
-                    "{} {} ({}) default: {}",
-                    marker, metadata.name, metadata.display_name, metadata.default_model
-                ));
-            }
-            output::goose_mode_message("Use /model <provider>/<model> to switch providers.");
-            return Ok(());
         }
+        output::goose_mode_message("Use /model <provider>/<model> to switch providers.");
+        Ok(())
+    }
 
-        let requested_model = model.unwrap_or_default().trim();
+    async fn switch_model(&self, model: &str) -> Result<()> {
+        let provider = self.agent.provider().await?;
+        let current_provider_name = provider.get_name().to_string();
+        let current_model_config = self
+            .agent
+            .model_config_for_session(&self.session_id)
+            .await?;
+        let current_model_name = current_model_config.model_name.clone();
+        let provider_metadata = goose::providers::providers().await;
+        let requested_model = model.trim();
         if requested_model.is_empty() {
             output::render_error("Model name cannot be empty");
             return Ok(());
@@ -2144,6 +2438,48 @@ fn is_injected_steer(message: &Message) -> bool {
     message.role == rmcp::model::Role::User && message.metadata.steer
 }
 
+fn effort_label(effort: goose_providers::thinking::ThinkingEffort) -> String {
+    match effort {
+        goose_providers::thinking::ThinkingEffort::Max => "xhigh".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn parse_effort_args(
+    args: &str,
+) -> std::result::Result<(model_picker::ModelPickerTarget, String), String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Err("Usage: /effort [target] <low|medium|high|xhigh>".to_string());
+    }
+
+    if let Some((target, effort)) = args.split_once('=') {
+        let target = target.trim().trim_end_matches(".effort");
+        let target = model_picker::parse_target(target)
+            .ok_or_else(|| format!("Unknown effort target '{target}'"))?;
+        let effort = model_picker::normalize_effort_label(effort)
+            .ok_or_else(|| "Effort must be one of: low, medium, high, xhigh".to_string())?;
+        return Ok((target, effort.to_string()));
+    }
+
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    match parts.as_slice() {
+        [effort] => {
+            let effort = model_picker::normalize_effort_label(effort)
+                .ok_or_else(|| "Effort must be one of: low, medium, high, xhigh".to_string())?;
+            Ok((model_picker::ModelPickerTarget::Session, effort.to_string()))
+        }
+        [target, effort] => {
+            let target = model_picker::parse_target(target)
+                .ok_or_else(|| format!("Unknown effort target '{target}'"))?;
+            let effort = model_picker::normalize_effort_label(effort)
+                .ok_or_else(|| "Effort must be one of: low, medium, high, xhigh".to_string())?;
+            Ok((target, effort.to_string()))
+        }
+        _ => Err("Usage: /effort [target] <low|medium|high|xhigh>".to_string()),
+    }
+}
+
 fn print_run_stats(
     run_started: Instant,
     first_token_at: Option<Instant>,
@@ -2680,6 +3016,90 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use test_case::test_case;
+
+    #[test]
+    fn model_picker_state_flows_from_target_to_provider_to_model() {
+        use super::model_picker::{ModelPickerOutcome, ModelPickerState, ModelPickerTarget};
+
+        let state = ModelPickerState::new()
+            .select_target(ModelPickerTarget::Planner)
+            .select_provider("openai");
+
+        assert_eq!(
+            state.select_model("gpt-5"),
+            ModelPickerOutcome::Selected {
+                target: ModelPickerTarget::Planner,
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn model_picker_cancel_returns_no_selection() {
+        use super::model_picker::{ModelPickerOutcome, ModelPickerState, ModelPickerTarget};
+
+        let state = ModelPickerState::new().select_target(ModelPickerTarget::Reviewer);
+
+        assert_eq!(state.cancel(), ModelPickerOutcome::Cancelled);
+    }
+
+    #[test]
+    fn model_picker_options_mark_current_values() {
+        use super::model_picker::{
+            build_effort_options, build_model_options, build_provider_options, ModelPickerProvider,
+        };
+
+        let providers = vec![ModelPickerProvider {
+            name: "openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            default_model: "gpt-5".to_string(),
+            models: vec!["gpt-5.5".to_string(), "gpt-5".to_string()],
+        }];
+
+        let provider_options = build_provider_options(&providers, Some("openai"));
+        assert_eq!(provider_options.len(), 1);
+        assert!(provider_options[0].selected);
+        assert!(provider_options[0].label.starts_with("✓ "));
+        assert!(provider_options[0].label.contains("OpenAI"));
+        assert!(provider_options[0].hint.contains("default: gpt-5"));
+
+        let model_options = build_model_options(&providers[0], Some("gpt-5.5"));
+        assert!(model_options
+            .iter()
+            .any(|option| option.selected && option.label.contains("gpt-5.5")));
+        assert!(model_options
+            .iter()
+            .any(|option| option.label.contains("Direct input")));
+
+        let effort_options = build_effort_options(Some("xhigh"));
+        assert!(effort_options
+            .iter()
+            .any(|option| option.selected && option.label.contains("xhigh")));
+    }
+
+    #[test]
+    fn parse_effort_args_supports_session_and_role_targets() {
+        assert_eq!(
+            parse_effort_args("xhigh").unwrap(),
+            (
+                model_picker::ModelPickerTarget::Session,
+                "xhigh".to_string()
+            )
+        );
+        assert_eq!(
+            parse_effort_args("planner high").unwrap(),
+            (model_picker::ModelPickerTarget::Planner, "high".to_string())
+        );
+        assert_eq!(
+            parse_effort_args("implementer.effort=max").unwrap(),
+            (
+                model_picker::ModelPickerTarget::Implementer,
+                "xhigh".to_string()
+            )
+        );
+        assert!(parse_effort_args("reviewer turbo").is_err());
+    }
 
     #[test]
     fn test_format_elapsed_time_under_60_seconds() {

@@ -26,7 +26,11 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mode", "Set goose mode (auto/approve/smart_approve/chat)"),
     (
         "/model",
-        "Show or switch provider/model (e.g. /model codex-acp/gpt-5.5)",
+        "Pick or switch provider/model (e.g. /model codex-acp/gpt-5.5)",
+    ),
+    (
+        "/effort",
+        "Pick or set reasoning effort (low/medium/high/xhigh)",
     ),
     ("/recipe", "Generate a recipe from this session"),
     ("/skills", "List or load skills"),
@@ -56,6 +60,31 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
+fn slash_command_candidates(token: &str, limit: usize) -> Vec<(&'static str, &'static str)> {
+    let query = token.trim_start_matches('/');
+    let mut seen = std::collections::HashSet::new();
+    let prefix_matches = SLASH_COMMANDS
+        .iter()
+        .filter(move |(command, _)| command.starts_with(token));
+    let partial_matches = SLASH_COMMANDS.iter().filter(move |(command, _)| {
+        !command.starts_with(token)
+            && !query.is_empty()
+            && command.trim_start_matches('/').contains(query)
+    });
+
+    prefix_matches
+        .chain(partial_matches)
+        .filter_map(|(command, description)| {
+            if seen.insert(*command) {
+                Some((*command, *description))
+            } else {
+                None
+            }
+        })
+        .take(limit)
+        .collect()
+}
+
 fn slash_command_hint(line: &str) -> Option<String> {
     let (token, has_args) = match line.split_once(' ') {
         Some((cmd, _)) => (cmd, true),
@@ -67,24 +96,19 @@ fn slash_command_hint(line: &str) -> Option<String> {
             None => Some("   ✗ unknown command".to_string()),
         };
     }
-    let matches: Vec<&(&str, &str)> = SLASH_COMMANDS
-        .iter()
-        .filter(|(c, _)| c.starts_with(token))
-        .collect();
-    if let Some((_, desc)) = matches.iter().find(|(c, _)| *c == token) {
+    if let Some((_, desc)) = SLASH_COMMANDS.iter().find(|(c, _)| *c == token) {
         return Some(format!("   ✓ {}", desc));
     }
+    let matches = slash_command_candidates(token, 5);
     match matches.len() {
         0 => Some("   ✗ unknown command".to_string()),
-        1 => {
-            let (cmd, desc) = matches[0];
-            let remainder = cmd.strip_prefix(token).unwrap_or("");
-            Some(format!("{} — {}", remainder, desc))
-        }
-        _ => {
-            let names: Vec<&str> = matches.iter().take(6).map(|(c, _)| *c).collect();
-            Some(format!("   {}", names.join(" ")))
-        }
+        _ => Some(
+            matches
+                .into_iter()
+                .map(|(command, desc)| format!("   {command} — {desc}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
     }
 }
 
@@ -787,6 +811,23 @@ mod tests {
         assert_eq!(hint, "\n╰──────────────────╯\n  Enter to send");
         assert!(hint.starts_with('\n'));
         assert!(!hint.ends_with('\n'));
+    }
+
+    #[test]
+    fn slash_command_hint_lists_partial_matches_with_descriptions() {
+        let hint = slash_command_hint("/mo").expect("slash command hint");
+
+        assert!(hint.contains("/model — Pick or switch"));
+        assert!(hint.contains("/mode — Set goose mode"));
+        assert!(hint.lines().count() >= 2);
+    }
+
+    #[test]
+    fn slash_command_hint_limits_partial_match_list_to_five() {
+        let hint = slash_command_hint("/").expect("slash command hint");
+
+        assert_eq!(hint.lines().count(), 5);
+        assert!(hint.lines().all(|line| line.contains(" — ")));
     }
 
     #[test]

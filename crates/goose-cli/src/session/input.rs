@@ -33,6 +33,7 @@ pub enum InputResult {
     Roles(Option<String>),
     Stats,
     Preset(Option<String>),
+    Effort(Option<String>),
     Bash(String),
     InitProject,
     Remember(String),
@@ -337,6 +338,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_ORCH: &str = "/orch";
     const CMD_STATUS: &str = "/status";
     const CMD_USAGE: &str = "/usage";
+    const CMD_EFFORT: &str = "/effort";
     const CMD_BTW: &str = "/btw";
     const CMD_ROLES: &str = "/roles";
     const CMD_CLEAR: &str = "/clear";
@@ -427,6 +429,10 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_STATUS => Some(InputResult::Status),
         s if s == CMD_USAGE => Some(InputResult::UsageInfo),
         "/stats" => Some(InputResult::Stats),
+        s if s == CMD_EFFORT => Some(InputResult::Effort(None)),
+        s if s.starts_with(&format!("{CMD_EFFORT} ")) => Some(InputResult::Effort(Some(
+            s.get(CMD_EFFORT.len()..).unwrap_or("").trim().to_string(),
+        ))),
         "/preset" => Some(InputResult::Preset(None)),
         "/init" => Some(InputResult::InitProject),
         s if s == "/remember" || s.starts_with("/remember ") => Some(InputResult::Remember(
@@ -582,7 +588,8 @@ fn print_help() {
 /prompts [--extension <name>] - List all available prompts, optionally filtered by extension
 /prompt <n> [--info] [key=value...] - Get prompt info or execute a prompt
 /mode <name> - Set the goose mode to use ({modes})
-/model [provider/]model - Show the current provider/model, or switch this session and save it as default
+/model [provider/]model - Without args, open a provider/model picker; with args, switch this session and save it as default
+/effort [target] <level> - Without args, pick reasoning effort for session/planner/implementer/reviewer; bare level sets session effort
 /plan <message_text> -  Enters 'plan' mode with optional message. Create a plan based on the current messages and asks user if they want to act on it.
 /orch <task> - Run the task through a plan/implement/review loop: planner model plans, implementer model executes, reviewer model reviews until approved (GOOSE_PLANNER_*, GOOSE_IMPLEMENTER_*, GOOSE_REVIEWER_* config)
 /status - Show session status: provider/model/effort/connection type, orchestration roles, subagent config, token usage
@@ -736,6 +743,16 @@ mod tests {
             assert_eq!(model, "gpt-4.1");
         } else {
             panic!("Expected Model");
+        }
+
+        assert!(matches!(
+            handle_slash_command("/effort"),
+            Some(InputResult::Effort(None))
+        ));
+        if let Some(InputResult::Effort(Some(effort))) = handle_slash_command("/effort xhigh") {
+            assert_eq!(effort, "xhigh");
+        } else {
+            panic!("Expected Effort");
         }
 
         // Test unknown commands
