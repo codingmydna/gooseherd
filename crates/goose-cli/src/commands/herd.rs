@@ -178,6 +178,20 @@ fn roles_configured(config: &Config) -> bool {
             .is_ok()
 }
 
+fn gate_advisory(config: &Config) -> Option<String> {
+    let gates = config
+        .get_param::<Vec<String>>("GOOSE_ORCH_GATES")
+        .unwrap_or_default();
+    if gates.iter().any(|gate| !gate.trim().is_empty()) {
+        return None;
+    }
+
+    Some(
+        "orch mechanical gates not configured (GOOSE_ORCH_GATES)\n      tip: set GOOSE_ORCH_GATES=[\"cargo fmt --check\", \"cargo test -p goose-cli\"] to run fmt/tests/lint before review"
+            .to_string(),
+    )
+}
+
 fn print_check(check: &Check) {
     let mark = if check.ok {
         style("✓").green()
@@ -252,6 +266,16 @@ pub async fn handle_herd() -> Result<()> {
         )
     };
     print_check(&role_check);
+
+    if let Some(advisory) = gate_advisory(config) {
+        let mut lines = advisory.lines();
+        if let Some(label) = lines.next() {
+            println!("  {} {}", style("•").yellow(), label);
+        }
+        for line in lines {
+            println!("{}", style(line).cyan());
+        }
+    }
 
     let both_vendors_available =
         claude_found && codex_found && claude_adapter_found && codex_adapter_found;
@@ -354,5 +378,26 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(!checks[0].ok);
         assert_eq!(checks[0].label, "empty-acp agent");
+    }
+
+    #[test]
+    fn gate_advisory_present_when_unset() {
+        let config = test_config();
+
+        let advisory = gate_advisory(&config).expect("advisory");
+
+        assert!(advisory.contains("GOOSE_ORCH_GATES"));
+        assert!(advisory.contains("cargo fmt --check"));
+        assert!(advisory.contains("cargo test -p goose-cli"));
+    }
+
+    #[test]
+    fn gate_advisory_absent_when_set() {
+        let config = test_config();
+        config
+            .set_param("GOOSE_ORCH_GATES", vec!["cargo fmt --check".to_string()])
+            .unwrap();
+
+        assert!(gate_advisory(&config).is_none());
     }
 }

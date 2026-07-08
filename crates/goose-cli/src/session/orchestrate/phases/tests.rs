@@ -257,12 +257,12 @@ fn planner_prompt_omits_question_protocol_when_disabled() {
 
 #[test]
 fn review_prompt_contains_reinforced_rubric() {
-    assert!(super::REVIEW_SYSTEM_PROMPT.contains("독립 재검증"));
-    assert!(super::REVIEW_SYSTEM_PROMPT.contains("수용 기준"));
-    assert!(super::REVIEW_SYSTEM_PROMPT.contains("실패 귀속"));
-    assert!(super::REVIEW_SYSTEM_PROMPT.contains("수정 불요 관찰"));
-    assert!(super::REVIEW_SYSTEM_PROMPT.contains("위치"));
-    assert!(super::REVIEW_SYSTEM_PROMPT.contains("메커니즘"));
-    assert!(super::REVIEW_SYSTEM_PROMPT.contains("재현"));
-    assert!(super::REVIEW_SYSTEM_PROMPT.contains("수정 방향"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("Independent re-verification"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("acceptance criteria"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("failure-attribution"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("no-fix-needed observations"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("location"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("mechanism"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("reproduction"));
+    assert!(super::REVIEW_SYSTEM_PROMPT.contains("fix direction"));
 }

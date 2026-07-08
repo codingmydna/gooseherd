@@ -493,6 +493,13 @@ mod tests {
             .with_extensions(extensions.into_iter())
             .build();
 
-        assert_snapshot!(system_prompt);
+        let suffix = if cfg!(feature = "code-mode") {
+            "code-mode"
+        } else {
+            "default"
+        };
+        insta::with_settings!({ snapshot_suffix => suffix }, {
+            assert_snapshot!(system_prompt);
+        });
     }
 }

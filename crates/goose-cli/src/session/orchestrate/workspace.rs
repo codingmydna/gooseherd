@@ -218,22 +218,25 @@ fn parse_status_path(line: &str) -> Option<String> {
 fn conventional_commit_subject(task: &str, changed_paths: &[String]) -> String {
     const SUMMARY_LIMIT: usize = 65;
 
-    let task_lower = task.to_lowercase();
-    let kind = if task_lower.contains("fix")
-        || task_lower.contains("bug")
-        || task_lower.contains("defect")
-        || task_lower.contains("버그")
-        || task_lower.contains("결함")
-        || task_lower.contains("고쳐")
-        || task_lower.contains("고치")
-        || task_lower.contains("수정")
+    let title_lower = commit_task_title(task).to_lowercase();
+    let leading_token = title_lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .find(|token| !token.is_empty());
+    let kind = if matches!(leading_token, Some("fix" | "bug" | "defect"))
+        || title_lower.contains("버그")
+        || title_lower.contains("결함")
+        || title_lower.contains("고쳐")
+        || title_lower.contains("고치")
+        || title_lower.contains("수정")
     {
         "fix"
-    } else if task_lower.contains("doc") || task_lower.contains("문서") {
+    } else if matches!(leading_token, Some("doc" | "docs")) || title_lower.contains("문서") {
         "docs"
-    } else if task_lower.contains("test") {
+    } else if matches!(leading_token, Some("test" | "tests")) {
         "test"
-    } else if task_lower.contains("refactor") || task_lower.contains("리팩") {
+    } else if matches!(leading_token, Some("refactor" | "refactoring"))
+        || title_lower.contains("리팩")
+    {
         "refactor"
     } else {
         "feat"
@@ -254,11 +257,8 @@ fn commit_task_summary(task: &str, kind: &str, changed_paths: &[String]) -> Stri
         return summary;
     }
 
-    let summary = task
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("update orch lifecycle");
+    let title = commit_task_title(task);
+    let summary = title.as_str();
     let summary = trim_explanatory_tail(summary)
         .trim_end_matches(['.', '!', '?'])
         .trim();
@@ -268,6 +268,59 @@ fn commit_task_summary(task: &str, kind: &str, changed_paths: &[String]) -> Stri
     } else {
         summary.to_string()
     }
+}
+
+fn commit_task_title(task: &str) -> String {
+    task.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(strip_title_markers)
+        .unwrap_or_else(|| "update orch lifecycle".to_string())
+}
+
+fn strip_title_markers(line: &str) -> String {
+    let mut title = line.trim();
+    title = title.trim_start_matches('#').trim_start();
+    title = strip_task_label(title).trim_start();
+    strip_surrounding_backticks(title)
+}
+
+fn strip_task_label(text: &str) -> &str {
+    let text = text.trim_start();
+    let task_len = "Task".len();
+    if text
+        .get(..task_len)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Task"))
+    {
+        if let Some(rest) = text.get(task_len..) {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix(':') {
+                return rest.trim_start();
+            }
+        }
+    }
+    if let Some(rest) = text.strip_prefix("과제") {
+        let rest = rest.trim_start();
+        if let Some(rest) = rest.strip_prefix(':') {
+            return rest.trim_start();
+        }
+    }
+    text
+}
+
+fn strip_surrounding_backticks(text: &str) -> String {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix('`') {
+        if let Some(end) = rest.find('`') {
+            let mut cleaned = String::with_capacity(text.len().saturating_sub(2));
+            if let (Some(before), Some(after)) = (rest.get(..end), rest.get(end + 1..)) {
+                cleaned.push_str(before);
+                cleaned.push_str(after);
+                return cleaned.trim().trim_matches('`').to_string();
+            }
+        }
+    }
+    text.trim_matches('`').to_string()
 }
 
 fn english_summary_for_korean_task(
@@ -397,7 +450,7 @@ pub(super) fn finalize_worktree_approval(workspace: &OrchWorkspace, task: &str, 
                     .green()
                     .bold()
             );
-            println!("  병합하려면: git merge {branch}");
+            println!("  to merge: git merge {branch}");
         }
         Ok(false) => {
             println!(
@@ -576,6 +629,22 @@ mod tests {
         assert_eq!(
             subject(task, &["crates/goose-cli/src/session/orchestrate.rs"]),
             "fix(cli): improve orch auto-commit titles"
+        );
+    }
+
+    #[test]
+    fn conventional_commit_subject_cleans_markdown_task_heading() {
+        let task = r#"# Task: `/loop` — time-based recurring prompt execution
+
+Update loop scheduling behavior.
+
+Do not classify this as a fix just because the body says fix failing CI.
+Do not classify this as docs just because the body mentions docs/loops.md.
+"#;
+
+        assert_eq!(
+            subject(task, &["crates/goose-cli/src/session/orchestrate.rs"]),
+            "feat(cli): /loop — time-based recurring prompt execution"
         );
     }
 

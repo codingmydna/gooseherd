@@ -149,7 +149,7 @@ pub(super) fn gate_passed_review_note(gates: &[String]) -> String {
     if commands.is_empty() {
         String::new()
     } else {
-        format!("\n\n게이트 통과: {}", commands.join("; "))
+        format!("\n\ngates passed: {}", commands.join("; "))
     }
 }
 
@@ -342,7 +342,7 @@ mod tests {
 
         assert_eq!(
             super::gate_passed_review_note(&gates),
-            "\n\n게이트 통과: cargo fmt --check; cargo test -p goose-cli"
+            "\n\ngates passed: cargo fmt --check; cargo test -p goose-cli"
         );
     }
 }
