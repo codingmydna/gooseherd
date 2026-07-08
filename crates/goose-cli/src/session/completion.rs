@@ -36,13 +36,17 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/skills", "List or load skills"),
     ("/status", "Session status: model, roles, subagents, usage"),
     ("/usage", "Token usage and cost for this session"),
-    ("/stats", "Orch run statistics and model verification"),
+    ("/stats", "Orch/goal run statistics and model verification"),
     (
         "/arena",
         "Same task, N models, isolated worktrees, blind judge",
     ),
     ("/worktree", "Create a named git worktree"),
     ("/orch", "Plan → implement → review loop across models"),
+    (
+        "/goal",
+        "Retry until a check or evaluator confirms the goal",
+    ),
     (
         "/loop",
         "Repeat a prompt on an interval until stopped or done",
@@ -95,6 +99,11 @@ fn slash_command_hint(line: &str) -> Option<String> {
         None => (line, false),
     };
     if has_args {
+        if token == "/goal" {
+            return Some(
+                "   ◎ /goal <goal text> [--max N] [--check \"shell cmd\"] · /goal stop".to_string(),
+            );
+        }
         if token == "/loop" {
             return Some(
                 "   ↻ /loop <30s|5m|1h|90> [--max N] [--until-done] <prompt> · /loop stop"

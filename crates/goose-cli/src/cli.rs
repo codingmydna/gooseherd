@@ -33,7 +33,8 @@ use crate::commands::skills::handle_skills_list;
 use crate::recipes::extract_from_cli::extract_recipe_info_from_cli;
 use crate::recipes::recipe::{explain_recipe, render_recipe_as_yaml};
 use crate::session::{
-    build_session, parse_loop_interval, LoopCommand, SessionBuilderConfig, LOOP_USAGE,
+    build_session, parse_loop_interval, GoalCommand, GoalOutcome, LoopCommand,
+    SessionBuilderConfig, GOAL_USAGE, LOOP_USAGE,
 };
 use goose::agents::Container;
 use goose::session::session_manager::SessionType;
@@ -1041,6 +1042,37 @@ enum Command {
         model_opts: ModelOptions,
     },
 
+    /// Run a goal loop until a check or evaluator confirms success
+    #[command(
+        about = "Run a goal loop until success is verified",
+        long_about = "Runs a normal goose prompt, evaluates whether the goal was met, and retries with evaluator feedback until success or a max-attempt cap. If --check is provided, the shell command runs in the working directory after each attempt and exit 0 means success; no evaluator model is called. Without --check, the evaluator uses GOOSE_EVALUATOR_PROVIDER/GOOSE_EVALUATOR_MODEL, falling back to the reviewer role config. Exits 0 when the goal is met, 1 otherwise."
+    )]
+    Goal {
+        /// Goal to pursue
+        #[arg(short = 't', long = "text", help = "Goal to pursue")]
+        text: String,
+
+        /// Maximum attempts before giving up
+        #[arg(
+            long = "max",
+            help = "Stop after N attempts (default: GOOSE_GOAL_MAX_ATTEMPTS or 5)"
+        )]
+        max: Option<u32>,
+
+        /// Deterministic shell check; exit 0 means the goal is met
+        #[arg(long = "check", help = "Shell command to run after each attempt")]
+        check: Option<String>,
+
+        #[command(flatten)]
+        session_opts: SessionOptions,
+
+        #[command(flatten)]
+        extension_opts: ExtensionOptions,
+
+        #[command(flatten)]
+        model_opts: ModelOptions,
+    },
+
     /// Run the plan → implement → review orchestration headlessly
     #[command(
         about = "Run the multi-model plan → implement → review loop headlessly",
@@ -1442,6 +1474,7 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Projects) => "projects",
         Some(Command::Run { .. }) => "run",
         Some(Command::Loop { .. }) => "loop",
+        Some(Command::Goal { .. }) => "goal",
         Some(Command::Orch { .. }) => "orch",
         Some(Command::Gateway { .. }) => "gateway",
         Some(Command::Schedule { .. }) => "schedule",
@@ -2097,6 +2130,74 @@ async fn handle_loop_command(
     result
 }
 
+async fn handle_goal_command(
+    text: String,
+    max: Option<u32>,
+    check: Option<String>,
+    session_opts: SessionOptions,
+    extension_opts: ExtensionOptions,
+    model_opts: ModelOptions,
+) -> Result<()> {
+    if max == Some(0) {
+        eprintln!("{}", console::style(GOAL_USAGE).red());
+        std::process::exit(2);
+    }
+
+    let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
+    let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
+    let mut session = build_session(SessionBuilderConfig {
+        session_id,
+        resume: false,
+        fork: false,
+        no_session: false,
+        extensions: extension_opts.extensions,
+        streamable_http_extensions: extension_opts.streamable_http_extensions,
+        builtins: extension_opts.builtins,
+        no_profile: extension_opts.no_profile,
+        recipe: None,
+        additional_system_prompt: None,
+        provider: model_opts.provider,
+        model: model_opts.model,
+        debug: session_opts.debug,
+        max_tool_repetitions: session_opts.max_tool_repetitions,
+        max_turns: session_opts.max_turns,
+        scheduled_job_id: None,
+        interactive: false,
+        quiet: false,
+        output_format: "text".to_string(),
+        container: session_opts.container.map(Container::new),
+        stats: false,
+    })
+    .await;
+
+    let command = GoalCommand {
+        goal: text,
+        max_attempts: max,
+        check,
+    };
+    let session_start = std::time::Instant::now();
+    tracing::info!(
+        monotonic_counter.goose.session_starts = 1,
+        session_type = "goal",
+        interactive = false,
+        "Headless goal session started"
+    );
+    let result = session.headless_goal(command).await;
+    log_session_completion(
+        &session,
+        session_start,
+        "goal",
+        matches!(result, Ok(GoalOutcome::Met)),
+    )
+    .await;
+    match result? {
+        GoalOutcome::Met => Ok(()),
+        GoalOutcome::NotMet | GoalOutcome::Stopped => {
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn handle_orch_command(text: String, max_cycles: Option<u32>, merge: bool) -> Result<()> {
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
     let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
@@ -2510,6 +2611,14 @@ pub async fn cli() -> anyhow::Result<()> {
             )
             .await
         }
+        Some(Command::Goal {
+            text,
+            max,
+            check,
+            session_opts,
+            extension_opts,
+            model_opts,
+        }) => handle_goal_command(text, max, check, session_opts, extension_opts, model_opts).await,
         Some(Command::Orch {
             text,
             max_cycles,

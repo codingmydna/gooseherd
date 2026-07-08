@@ -1,4 +1,5 @@
 use super::completion::GooseCompleter;
+use super::goal;
 use super::looping::{self, ParsedLoopCommand};
 use super::{CompletionCache, HintStatus};
 use anyhow::Result;
@@ -40,6 +41,7 @@ pub enum InputResult {
     Remember(String),
     Arena(String),
     Worktree(String),
+    Goal(goal::ParsedGoalCommand),
     Loop(looping::LoopCommand),
     LoopStop,
     Clear,
@@ -339,6 +341,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_PLAN: &str = "/plan";
     const CMD_ENDPLAN: &str = "/endplan";
     const CMD_ORCH: &str = "/orch";
+    const CMD_GOAL: &str = "/goal";
     const CMD_LOOP: &str = "/loop";
     const CMD_STATUS: &str = "/status";
     const CMD_USAGE: &str = "/usage";
@@ -430,6 +433,15 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_ORCH || s.starts_with(&format!("{CMD_ORCH} ")) => Some(
             InputResult::Orchestrate(s.get(CMD_ORCH.len()..).unwrap_or("").trim().to_string()),
         ),
+        s if s == CMD_GOAL || s.starts_with(&format!("{CMD_GOAL} ")) => {
+            match goal::parse_goal_command_args(s.get(CMD_GOAL.len()..).unwrap_or("").trim()) {
+                Ok(command) => Some(InputResult::Goal(command)),
+                Err(error) => {
+                    println!("{}", console::style(error).red());
+                    Some(InputResult::Retry)
+                }
+            }
+        }
         s if s == CMD_LOOP || s.starts_with(&format!("{CMD_LOOP} ")) => {
             match looping::parse_loop_command_args(s.get(CMD_LOOP.len()..).unwrap_or("").trim()) {
                 Ok(ParsedLoopCommand::Start(command)) => Some(InputResult::Loop(command)),
@@ -606,9 +618,10 @@ fn print_help() {
 /effort [target] <level> - Without args, pick reasoning effort for session/planner/implementer/reviewer; bare level sets session effort
 /plan <message_text> -  Enters 'plan' mode with optional message. Create a plan based on the current messages and asks user if they want to act on it.
 /orch <task> - Run the task through a plan/implement/review loop: planner model plans, implementer model executes, reviewer model reviews until approved (GOOSE_PLANNER_*, GOOSE_IMPLEMENTER_*, GOOSE_REVIEWER_* config)
+/goal <goal> [--max N] [--check \"cmd\"] - Retry a normal turn until a deterministic check or evaluator says GOAL_MET
 /status - Show session status: provider/model/effort/connection type, orchestration roles, subagent config, token usage
 /usage - Show token usage and cost for this session
-/stats - Orchestration run statistics: per-role/model tokens, durations, verdicts, reported-model verification
+/stats - Orch/goal run statistics: per-role/model tokens, durations, verdicts, reported-model verification
 /arena [lineup=provider/model,...] <task> - Run the same task on each contestant in isolated git worktrees, then blind-judge the diffs (GOOSE_ARENA_LINEUP, GOOSE_ARENA_TIMEOUT_SECS)
 /worktree <name> - Create a named git worktree under .goose/worktrees and print how to enter it
 /btw <question> - Ask a side question (answered by the planner model) without adding it to the session history

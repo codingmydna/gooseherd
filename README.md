@@ -13,6 +13,9 @@ is excellent inside its own harness. goose already speaks to both of them over
 ACP. What was missing was a layer that makes them work *together* on one task,
 with a paper trail.
 
+For the loop patterns behind these commands, see
+[Loop engineering with gooseherd](docs/loops.md).
+
 ## What it adds on top of goose
 
 **`/orch <task>`** — a plan → implement → review loop across different models.
@@ -149,6 +152,8 @@ Most of what your hands already know keeps working. The mapping:
 | Plan mode / read-only exploration | automatic for the planner and reviewer roles in `/orch` |
 | `/compact`, `/clear`, `/model` | same commands |
 | `/loop <interval> <prompt>` | same command; headless: `goose loop -t "<prompt>" --every <interval>` |
+| `/goal <goal>` | same command; headless: `goose goal -t "<goal>" --max N --check "<cmd>"` |
+| `/schedule` | roadmap; see [loop engineering](docs/loops.md) and use cron with `goose loop --max 1` / `goose goal` meanwhile |
 | Shift+Tab mode cycling | Shift+Tab cycles role presets (`/preset save <name>` first) |
 | `/cost`, `/context` | `/usage`, `/status`, `/stats` |
 | Side questions without derailing the session | `/btw <question>` |

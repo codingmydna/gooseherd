@@ -5,6 +5,7 @@ pub mod editor;
 mod elicitation;
 mod exemplars;
 mod export;
+mod goal;
 mod input;
 mod ledger;
 mod live_input;
@@ -35,6 +36,7 @@ use tokio_util::task::AbortOnDropHandle;
 pub use self::export::message_to_markdown;
 pub use builder::{build_session, SessionBuilderConfig};
 use console::Color;
+pub(crate) use goal::{GoalCommand, GoalOutcome, GOAL_USAGE};
 use goose::agents::AgentEvent;
 use goose::agents::SUBAGENT_TOOL_REQUEST_TYPE;
 use goose::permission::permission_confirmation::PrincipalType;
@@ -201,6 +203,9 @@ pub struct CliSession {
     sent_steers: std::sync::Mutex<Vec<String>>,
     loop_active: AtomicBool,
     loop_stop_requested: AtomicBool,
+    goal_active: AtomicBool,
+    goal_stop_requested: AtomicBool,
+    goal_status: std::sync::Mutex<Option<goal::GoalStatusSnapshot>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,6 +322,9 @@ impl CliSession {
             sent_steers: std::sync::Mutex::new(Vec::new()),
             loop_active: AtomicBool::new(false),
             loop_stop_requested: AtomicBool::new(false),
+            goal_active: AtomicBool::new(false),
+            goal_stop_requested: AtomicBool::new(false),
+            goal_status: std::sync::Mutex::new(None),
         }
     }
 
@@ -713,6 +721,29 @@ impl CliSession {
                     println!("{}", console::style("Loop stop requested.").yellow());
                 } else {
                     output::render_error("No active loop is running.");
+                }
+            }
+            InputResult::Goal(command) => {
+                history.save(editor);
+                match command {
+                    goal::ParsedGoalCommand::Start(command) => {
+                        if let Err(e) = self.run_goal(command, true).await {
+                            output::render_error(&e.to_string());
+                        }
+                    }
+                    goal::ParsedGoalCommand::Status => {
+                        if let Err(e) = self.render_goal_status().await {
+                            output::render_error(&e.to_string());
+                        }
+                    }
+                    goal::ParsedGoalCommand::Stop => {
+                        if self.goal_active.load(Ordering::SeqCst) {
+                            self.goal_stop_requested.store(true, Ordering::SeqCst);
+                            println!("{}", console::style("Goal stop requested.").yellow());
+                        } else {
+                            output::render_error("No active goal loop is running.");
+                        }
+                    }
                 }
             }
             InputResult::Status => {

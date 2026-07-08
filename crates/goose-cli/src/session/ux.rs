@@ -235,6 +235,19 @@ impl CliSession {
                 println!("\n  {}", style("no active loop is running").dim());
             }
             Ok(())
+        } else if cmd == "/goal" {
+            self.render_goal_status().await
+        } else if cmd == "/goal stop" {
+            if self.goal_active.load(Ordering::SeqCst) {
+                self.goal_stop_requested.store(true, Ordering::SeqCst);
+                println!(
+                    "\n  {}",
+                    style("goal will stop after the current attempt").yellow()
+                );
+            } else {
+                println!("\n  {}", style("no active goal loop is running").dim());
+            }
+            Ok(())
         } else if let Some(q) = cmd.strip_prefix("/btw") {
             self.handle_btw(q.trim().to_string(), Some(StdoutPrinter))
                 .await
@@ -242,7 +255,7 @@ impl CliSession {
             println!(
                 "\n  {}",
                 style(
-                    "live commands while the agent runs: /loop stop /status /stats /usage /roles /btw <question>"
+                    "live commands while the agent runs: /goal stop /loop stop /status /stats /usage /roles /btw <question>"
                 )
                 .dim()
             );
@@ -480,7 +493,8 @@ impl CliSession {
         if records.is_empty() {
             println!(
                 "\n  {}",
-                style("No orchestration runs recorded yet — run /orch first.").dim()
+                style("No orchestration or goal runs recorded yet — run /orch or /goal first.")
+                    .dim()
             );
             return Ok(());
         }
@@ -519,7 +533,7 @@ impl CliSession {
         }
 
         println!();
-        section("stats · by role and model (all recorded runs)");
+        section("stats · by role and model (all recorded orch/goal runs)");
         for (key, a) in &aggs {
             let avg_s = if a.phases > 0 {
                 a.dur_ms as f64 / a.phases as f64 / 1000.0
