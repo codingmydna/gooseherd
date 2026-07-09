@@ -1974,6 +1974,9 @@ impl CliSession {
                                             &mut prompted_credits_urls,
                                         );
                                     }
+                                    // Streamed output just moved the cursor; keep the periodic
+                                    // status refresh from redrawing the spinner over it.
+                                    output::note_streamed_output();
                                 }
                             }
                         }

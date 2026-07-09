@@ -107,6 +107,11 @@ const ACTIVE_ROLE_REVIEWER: u8 = 3;
 const MAX_TRACKED_TOOL_CALLS: usize = 128;
 const LONG_TOOL_CALL_DURATION: Duration = Duration::from_secs(3);
 const THINKING_STATUS_REFRESH: Duration = Duration::from_secs(1);
+/// While the model is actively streaming output, redrawing the spinner would
+/// paint its status label into the middle of the streamed line. Suppress the
+/// periodic spinner refresh for this long after the last streamed output so it
+/// only reappears once output pauses (tool waits, end of turn).
+const STATUS_OUTPUT_SUPPRESS_WINDOW: Duration = Duration::from_millis(2000);
 
 static ACTIVE_ROLE: AtomicU8 = AtomicU8::new(ACTIVE_ROLE_NONE);
 static ACTIVE_ROLE_CYCLE: AtomicU32 = AtomicU32::new(0);
@@ -627,6 +632,19 @@ pub struct PromptInfo {
 // Global thinking indicator
 thread_local! {
     static THINKING: RefCell<ThinkingIndicator> = RefCell::new(ThinkingIndicator::default());
+    static LAST_STREAMED_OUTPUT: RefCell<Option<Instant>> = const { RefCell::new(None) };
+}
+
+/// Record that streamed output was just written to the terminal, so the next
+/// periodic status refresh knows not to redraw the spinner over it.
+pub fn note_streamed_output() {
+    if std::io::stdout().is_terminal() {
+        LAST_STREAMED_OUTPUT.with(|t| *t.borrow_mut() = Some(Instant::now()));
+    }
+}
+
+fn should_suppress_status(last_output: Option<Instant>, now: Instant, window: Duration) -> bool {
+    matches!(last_output, Some(at) if now.saturating_duration_since(at) < window)
 }
 
 pub fn show_thinking() {
@@ -663,6 +681,7 @@ pub fn begin_thinking_turn() -> ThinkingTurnGuard {
 pub fn finish_thinking_turn() {
     if std::io::stdout().is_terminal() {
         THINKING.with(|t| t.borrow_mut().finish_turn());
+        LAST_STREAMED_OUTPUT.with(|t| *t.borrow_mut() = None);
     } else {
         clear_running_tools();
     }
@@ -670,6 +689,12 @@ pub fn finish_thinking_turn() {
 
 pub fn refresh_thinking_status() {
     if std::io::stdout().is_terminal() {
+        let suppress = LAST_STREAMED_OUTPUT.with(|t| {
+            should_suppress_status(*t.borrow(), Instant::now(), STATUS_OUTPUT_SUPPRESS_WINDOW)
+        });
+        if suppress {
+            return;
+        }
         THINKING.with(|t| t.borrow_mut().refresh());
     }
 }
@@ -2390,6 +2415,30 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::env;
+
+    #[test]
+    fn suppresses_status_only_while_output_is_recent() {
+        let base = Instant::now();
+        let window = Duration::from_millis(2000);
+        // Output 500ms ago (within window) → suppress the spinner refresh.
+        assert!(should_suppress_status(
+            Some(base),
+            base + Duration::from_millis(500),
+            window
+        ));
+        // Output 3s ago (past window, e.g. a tool wait) → allow the spinner.
+        assert!(!should_suppress_status(
+            Some(base),
+            base + Duration::from_millis(3000),
+            window
+        ));
+        // No output yet (initial wait) → allow the spinner.
+        assert!(!should_suppress_status(
+            None,
+            base + Duration::from_millis(500),
+            window
+        ));
+    }
 
     #[test]
     fn test_short_paths_unchanged() {
