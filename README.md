@@ -158,6 +158,12 @@ Then, inside `goose session`:
 /orch add input validation to the /login handler and cover it with tests
 ```
 
+The task text is a contract the cheaper implementer follows literally, so its
+shape matters. gooseherd has a house style for writing them — a 6-part anatomy
+(goal, why, code pointers, numbered requirements, completion criteria, planner
+footer) and 5 principles, distilled from the model that bootstrapped this fork:
+[Writing good `/orch` tasks — the Fable 5 style](docs/writing-orch-tasks.md).
+
 ## Coming from Claude Code or Codex CLI
 
 Most of what your hands already know keeps working. The mapping:
