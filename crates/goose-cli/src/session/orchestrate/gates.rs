@@ -30,6 +30,80 @@ pub(super) fn effective_gates(gates: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug)]
+pub(super) struct GateSkip {
+    pub command: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct GatePartition {
+    pub applicable: Vec<String>,
+    pub skipped: Vec<GateSkip>,
+}
+
+/// Split gates into those that can run against `impl_dir` and those that must be
+/// skipped. A gate is skipped when its build tool's manifest is absent from the
+/// target repo (a `cargo` gate in a repo with no `Cargo.toml`) or the tool is
+/// not installed. Without this, an unrelated gate fails forever and re-dispatches
+/// the implementer — which is how orchestrating a JS repo with goose's own Rust
+/// gates looped and pushed the implementer to fabricate a `Cargo.toml`.
+pub(super) fn partition_gates(impl_dir: &Path, gates: &[String]) -> GatePartition {
+    let mut partition = GatePartition::default();
+    for gate in gates {
+        let command = gate.trim();
+        if command.is_empty() {
+            continue;
+        }
+        match gate_skip_reason(impl_dir, command) {
+            Some(reason) => partition.skipped.push(GateSkip {
+                command: command.to_string(),
+                reason,
+            }),
+            None => partition.applicable.push(command.to_string()),
+        }
+    }
+    partition
+}
+
+/// Build tools that do nothing useful without their manifest in the repo root.
+fn required_manifest(program: &str) -> Option<&'static [&'static str]> {
+    match program {
+        "cargo" | "rustc" | "rustfmt" | "clippy-driver" => Some(&["Cargo.toml"]),
+        "pnpm" | "npm" | "yarn" | "npx" | "node" => Some(&["package.json"]),
+        "go" | "gofmt" => Some(&["go.mod"]),
+        _ => None,
+    }
+}
+
+fn program_on_path(program: &str) -> bool {
+    if program.contains('/') {
+        return Path::new(program).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+/// `Some(reason)` when a gate can't meaningfully run against `impl_dir`. Shell-form
+/// gates are always kept — they are user-authored and may guard/`cd` themselves.
+fn gate_skip_reason(impl_dir: &Path, command: &str) -> Option<String> {
+    if command_needs_shell(command) {
+        return None;
+    }
+    let program = command.split_whitespace().next()?;
+    if let Some(manifests) = required_manifest(program) {
+        let present = manifests.iter().any(|name| impl_dir.join(name).exists());
+        if !present {
+            return Some(format!("no {} in the target repo", manifests.join(" or ")));
+        }
+    }
+    if !program_on_path(program) {
+        return Some(format!("`{program}` is not installed"));
+    }
+    None
+}
+
 pub(super) fn run_gates(impl_dir: &Path, gates: &[String]) -> GateOutcome {
     for command in gates {
         if command.trim().is_empty() {
@@ -203,6 +277,73 @@ pub(super) fn record_gate_phase(
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    #[test]
+    fn partition_skips_build_tool_gates_without_manifests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gates = vec![
+            "cargo fmt --check".to_string(),
+            "cargo test -p goose-cli".to_string(),
+            "pnpm test".to_string(),
+            "go vet ./...".to_string(),
+        ];
+
+        let partition = super::partition_gates(temp.path(), &gates);
+
+        assert!(
+            partition.applicable.is_empty(),
+            "no manifest present, so no build-tool gate should run: {:?}",
+            partition.applicable
+        );
+        assert_eq!(partition.skipped.len(), 4);
+        assert!(partition
+            .skipped
+            .iter()
+            .any(|s| s.reason.contains("Cargo.toml")));
+        assert!(partition
+            .skipped
+            .iter()
+            .any(|s| s.reason.contains("package.json")));
+    }
+
+    #[test]
+    fn partition_keeps_cargo_gate_when_cargo_toml_present() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
+
+        let partition = super::partition_gates(temp.path(), &["cargo fmt --check".to_string()]);
+
+        // cargo is on PATH in the test env, and the manifest now exists.
+        assert_eq!(partition.applicable, vec!["cargo fmt --check".to_string()]);
+        assert!(partition.skipped.is_empty());
+    }
+
+    #[test]
+    fn partition_keeps_shell_form_gates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let partition = super::partition_gates(
+            temp.path(),
+            &["test -f package.json && pnpm test".to_string()],
+        );
+
+        assert_eq!(partition.applicable.len(), 1);
+        assert!(partition.skipped.is_empty());
+    }
+
+    #[test]
+    fn partition_skips_uninstalled_tool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let partition = super::partition_gates(
+            temp.path(),
+            &["goose-nonexistent-gate-tool-xyz --check".to_string()],
+        );
+
+        assert!(partition.applicable.is_empty());
+        assert_eq!(partition.skipped.len(), 1);
+        assert!(partition.skipped[0].reason.contains("not installed"));
+    }
 
     #[test]
     fn run_gates_passes_when_all_commands_succeed() {
