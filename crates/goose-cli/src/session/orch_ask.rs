@@ -562,33 +562,106 @@ fn render_tab_bar(state: &AskState) -> String {
     parts.join(" ")
 }
 
+const MIN_LEFT_COL_WIDTH: usize = 24;
+const MAX_LEFT_COL_WIDTH: usize = 72;
+const PREVIEW_CONTENT_WIDTH: usize = 42;
+
+/// Word-wrap `text` to `width` terminal columns, measuring display width so CJK
+/// characters (two columns each) and any embedded ANSI codes are accounted for.
+/// Words longer than `width` are hard-split rather than allowed to overflow.
+fn wrap_display(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for word in text.split_whitespace() {
+        let word_width = console::measure_text_width(word);
+        if word_width > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut chunk = String::new();
+            let mut chunk_width = 0;
+            for ch in word.chars() {
+                let ch_width = console::measure_text_width(&ch.to_string());
+                if chunk_width + ch_width > width && !chunk.is_empty() {
+                    lines.push(std::mem::take(&mut chunk));
+                    chunk_width = 0;
+                }
+                chunk.push(ch);
+                chunk_width += ch_width;
+            }
+            current = chunk;
+            current_width = chunk_width;
+            continue;
+        }
+        let separator = usize::from(!current.is_empty());
+        if current_width + separator + word_width > width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_width = word_width;
+        } else {
+            if separator == 1 {
+                current.push(' ');
+            }
+            current.push_str(word);
+            current_width += separator + word_width;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 fn render_question(term: &Term, state: &AskState) -> io::Result<()> {
     let question = &state.set.questions[state.current_tab()];
     term.write_line(&style(&question.question).bold().to_string())?;
     term.write_line("")?;
 
     let rows = state.rows_for(state.current_tab());
-    let left = question_lines(&rows, state.cursors[state.current_tab()]);
+    let cursor = state.cursors[state.current_tab()];
     let preview = state.current_row().and_then(|row| row.preview);
     let (_, cols) = term.size();
-    if cols >= 100 {
-        let preview_lines = preview
-            .as_deref()
-            .map(preview_box_lines)
-            .unwrap_or_default();
-        let max = left.len().max(preview_lines.len());
-        for index in 0..max {
-            let left_line = left.get(index).cloned().unwrap_or_default();
-            let preview_line = preview_lines.get(index).cloned().unwrap_or_default();
-            term.write_line(&format!("{left_line:<58} {preview_line}"))?;
+    let cols = cols as usize;
+
+    match preview {
+        Some(preview) if cols >= 100 => {
+            let preview_lines = preview_box_lines(&preview);
+            let preview_width = preview_lines
+                .iter()
+                .map(|line| console::measure_text_width(line))
+                .max()
+                .unwrap_or(0);
+            let left_width = cols
+                .saturating_sub(preview_width + 1)
+                .clamp(MIN_LEFT_COL_WIDTH, MAX_LEFT_COL_WIDTH);
+            let left = question_lines(&rows, cursor, Some(left_width));
+            let row_count = left.len().max(preview_lines.len());
+            for index in 0..row_count {
+                let left_line = left.get(index).cloned().unwrap_or_default();
+                let preview_line = preview_lines.get(index).map(String::as_str).unwrap_or("");
+                let padded =
+                    console::pad_str(&left_line, left_width, console::Alignment::Left, Some("…"));
+                term.write_line(&format!("{padded} {preview_line}"))?;
+            }
         }
-    } else {
-        for line in left {
-            term.write_line(&line)?;
-        }
-        if let Some(preview) = preview {
+        Some(preview) => {
+            for line in question_lines(&rows, cursor, None) {
+                term.write_line(&line)?;
+            }
             term.write_line("")?;
             for line in preview_box_lines(&preview) {
+                term.write_line(&line)?;
+            }
+        }
+        None => {
+            for line in question_lines(&rows, cursor, None) {
                 term.write_line(&line)?;
             }
         }
@@ -601,7 +674,7 @@ fn render_question(term: &Term, state: &AskState) -> io::Result<()> {
     Ok(())
 }
 
-fn question_lines(rows: &[AskRow], cursor: usize) -> Vec<String> {
+fn question_lines(rows: &[AskRow], cursor: usize, wrap_width: Option<usize>) -> Vec<String> {
     let mut lines = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         if index == 1 && rows.first().is_some_and(|row| row.recommended) {
@@ -614,13 +687,24 @@ fn question_lines(rows: &[AskRow], cursor: usize) -> Vec<String> {
             ""
         };
         let label = format!("{marker} {}. {}{}", index + 1, row.label, recommended);
+        let label = match wrap_width {
+            Some(width) => console::truncate_str(&label, width, "…").into_owned(),
+            None => label,
+        };
         if cursor == index {
             lines.push(style(label).reverse().to_string());
         } else {
             lines.push(label);
         }
         if let Some(description) = &row.description {
-            lines.push(format!("   {}", style(description).dim()));
+            match wrap_width {
+                Some(width) => {
+                    for wrapped in wrap_display(description, width.saturating_sub(3)) {
+                        lines.push(format!("   {}", style(wrapped).dim()));
+                    }
+                }
+                None => lines.push(format!("   {}", style(description).dim())),
+            }
         }
     }
     lines
@@ -629,19 +713,26 @@ fn question_lines(rows: &[AskRow], cursor: usize) -> Vec<String> {
 fn preview_box_lines(preview: &str) -> Vec<String> {
     let content: Vec<String> = preview
         .lines()
-        .map(|line| truncate_chars(line, 42))
+        .map(|line| console::truncate_str(line, PREVIEW_CONTENT_WIDTH, "…").into_owned())
         .collect();
     let width = content
         .iter()
-        .map(|line| line.chars().count())
+        .map(|line| console::measure_text_width(line))
         .max()
         .unwrap_or(7)
         .max(7);
+    let align = console::Alignment::Left;
     let mut lines = vec![format!("┌{}┐", "─".repeat(width + 2))];
-    lines.push(format!("│ {:width$} │", "Preview", width = width));
+    lines.push(format!(
+        "│ {} │",
+        console::pad_str("Preview", width, align, None)
+    ));
     lines.push(format!("├{}┤", "─".repeat(width + 2)));
-    for line in content {
-        lines.push(format!("│ {:width$} │", line, width = width));
+    for line in &content {
+        lines.push(format!(
+            "│ {} │",
+            console::pad_str(line, width, align, None)
+        ));
     }
     lines.push(format!("└{}┘", "─".repeat(width + 2)));
     lines
@@ -866,6 +957,106 @@ after
 
         assert!(matches!(state.cancel(), AskOutcome::Cancelled));
         assert!(matches!(state.submit(), AskOutcome::Submitted(answers) if answers.len() == 2));
+    }
+
+    fn option_rows(label: &str, description: &str, preview: Option<&str>) -> Vec<AskRow> {
+        vec![AskRow {
+            label: label.to_string(),
+            description: Some(description.to_string()),
+            recommended: true,
+            preview: preview.map(str::to_string),
+            kind: RowKind::Option(0),
+        }]
+    }
+
+    fn compose_two_pane(rows: &[AskRow], cursor: usize, preview: &str, cols: usize) -> Vec<String> {
+        let preview_lines = preview_box_lines(preview);
+        let preview_width = preview_lines
+            .iter()
+            .map(|line| console::measure_text_width(line))
+            .max()
+            .unwrap_or(0);
+        let left_width = cols
+            .saturating_sub(preview_width + 1)
+            .clamp(MIN_LEFT_COL_WIDTH, MAX_LEFT_COL_WIDTH);
+        let left = question_lines(rows, cursor, Some(left_width));
+        let row_count = left.len().max(preview_lines.len());
+        (0..row_count)
+            .map(|index| {
+                let left_line = left.get(index).cloned().unwrap_or_default();
+                let preview_line = preview_lines.get(index).map(String::as_str).unwrap_or("");
+                let padded =
+                    console::pad_str(&left_line, left_width, console::Alignment::Left, Some("…"));
+                format!("{padded} {preview_line}")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_pane_left_column_never_overflows() {
+        let rows = option_rows(
+            "세로 타임라인 (recommended)",
+            "세션마다 세로 척추(spine) 선을 긋고, 이벤트마다 종류별 색 점을 찍는 매우 긴 설명으로 오른쪽 프리뷰 영역을 절대 침범하면 안 됩니다.",
+            Some("어떤 공고를 찾으세요?\n● 업력 3년 – 조건 충족"),
+        );
+        for cols in [100usize, 120, 180, 230] {
+            let preview = rows[0].preview.as_deref().unwrap();
+            let preview_width = preview_box_lines(preview)
+                .iter()
+                .map(|line| console::measure_text_width(line))
+                .max()
+                .unwrap_or(0);
+            for line in compose_two_pane(&rows, 0, preview, cols) {
+                assert!(
+                    console::measure_text_width(&line) <= cols,
+                    "composed line exceeds terminal cols {cols}: measured {}",
+                    console::measure_text_width(&line)
+                );
+                assert!(
+                    console::measure_text_width(&line) >= preview_width,
+                    "preview column dropped at cols {cols}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn question_lines_stay_within_wrap_width() {
+        let rows = option_rows(
+            "세로 타임라인으로 각 유저 여정을 촘촘하게 다시 그리는 아주 긴 옵션 라벨",
+            "세션마다 세로 척추 선을 긋고 이벤트마다 종류별 색 점을 찍어 왼쪽에 시각 오른쪽에 요약을 배치하는 방식입니다",
+            None,
+        );
+        let width = 40;
+        for line in question_lines(&rows, 0, Some(width)) {
+            assert!(
+                console::measure_text_width(&line) <= width,
+                "line exceeds wrap width {width}: {line:?} (measured {})",
+                console::measure_text_width(&line)
+            );
+        }
+    }
+
+    #[test]
+    fn preview_box_is_rectangular_for_cjk_content() {
+        let widths: Vec<usize> =
+            preview_box_lines("어떤 공고를 찾으세요?\npage click conv\n입력 3년 조건 충족")
+                .iter()
+                .map(|line| console::measure_text_width(line))
+                .collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "preview box borders misaligned for CJK content: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_display_hard_splits_overlong_word() {
+        let out = wrap_display("aaaaaaaaaaaaaaaaaaaa", 5);
+        assert!(out
+            .iter()
+            .all(|line| console::measure_text_width(line) <= 5));
+        assert_eq!(out.concat(), "aaaaaaaaaaaaaaaaaaaa");
     }
 
     #[test]
