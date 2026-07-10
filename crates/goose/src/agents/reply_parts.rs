@@ -9,8 +9,6 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use super::super::agents::Agent;
-#[cfg(feature = "code-mode")]
-use crate::agents::platform_extensions::code_execution;
 use crate::config::Config;
 use crate::conversation::message::{Message, MessageContent, ToolRequest};
 use crate::conversation::Conversation;
@@ -151,61 +149,6 @@ impl Agent {
     ) -> Result<(Vec<Tool>, Vec<Tool>, String, ModelConfig)> {
         let mut tools = self.list_tools(session_id, None).await;
 
-        #[cfg(feature = "code-mode")]
-        let code_execution_active = self
-            .extension_manager
-            .is_extension_enabled(code_execution::EXTENSION_NAME)
-            .await;
-        #[cfg(not(feature = "code-mode"))]
-        let code_execution_active = false;
-        #[cfg(feature = "code-mode")]
-        if code_execution_active {
-            let disclosure_style =
-                crate::agents::platform_extensions::code_execution::get_tool_disclosure();
-
-            tools = tools
-                .into_iter()
-                .filter_map(|mut t| match disclosure_style {
-                    pctx_code_mode::config::ToolDisclosure::Catalog
-                    | pctx_code_mode::config::ToolDisclosure::Filesystem => {
-                        // in catalog & filesystem styles, progressive search is handled
-                        // by pctx, so we want to omit all non-first-class extensions
-                        // from the standard tool list
-                        if crate::agents::extension_manager::get_tool_owner(&t).is_some_and(|o| {
-                            crate::agents::extension_manager::is_first_class_extension(&o)
-                        }) {
-                            Some(t)
-                        } else {
-                            None
-                        }
-                    }
-                    pctx_code_mode::config::ToolDisclosure::Sidecar => {
-                        // in sidecar style there is no progressive search, just a way to chain tools
-                        // together with typescript
-                        // add output schema to description since many model providers drop the
-                        // output schema when presenting tools to the model
-                        let output_schema = t
-                            .output_schema
-                            .as_ref()
-                            .map(|s| serde_json::json!(s).to_string())
-                            .unwrap_or("unknown".to_string());
-                        let description_extension = format!(
-                            "The successful return schema of this tool is:\n{output_schema}"
-                        );
-
-                        t.description = Some(
-                            t.description
-                                .map(|t| format!("{t}\n{description_extension}"))
-                                .unwrap_or(description_extension)
-                                .into(),
-                        );
-
-                        Some(t)
-                    }
-                })
-                .collect();
-        }
-
         // Filter out tools not visible to the model per MCP Apps visibility spec.
         // Tools with `_meta.ui.visibility` that doesn't include "model" are app-only.
         tools.retain(is_tool_visible_to_model);
@@ -230,7 +173,6 @@ impl Agent {
             .with_extensions(extensions_info.into_iter())
             .with_frontend_instructions(self.frontend_instructions.lock().await.clone())
             .with_extension_and_tool_counts(extension_count, tool_count)
-            .with_code_execution_mode(code_execution_active)
             .with_hints(working_dir)
             .with_goose_mode(goose_mode)
             .build();

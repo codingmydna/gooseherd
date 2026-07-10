@@ -20,12 +20,12 @@ install: release
 
 # run the test suite
 test:
-    cargo test
+    cargo test --workspace
 
 # check formatting and lint (matches CI)
 lint:
     cargo fmt --check
-    cargo clippy --workspace --all-targets --exclude v8 -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # format the code
 fmt:

@@ -56,13 +56,6 @@ static PROVIDER_CONFIGS: LazyLock<Vec<ProviderConfig>> = LazyLock::new(|| {
             env_modifications: None,
             skip_reason: None,
         },
-        ProviderConfig {
-            name: "aws_bedrock",
-            model_name: "anthropic.claude-sonnet-4-20250514:0",
-            required_env_vars: &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
-            env_modifications: None,
-            skip_reason: Some("No valid keys around"),
-        },
         ProviderConfig::simple("google", "gemini-2.5-flash"),
         ProviderConfig::simple("groq", "llama-3.3-70b-versatile"),
         ProviderConfig::simple_skip(
@@ -89,11 +82,6 @@ static PROVIDER_CONFIGS: LazyLock<Vec<ProviderConfig>> = LazyLock::new(|| {
         ProviderConfig::simple_skip("gemini-cli", "gemini-2.5-flash", Some("No keys available")),
         ProviderConfig::simple_skip("litellm", "gpt-4o", Some("No keys available")),
         ProviderConfig::simple_skip("ollama", "qwen3", Some("Ollama not supported")),
-        ProviderConfig::simple_skip(
-            "sagemaker_tgi",
-            "meta-llama/Llama-2-7b-chat-hf",
-            Some("No keys available"),
-        ),
         ProviderConfig::simple_skip("snowflake", "claude-3-7-sonnet", Some("No keys available")),
         ProviderConfig::simple_skip("venice", "llama-3.3-70b", Some("No keys available")),
         ProviderConfig::simple_skip("xai", "grok-3", Some("No keys available")),

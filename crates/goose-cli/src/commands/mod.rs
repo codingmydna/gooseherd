@@ -9,8 +9,4 @@ pub mod review;
 pub mod session;
 pub mod skills;
 pub mod term;
-#[cfg(feature = "tui")]
-pub mod tui;
-#[cfg(feature = "update")]
-pub mod update;
 pub mod worktree;

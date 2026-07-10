@@ -11,8 +11,6 @@ pub mod avian;
 pub mod azure;
 pub mod azureauth;
 pub mod base;
-#[cfg(feature = "aws-providers")]
-pub mod bedrock;
 pub mod canonical {
     pub use goose_providers::canonical::*;
 }
@@ -48,8 +46,6 @@ mod init;
 pub mod inventory;
 pub mod kimicode;
 pub mod litellm;
-#[cfg(feature = "local-inference")]
-pub mod local_inference;
 pub mod nanogpt;
 pub mod oauth;
 pub mod oauth_device_flow;
@@ -72,8 +68,6 @@ mod retry {
     pub use goose_providers::retry::*;
 }
 pub mod openai_def;
-#[cfg(feature = "aws-providers")]
-pub mod sagemaker_tgi;
 pub mod snowflake;
 pub mod testprovider;
 pub mod tetrate;

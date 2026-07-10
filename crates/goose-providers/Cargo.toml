@@ -13,10 +13,6 @@ workspace = true
 
 [features]
 default = []
-local-inference = ["dep:goose-local-inference"]
-cuda = ["local-inference", "goose-local-inference/cuda"]
-vulkan = ["local-inference", "goose-local-inference/vulkan"]
-mlx = ["local-inference", "goose-local-inference/mlx"]
 rustls-tls = [
     "reqwest/rustls",
     "rmcp/reqwest",
@@ -36,7 +32,6 @@ async-stream = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 goose-provider-types = { path = "../goose-provider-types", default-features = false }
-goose-local-inference = { path = "../goose-local-inference", default-features = false, optional = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true, features = ["server", "macros"] }
 serde = { workspace = true }

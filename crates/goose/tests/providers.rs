@@ -10,16 +10,12 @@ use goose::permission::{Permission, PermissionConfirmation};
 use goose::providers::anthropic::ANTHROPIC_DEFAULT_MODEL;
 use goose::providers::azure::AZURE_DEFAULT_MODEL;
 use goose::providers::base::Provider;
-#[cfg(feature = "aws-providers")]
-use goose::providers::bedrock::BEDROCK_DEFAULT_MODEL;
 use goose::providers::claude_code::CLAUDE_CODE_DEFAULT_MODEL;
 use goose::providers::codex::CODEX_DEFAULT_MODEL;
 use goose::providers::create_with_named_model;
 use goose::providers::google::GOOGLE_DEFAULT_MODEL;
 use goose::providers::litellm::LITELLM_DEFAULT_MODEL;
 use goose::providers::openai::OPEN_AI_DEFAULT_MODEL;
-#[cfg(feature = "aws-providers")]
-use goose::providers::sagemaker_tgi::SAGEMAKER_TGI_DEFAULT_MODEL;
 use goose::providers::snowflake::SNOWFLAKE_DEFAULT_MODEL;
 use goose::providers::xai::XAI_DEFAULT_MODEL;
 use goose::session::{SessionManager, SessionType};
@@ -747,40 +743,6 @@ async fn test_azure_provider() -> Result<()> {
     .await
 }
 
-#[cfg(feature = "aws-providers")]
-#[tokio::test]
-async fn test_bedrock_provider_long_term_credentials() -> Result<()> {
-    ProviderTestConfig::with_llm_provider(
-        "aws_bedrock",
-        BEDROCK_DEFAULT_MODEL,
-        &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
-    )
-    .run()
-    .await
-}
-
-#[cfg(feature = "aws-providers")]
-#[tokio::test]
-async fn test_bedrock_provider_aws_profile_credentials() -> Result<()> {
-    ProviderTestConfig::with_llm_provider("aws_bedrock", BEDROCK_DEFAULT_MODEL, &["AWS_PROFILE"])
-        .clear_env(&["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"])
-        .run()
-        .await
-}
-
-#[cfg(feature = "aws-providers")]
-#[tokio::test]
-async fn test_bedrock_provider_bearer_token() -> Result<()> {
-    ProviderTestConfig::with_llm_provider(
-        "aws_bedrock",
-        BEDROCK_DEFAULT_MODEL,
-        &["AWS_BEARER_TOKEN_BEDROCK", "AWS_REGION"],
-    )
-    .clear_env(&["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"])
-    .run()
-    .await
-}
-
 #[tokio::test]
 async fn test_databricks_provider() -> Result<()> {
     ProviderTestConfig::with_llm_provider(
@@ -841,18 +803,6 @@ async fn test_snowflake_provider() -> Result<()> {
         "Snowflake",
         SNOWFLAKE_DEFAULT_MODEL,
         &["SNOWFLAKE_HOST", "SNOWFLAKE_TOKEN"],
-    )
-    .run()
-    .await
-}
-
-#[cfg(feature = "aws-providers")]
-#[tokio::test]
-async fn test_sagemaker_tgi_provider() -> Result<()> {
-    ProviderTestConfig::with_llm_provider(
-        "SageMakerTgi",
-        SAGEMAKER_TGI_DEFAULT_MODEL,
-        &["SAGEMAKER_ENDPOINT_NAME"],
     )
     .run()
     .await

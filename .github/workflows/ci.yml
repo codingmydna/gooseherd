@@ -37,8 +37,7 @@ jobs:
           sudo apt-get install -y libdbus-1-dev libxcb1-dev
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
       - name: Clippy
-        # v8 is a vendored, build-only crate; excluded until vendor/v8 is removed.
-        run: cargo clippy --workspace --all-targets --exclude v8 -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Build and Test (${{ matrix.os }})
@@ -64,5 +63,5 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then
             gnome-keyring-daemon --components=secrets --daemonize --unlock <<< 'foobar'
           fi
-          cargo test -- --skip scenario_tests::scenarios::tests
-          cargo test --jobs 1 scenario_tests::scenarios::tests
+          cargo test --workspace -- --skip scenario_tests::scenarios::tests
+          cargo test --workspace --jobs 1 scenario_tests::scenarios::tests

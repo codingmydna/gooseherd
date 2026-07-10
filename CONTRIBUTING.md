@@ -13,7 +13,7 @@ cargo build                                                        # or: just bu
 cargo build --release -p goose-cli                                 # or: just release
 cargo test                                                         # or: just test
 cargo fmt                                                          # or: just fmt
-cargo clippy --workspace --all-targets --exclude v8 -- -D warnings # or: just lint
+cargo clippy --workspace --all-targets -- -D warnings # or: just lint
 ```
 
 `just install` builds the release binary and copies it to `~/.local/bin/goose`.

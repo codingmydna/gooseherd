@@ -4,14 +4,10 @@ use clap_complete::{generate, Shell as ClapShell};
 use clap_complete_nushell::Nushell as ClapNushell;
 use goose::builtin_extension::register_builtin_extensions;
 use goose::config::{Config, GooseMode};
-#[cfg(feature = "telemetry")]
-use goose::posthog::get_telemetry_choice;
 use goose::recipe::Recipe;
 use goose_mcp::mcp_server_runner::{serve, McpCommand};
 use goose_mcp::{AutoVisualiserRouter, ComputerControllerServer, MemoryServer, TutorialServer};
 
-#[cfg(feature = "telemetry")]
-use crate::commands::configure::configure_telemetry_consent_dialog;
 use crate::commands::configure::handle_configure;
 use crate::commands::info::handle_info;
 use crate::commands::plugin::{handle_plugin_install, handle_plugin_update};
@@ -876,24 +872,6 @@ enum Command {
         command: PluginCommand,
     },
 
-    /// Update the goose CLI version
-    #[cfg(feature = "update")]
-    #[command(about = "Update the goose CLI version")]
-    Update {
-        /// Update to canary version
-        #[arg(
-            short,
-            long,
-            help = "Update to canary version",
-            long_help = "Update to the latest canary version of the goose CLI, otherwise updates to the latest stable version."
-        )]
-        canary: bool,
-
-        /// Enforce to re-configure goose during update
-        #[arg(short, long, help = "Enforce to re-configure goose during update")]
-        reconfigure: bool,
-    },
-
     /// Terminal-integrated session (one session per terminal)
     #[command(
         about = "Terminal-integrated goose session",
@@ -910,35 +888,6 @@ enum Command {
     Term {
         #[command(subcommand)]
         command: TermCommand,
-    },
-
-    /// Launch the goose terminal UI (TUI)
-    #[cfg(feature = "tui")]
-    #[command(
-        about = "Launch the goose terminal UI",
-        long_about = "Launch the goose terminal UI (the @aaif/goose npm package).\n\
-                      \n\
-                      Resolution order:\n  \
-                      1. GOOSE_TUI_SCRIPT, if set to an existing dist/tui.js\n  \
-                      2. A local checkout's ui/text/dist/tui.js (dev workflow)\n  \
-                      3. `npx --yes --package <spec> -- goose-tui` (deployed installs)\n\
-                      \n\
-                      Override the npm spec via GOOSE_TUI_NPM_SPEC (default: @aaif/goose@latest).\n\
-                      Local script mode requires `node` on PATH; npx mode requires `npx` on PATH.\n\
-                      Any extra arguments are passed through to the TUI."
-    )]
-    Tui {
-        /// Arguments forwarded to the TUI
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Manage local inference models
-    #[cfg(feature = "local-inference")]
-    #[command(about = "Manage local inference models", visible_alias = "lm")]
-    LocalModels {
-        #[command(subcommand)]
-        command: LocalModelsCommand,
     },
 
     /// Generate completions for various shells
@@ -1062,39 +1011,6 @@ enum Command {
     },
 }
 
-#[cfg(feature = "local-inference")]
-#[derive(Subcommand)]
-enum LocalModelsCommand {
-    /// Search HuggingFace for local models
-    #[command(about = "Search HuggingFace for local GGUF and MLX models")]
-    Search {
-        /// Search query
-        query: String,
-
-        /// Maximum number of results
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-    },
-
-    /// Download a model from HuggingFace
-    #[command(about = "Download a local model from a search result")]
-    Download {
-        /// Model spec/download id, e.g. user/repo:Q4_K_M or user/repo
-        spec: String,
-    },
-
-    /// List downloaded local models
-    #[command(about = "List downloaded local models")]
-    List,
-
-    /// Delete a downloaded model
-    #[command(about = "Delete a downloaded local model")]
-    Delete {
-        /// Model ID to delete
-        id: String,
-    },
-}
-
 #[derive(Subcommand)]
 enum TermCommand {
     /// Print shell initialization script
@@ -1214,16 +1130,10 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Loop { .. }) => "loop",
         Some(Command::Goal { .. }) => "goal",
         Some(Command::Orch { .. }) => "orch",
-        #[cfg(feature = "update")]
-        Some(Command::Update { .. }) => "update",
         Some(Command::Recipe { .. }) => "recipe",
         Some(Command::Skills { .. }) => "skills",
         Some(Command::Plugin { .. }) => "plugin",
         Some(Command::Term { .. }) => "term",
-        #[cfg(feature = "tui")]
-        Some(Command::Tui { .. }) => "tui",
-        #[cfg(feature = "local-inference")]
-        Some(Command::LocalModels { .. }) => "local-models",
         Some(Command::Completion { .. }) => "completion",
         Some(Command::Review { .. }) => "review",
         Some(Command::ValidateExtensions { .. }) => "validate-extensions",
@@ -1320,11 +1230,6 @@ async fn handle_interactive_session(
     session_opts: SessionOptions,
     extension_opts: ExtensionOptions,
 ) -> Result<()> {
-    #[cfg(feature = "telemetry")]
-    if get_telemetry_choice().is_none() {
-        configure_telemetry_consent_dialog()?;
-    }
-
     let session_start = std::time::Instant::now();
     let session_type = if fork {
         "forked"
@@ -1565,11 +1470,6 @@ async fn handle_run_command(
     output_opts: OutputOptions,
     model_opts: ModelOptions,
 ) -> Result<()> {
-    #[cfg(feature = "telemetry")]
-    if run_behavior.interactive && get_telemetry_choice().is_none() {
-        configure_telemetry_consent_dialog()?;
-    }
-
     let parsed = parse_run_input(&input_opts, output_opts.quiet)?;
 
     let Some((input_config, recipe)) = parsed else {
@@ -1832,162 +1732,9 @@ async fn handle_term_subcommand(command: TermCommand) -> Result<()> {
     }
 }
 
-#[cfg(feature = "local-inference")]
-fn print_download_progress(manager: &goose::download_manager::DownloadManager) {
-    let Some(progress) = manager
-        .list_progress()
-        .into_iter()
-        .find(|progress| progress.status == goose::download_manager::DownloadStatus::Downloading)
-    else {
-        return;
-    };
-
-    print!(
-        "\r  {:.1}% ({:.0}MB / {:.0}MB)",
-        progress.progress_percent,
-        progress.bytes_downloaded as f64 / (1024.0 * 1024.0),
-        progress.total_bytes as f64 / (1024.0 * 1024.0),
-    );
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-}
-
-#[cfg(feature = "local-inference")]
-async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> {
-    use goose::providers::local_inference::hf_models;
-    use goose::providers::local_inference::local_model_registry::get_registry;
-
-    goose::providers::local_inference::configure_huggingface_auth();
-
-    match command {
-        LocalModelsCommand::Search { query, limit } => {
-            println!("Searching HuggingFace for '{}'...", query);
-            let results = hf_models::search_local_models(&query, limit).await?;
-
-            if results.is_empty() {
-                println!("No compatible local models found.");
-                return Ok(());
-            }
-
-            for model in &results {
-                println!(
-                    "\n{} (by {}) — {} downloads",
-                    model.model_name, model.author, model.downloads
-                );
-                for variant in &model.variants {
-                    let size = if variant.size_bytes > 0 {
-                        format!(
-                            "{:.1}GB",
-                            variant.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                        )
-                    } else {
-                        "unknown".to_string()
-                    };
-                    let support = if variant.supported {
-                        String::new()
-                    } else {
-                        format!(
-                            " ({})",
-                            variant
-                                .unsupported_reason
-                                .as_deref()
-                                .unwrap_or("unsupported on this platform")
-                        )
-                    };
-                    println!(
-                        "  [{}] {} — {} — {}{}",
-                        variant.format, variant.label, size, variant.description, support
-                    );
-                    if variant.supported {
-                        println!(
-                            "    Download: goose local-models download '{}'",
-                            variant.download_id
-                        );
-                    }
-                }
-            }
-        }
-        LocalModelsCommand::Download { spec } => {
-            println!("Resolving {}...", spec);
-            let manager = goose::download_manager::get_download_manager();
-            let resolve_task = hf_models::resolve_local_model_spec(&spec);
-            tokio::pin!(resolve_task);
-            let resolved = loop {
-                tokio::select! {
-                    result = &mut resolve_task => break result?,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                        print_download_progress(manager);
-                    }
-                }
-            };
-            let model_id = resolved.model_id();
-            let total_size = resolved.total_size();
-
-            println!(
-                "\nDownloaded {} ({}). Registering...",
-                model_id,
-                if total_size > 0 {
-                    format!("{:.1}GB", total_size as f64 / (1024.0 * 1024.0 * 1024.0))
-                } else {
-                    "unknown size".to_string()
-                }
-            );
-
-            let model_id = hf_models::register_resolved_model(resolved, &spec)?;
-
-            println!("Registered: {}", model_id);
-        }
-        LocalModelsCommand::List => {
-            let registry = get_registry()
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Failed to acquire registry lock"))?;
-            let models = registry.list_models();
-
-            if models.is_empty() {
-                println!("No local models downloaded.");
-                return Ok(());
-            }
-
-            println!(
-                "{:<50} {:<10} {:<12} Downloaded",
-                "ID", "Backend", "Variant"
-            );
-            println!("{}", "-".repeat(88));
-            for m in models {
-                println!(
-                    "{:<50} {:<10} {:<12} {}",
-                    m.id,
-                    m.backend_id.as_deref().unwrap_or("llamacpp"),
-                    m.quantization,
-                    if m.is_downloaded() { "✓" } else { "✗" }
-                );
-            }
-        }
-        LocalModelsCommand::Delete { id } => {
-            let mut registry = get_registry()
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Failed to acquire registry lock"))?;
-
-            if registry.get_model(&id).is_some() {
-                registry.delete_model(&id)?;
-                println!("Deleted model: {}", id);
-            } else {
-                println!("Model not found: {}", id);
-            }
-        }
-    }
-
-    Ok(())
-}
-
 async fn handle_default_session() -> Result<()> {
     if !Config::global().exists() {
         return handle_configure().await;
-    }
-
-    #[cfg(feature = "telemetry")]
-    if get_telemetry_choice().is_none() {
-        configure_telemetry_consent_dialog()?;
     }
 
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
@@ -2133,22 +1880,10 @@ pub async fn cli() -> anyhow::Result<()> {
             max_cycles,
             merge,
         }) => handle_orch_command(text, max_cycles, merge).await,
-        #[cfg(feature = "update")]
-        Some(Command::Update {
-            canary,
-            reconfigure,
-        }) => {
-            crate::commands::update::update(canary, reconfigure).await?;
-            Ok(())
-        }
         Some(Command::Recipe { command }) => handle_recipe_subcommand(command),
         Some(Command::Skills { command }) => handle_skills_subcommand(command).await,
         Some(Command::Plugin { command }) => handle_plugin_subcommand(command),
         Some(Command::Term { command }) => handle_term_subcommand(command).await,
-        #[cfg(feature = "tui")]
-        Some(Command::Tui { args }) => crate::commands::tui::handle_tui(args),
-        #[cfg(feature = "local-inference")]
-        Some(Command::LocalModels { command }) => handle_local_models_command(command).await,
         Some(Command::Review {
             range,
             prompt,
@@ -2413,18 +2148,6 @@ mod tests {
                 assert_eq!(severity, "low");
             }
             _ => panic!("expected review command"),
-        }
-    }
-
-    #[cfg(feature = "tui")]
-    #[test]
-    fn tui_command_accepts_trailing_args() {
-        let cli =
-            Cli::try_parse_from(["goose", "tui", "--", "--theme", "dark"]).expect("parse failed");
-
-        match cli.command {
-            Some(Command::Tui { args }) => assert_eq!(args, vec!["--theme", "dark"]),
-            _ => panic!("expected tui command"),
         }
     }
 }
