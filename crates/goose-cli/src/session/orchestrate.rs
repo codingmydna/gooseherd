@@ -5,12 +5,14 @@ mod gates;
 mod limits;
 mod phases;
 mod planner;
+mod repo_pack;
 mod roles;
 mod runner;
 mod workspace;
 
 pub(crate) use gates::{gate_banner_line, resolve_gates, GateSource};
 pub(super) use roles::{build_role_provider, resolve_all_roles, RoleConfig};
+pub(super) use workspace::git_evidence;
 
 const MAX_CYCLES_KEY: &str = "GOOSE_ORCH_MAX_CYCLES";
 const GATES_KEY: &str = "GOOSE_ORCH_GATES";

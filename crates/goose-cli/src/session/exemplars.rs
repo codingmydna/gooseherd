@@ -1,9 +1,15 @@
+use goose::config::Config;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const INDEX_FILE: &str = "exemplars.jsonl";
+
+/// Config key holding the comma-separated substrings that mark a serving model
+/// as frontier (uplift injection is redundant and auto-skipped for these).
+const FRONTIER_PATTERNS_KEY: &str = "GOOSE_UPLIFT_FRONTIER_PATTERNS";
+const DEFAULT_FRONTIER_PATTERN: &str = "fable";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InjectionMode {
@@ -59,17 +65,66 @@ pub(super) fn is_generic_model(model: &str) -> bool {
     model.is_empty() || model == "default" || model == "current" || model == "unknown"
 }
 
-pub(super) fn is_fable_model(provider_name: &str, model: &str) -> bool {
-    let provider_name = provider_name.trim().to_ascii_lowercase();
-    model.to_ascii_lowercase().contains("fable")
-        || (provider_name == "claude-acp" && is_generic_model(model))
+/// Why a serving model is treated as frontier — i.e. why uplift injection is
+/// auto-skipped for it. Carried so callers can print an honest skip reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum FrontierMatch {
+    /// The model string contains this configured frontier substring.
+    Pattern(String),
+    /// A `claude-acp` role with an unset/default model alias, which usually
+    /// fronts the user's own frontier model.
+    ClaudeAcpDefault,
+}
+
+/// Parse the comma-separated `GOOSE_UPLIFT_FRONTIER_PATTERNS` value into trimmed,
+/// non-empty, lowercased substrings. Empty input yields no patterns.
+pub(super) fn parse_frontier_patterns(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|pattern| pattern.trim().to_ascii_lowercase())
+        .filter(|pattern| !pattern.is_empty())
+        .collect()
+}
+
+/// The configured frontier patterns, defaulting to `["fable"]` when the knob is
+/// unset or resolves to an empty list.
+pub(super) fn frontier_patterns() -> Vec<String> {
+    Config::global()
+        .get_param::<String>(FRONTIER_PATTERNS_KEY)
+        .ok()
+        .map(|raw| parse_frontier_patterns(&raw))
+        .filter(|patterns| !patterns.is_empty())
+        .unwrap_or_else(|| vec![DEFAULT_FRONTIER_PATTERN.to_string()])
+}
+
+/// Decide whether a serving model is frontier given an explicit pattern list.
+/// Pure and unit-testable; callers pass [`frontier_patterns`].
+pub(super) fn frontier_match(
+    provider_name: &str,
+    model: &str,
+    patterns: &[String],
+) -> Option<FrontierMatch> {
+    let model_lower = model.to_ascii_lowercase();
+    if let Some(pattern) = patterns
+        .iter()
+        .find(|pattern| !pattern.is_empty() && model_lower.contains(pattern.as_str()))
+    {
+        return Some(FrontierMatch::Pattern(pattern.clone()));
+    }
+    if provider_name.trim().eq_ignore_ascii_case("claude-acp") && is_generic_model(model) {
+        return Some(FrontierMatch::ClaudeAcpDefault);
+    }
+    None
+}
+
+pub(super) fn is_frontier_model(provider_name: &str, model: &str, patterns: &[String]) -> bool {
+    frontier_match(provider_name, model, patterns).is_some()
 }
 
 pub(super) fn should_inject(provider_name: &str, model: &str, mode: InjectionMode) -> bool {
     match mode {
         InjectionMode::Always => true,
         InjectionMode::Never => false,
-        InjectionMode::Auto => !is_fable_model(provider_name, model),
+        InjectionMode::Auto => !is_frontier_model(provider_name, model, &frontier_patterns()),
     }
 }
 
@@ -295,36 +350,56 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fable_model_identity_uses_model_not_transport() {
-        assert!(!is_fable_model("claude-acp", "opus"));
-        assert!(is_fable_model("claude-acp", "default"));
-        assert!(is_fable_model("claude-acp", "claude-fable-5"));
-        assert!(!is_fable_model("codex-acp", "default"));
-        assert!(!is_fable_model("anthropic", "claude-opus"));
-        assert!(is_fable_model("anthropic", "claude-fable-5"));
-        assert!(!is_fable_model("openai", "gpt-5.5"));
+    fn default_patterns() -> Vec<String> {
+        vec![DEFAULT_FRONTIER_PATTERN.to_string()]
     }
 
     #[test]
-    fn should_inject_auto_skips_only_fable_models() {
-        assert!(should_inject("claude-acp", "opus", InjectionMode::Auto));
-        assert!(!should_inject("claude-acp", "default", InjectionMode::Auto));
-        assert!(!should_inject(
+    fn frontier_identity_uses_model_not_transport() {
+        let patterns = default_patterns();
+        assert!(!is_frontier_model("claude-acp", "opus", &patterns));
+        assert!(is_frontier_model("claude-acp", "default", &patterns));
+        assert!(is_frontier_model("claude-acp", "claude-fable-5", &patterns));
+        assert!(!is_frontier_model("codex-acp", "default", &patterns));
+        assert!(!is_frontier_model("anthropic", "claude-opus", &patterns));
+        assert!(is_frontier_model("anthropic", "claude-fable-5", &patterns));
+        assert!(!is_frontier_model("openai", "gpt-5.5", &patterns));
+    }
+
+    #[test]
+    fn frontier_match_reports_matched_pattern_and_alias_reason() {
+        let patterns = default_patterns();
+        assert_eq!(
+            frontier_match("anthropic", "claude-fable-5", &patterns),
+            Some(FrontierMatch::Pattern("fable".to_string()))
+        );
+        assert_eq!(
+            frontier_match("claude-acp", "default", &patterns),
+            Some(FrontierMatch::ClaudeAcpDefault)
+        );
+        assert_eq!(frontier_match("openai", "gpt-5.5", &patterns), None);
+    }
+
+    #[test]
+    fn frontier_patterns_are_configurable() {
+        // A claude-acp opus user is NOT frontier under the default "fable"
+        // pattern (so it receives uplift), but becomes frontier once "opus" is
+        // added to the pattern list.
+        assert!(!is_frontier_model(
             "claude-acp",
-            "claude-fable-5",
-            InjectionMode::Auto
+            "opus",
+            &parse_frontier_patterns("fable")
         ));
-        assert!(should_inject(
-            "anthropic",
-            "claude-opus",
-            InjectionMode::Auto
+        assert!(is_frontier_model(
+            "claude-acp",
+            "opus",
+            &parse_frontier_patterns("fable, opus")
         ));
-        assert!(!should_inject(
-            "anthropic",
-            "claude-fable-5",
-            InjectionMode::Auto
-        ));
+        assert!(parse_frontier_patterns("  ,  ").is_empty());
+        assert_eq!(
+            parse_frontier_patterns("Fable, GPT-5"),
+            vec!["fable".to_string(), "gpt-5".to_string()]
+        );
     }
 
     #[test]

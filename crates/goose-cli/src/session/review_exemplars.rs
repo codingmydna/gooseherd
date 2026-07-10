@@ -14,6 +14,16 @@ const DEFAULT_K: usize = 1;
 const DEFAULT_CHAR_LIMIT: usize = 8_000;
 const REVIEW_LABELS: &[&str] = &["APPROVED", "REVISE"];
 
+/// Knob controlling the implementer's "known failure modes" injection, distilled
+/// from past REVISE reviews of similar tasks.
+const FAILURE_MODES_KEY: &str = "GOOSE_IMPL_FAILURE_MODES";
+const FAILURE_MODES_LABELS: &[&str] = &["REVISE"];
+const FAILURE_MODES_K: usize = 2;
+/// Total budget for the distilled failure-modes block, kept tail-preserving so
+/// the earliest (most prominent) defects and the closing ones both survive.
+const FAILURE_MODES_HEAD: usize = 1_000;
+const FAILURE_MODES_TAIL: usize = 500;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct ReviewExemplarIndexRecord {
     pub(super) run_id: String,
@@ -85,8 +95,41 @@ pub(super) fn build_injection(
     )
 }
 
+/// Build the implementer-facing "known failure modes" injection: the distilled
+/// defect lines from up to [`FAILURE_MODES_K`] REVISE reviews of tasks similar to
+/// the current one. Gated exactly like the other uplift injections (frontier
+/// serving models skip it in auto mode); honours `GOOSE_IMPL_FAILURE_MODES`.
+pub(super) fn build_failure_modes_injection(
+    task: &str,
+    implementer_provider: &str,
+    implementer_model: &str,
+    current_run_id: Option<&str>,
+) -> ReviewExemplarInjection {
+    if !exemplars_enabled() {
+        return ReviewExemplarInjection::default();
+    }
+
+    build_failure_modes_from_state_dir(
+        &Paths::state_dir(),
+        task,
+        ReviewerServingModel {
+            provider_name: implementer_provider,
+            model: implementer_model,
+        },
+        failure_modes_mode(),
+        current_run_id,
+    )
+}
+
 pub(super) fn archive_review(request: &ArchiveReviewRequest<'_>) -> bool {
     archive_review_in_state_dir(&Paths::state_dir(), exemplars_enabled(), request)
+}
+
+fn failure_modes_mode() -> InjectionMode {
+    let raw = Config::global()
+        .get_param::<String>(FAILURE_MODES_KEY)
+        .unwrap_or_else(|_| "auto".to_string());
+    exemplars::parse_injection_mode(&raw)
 }
 
 fn exemplars_enabled() -> bool {
@@ -206,6 +249,80 @@ fn build_injection_from_state_dir(
         selected_run_ids,
         prompt_section: Some(examples.trim_end().to_string()),
     }
+}
+
+fn build_failure_modes_from_state_dir(
+    state_dir: &Path,
+    task: &str,
+    implementer: ReviewerServingModel<'_>,
+    mode: InjectionMode,
+    current_run_id: Option<&str>,
+) -> ReviewExemplarInjection {
+    if !exemplars::should_inject(implementer.provider_name, implementer.model, mode) {
+        return ReviewExemplarInjection::default();
+    }
+
+    let Some(mut records) = read_index_from_state_dir(state_dir) else {
+        return ReviewExemplarInjection::default();
+    };
+    if let Some(current_run_id) = current_run_id {
+        records.retain(|record| record.run_id != current_run_id);
+    }
+    let selected = exemplars::select_similar_records_by_label(
+        &records,
+        task,
+        FAILURE_MODES_K,
+        FAILURE_MODES_LABELS,
+    );
+    if selected.is_empty() {
+        return ReviewExemplarInjection::default();
+    }
+
+    let mut selected_run_ids = Vec::new();
+    let mut defects = String::new();
+    for record in selected {
+        let Ok(review) = std::fs::read_to_string(&record.path) else {
+            continue;
+        };
+        let block = extract_defect_lines(&review);
+        if block.trim().is_empty() {
+            continue;
+        }
+        selected_run_ids.push(record.run_id.clone());
+        defects.push_str(&block);
+        defects.push('\n');
+    }
+    if selected_run_ids.is_empty() {
+        return ReviewExemplarInjection::default();
+    }
+
+    let capped = goose::utils::middle_out_truncate(
+        defects.trim_end(),
+        FAILURE_MODES_HEAD,
+        FAILURE_MODES_TAIL,
+    );
+    ReviewExemplarInjection {
+        injected: true,
+        selected_run_ids,
+        prompt_section: Some(format!(
+            "Known failure modes from past reviews — avoid these:\n{capped}"
+        )),
+    }
+}
+
+/// The defect body of an archived review: every non-empty line except the
+/// `VERDICT:` marker line, so only the reviewer's concrete findings carry over.
+fn extract_defect_lines(review: &str) -> String {
+    review
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_verdict_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_verdict_line(line: &str) -> bool {
+    line.to_ascii_lowercase().starts_with("verdict:")
 }
 
 fn read_index_from_state_dir(state_dir: &Path) -> Option<Vec<ReviewExemplarIndexRecord>> {
@@ -477,6 +594,94 @@ mod tests {
         assert!(prompt.contains("verdict=\"APPROVED\""));
         assert!(prompt.contains("verdict=\"REVISE\""));
         assert!(prompt.contains("cycle=\"2\""));
+    }
+
+    #[test]
+    fn failure_modes_injects_defect_lines_from_similar_revise_reviews() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_review_record(
+            state.path(),
+            "run-approved",
+            1,
+            "APPROVED",
+            "Inject review exemplars into orch review prompt",
+            300,
+            "VERDICT: APPROVED\nNo defects.",
+        );
+        write_review_record(
+            state.path(),
+            "run-revise",
+            2,
+            "REVISE",
+            "Inject review exemplars into orch review prompt",
+            200,
+            "VERDICT: REVISE\n\n1. crates/x.rs: gate never re-run after fix.\n2. missing regression test.",
+        );
+
+        let injection = build_failure_modes_from_state_dir(
+            state.path(),
+            "Inject review exemplars into orch review prompt",
+            reviewer("claude-acp", "opus"),
+            InjectionMode::Auto,
+            None,
+        );
+
+        assert!(injection.injected);
+        // Only the REVISE review contributes defect lines; APPROVED is excluded.
+        assert_eq!(injection.selected_run_ids, vec!["run-revise".to_string()]);
+        let prompt = injection.prompt_section.expect("prompt");
+        assert!(prompt.contains("Known failure modes from past reviews"));
+        assert!(prompt.contains("gate never re-run after fix"));
+        assert!(!prompt.contains("VERDICT:"));
+    }
+
+    #[test]
+    fn failure_modes_skips_frontier_implementer_in_auto() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_review_record(
+            state.path(),
+            "run-revise",
+            1,
+            "REVISE",
+            "Inject review exemplars into orch review prompt",
+            100,
+            "VERDICT: REVISE\n\n1. defect here.",
+        );
+
+        let injection = build_failure_modes_from_state_dir(
+            state.path(),
+            "Inject review exemplars into orch review prompt",
+            reviewer("claude-acp", "claude-fable-5"),
+            InjectionMode::Auto,
+            None,
+        );
+
+        assert!(!injection.injected);
+        assert!(injection.prompt_section.is_none());
+    }
+
+    #[test]
+    fn failure_modes_empty_without_revise_history() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_review_record(
+            state.path(),
+            "run-approved",
+            1,
+            "APPROVED",
+            "Inject review exemplars into orch review prompt",
+            100,
+            "VERDICT: APPROVED",
+        );
+
+        let injection = build_failure_modes_from_state_dir(
+            state.path(),
+            "Inject review exemplars into orch review prompt",
+            reviewer("claude-acp", "opus"),
+            InjectionMode::Auto,
+            None,
+        );
+
+        assert!(!injection.injected);
     }
 
     #[test]

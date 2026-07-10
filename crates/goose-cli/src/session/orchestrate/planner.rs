@@ -16,9 +16,10 @@ use super::phases::{
     render_auto_answer_banner, stream_role_completion_status, validate_plan_structure, PhaseMeta,
     PlanQualityAction, PlanRoundAction, PlanStructureAction,
 };
+use super::repo_pack;
 use super::roles::{
-    build_role_provider, playbook_banner_fragment, role_stream_system_prompt,
-    user_instruction_preamble, RoleConfig,
+    build_role_provider, playbook_banner_fragment, render_uplift_skip_notice,
+    role_stream_system_prompt, user_instruction_preamble, RoleConfig,
 };
 
 pub(super) struct PlanPhaseOutput {
@@ -39,6 +40,7 @@ pub(super) async fn run_plan_phase(
     run_id: &str,
     interactive: bool,
     planner_role: &RoleConfig,
+    planner_repo_pack: Option<&str>,
     meta: &PhaseMeta<'_>,
 ) -> Result<PlanPhaseOutput> {
     let role_idle_timeout = if interactive {
@@ -77,6 +79,14 @@ pub(super) async fn run_plan_phase(
         task,
         working_dir
     );
+    if let Some(pack) = planner_repo_pack {
+        plan_request_text.push_str(&repo_pack::orientation_block(pack));
+        println!(
+            "  {}",
+            console::style("repo pack injected for planner").dim()
+        );
+    }
+    render_uplift_skip_notice("planner", planner_role);
     if let Some(prompt_section) = &plan_exemplar_injection.prompt_section {
         plan_request_text.push_str("\n\n---\n\n");
         plan_request_text.push_str(prompt_section);

@@ -124,6 +124,38 @@ pub(super) fn playbook_banner_fragment(role: &RoleConfig) -> String {
     }
 }
 
+/// One-line, honest explanation of why uplift is auto-skipped for a frontier
+/// serving model, or `None` when uplift applies or was disabled deliberately
+/// (explicit `never`/`always`). Callers print it dim so frontier users learn how
+/// to override the presumption.
+pub(super) fn uplift_skip_notice(role_label: &str, role: &RoleConfig) -> Option<String> {
+    if playbook_mode() != InjectionMode::Auto || playbook_injected(role) {
+        return None;
+    }
+    match exemplars::frontier_match(
+        &role.provider_name,
+        &role.model,
+        &exemplars::frontier_patterns(),
+    )? {
+        exemplars::FrontierMatch::Pattern(pattern) => Some(format!(
+            "uplift: skipped for {role_label} ({} matches frontier pattern '{}'; set GOOSE_UPLIFT_FRONTIER_PATTERNS to override)",
+            role.model, pattern
+        )),
+        exemplars::FrontierMatch::ClaudeAcpDefault => Some(format!(
+            "uplift: skipped for {role_label} ({}/{} presumed frontier via claude-acp default alias; set an explicit GOOSE_{}_MODEL or GOOSE_UPLIFT_FRONTIER_PATTERNS to override)",
+            role.provider_name,
+            role.model,
+            role_label.to_ascii_uppercase()
+        )),
+    }
+}
+
+pub(super) fn render_uplift_skip_notice(role_label: &str, role: &RoleConfig) {
+    if let Some(notice) = uplift_skip_notice(role_label, role) {
+        println!("  {}", console::style(notice).dim());
+    }
+}
+
 pub(super) fn is_acp_provider(provider_name: &str) -> bool {
     provider_name.ends_with("-acp")
 }
@@ -178,7 +210,11 @@ fn build_role_system_prompt(base: &str, role: &RoleConfig, mode: InjectionMode) 
         return base.to_string();
     }
 
-    let preamble = if exemplars::is_fable_model(&role.provider_name, &role.model) {
+    let preamble = if exemplars::is_frontier_model(
+        &role.provider_name,
+        &role.model,
+        &exemplars::frontier_patterns(),
+    ) {
         ""
     } else {
         PLAYBOOK_PREAMBLE
@@ -248,6 +284,32 @@ mod tests {
 
         assert!(prompt.contains("# Operating playbook"));
         assert!(prompt.contains(PLAYBOOK_PREAMBLE));
+    }
+
+    #[test]
+    fn uplift_skip_notice_explains_frontier_skip_in_auto_mode() {
+        let _guard = env_lock::lock_env([
+            ("GOOSE_ORCH_PLAYBOOK", Some("auto".to_string())),
+            ("GOOSE_UPLIFT_FRONTIER_PATTERNS", Some("fable".to_string())),
+        ]);
+
+        let notice = uplift_skip_notice("planner", &role("anthropic", "claude-fable-5"))
+            .expect("frontier model should produce a skip notice");
+        assert!(notice.contains("planner"));
+        assert!(notice.contains("frontier pattern 'fable'"));
+        assert!(notice.contains("GOOSE_UPLIFT_FRONTIER_PATTERNS"));
+
+        assert!(uplift_skip_notice("planner", &role("openai", "gpt-5.5")).is_none());
+
+        let acp = uplift_skip_notice("implementer", &role("claude-acp", "default"))
+            .expect("claude-acp default alias should produce a notice");
+        assert!(acp.contains("claude-acp default alias"));
+    }
+
+    #[test]
+    fn uplift_skip_notice_silent_under_explicit_mode() {
+        let _guard = env_lock::lock_env([("GOOSE_ORCH_PLAYBOOK", Some("never".to_string()))]);
+        assert!(uplift_skip_notice("reviewer", &role("openai", "gpt-5.5")).is_none());
     }
 
     #[test]

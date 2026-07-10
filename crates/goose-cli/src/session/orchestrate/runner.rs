@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use goose::config::{Config, GooseMode};
 use goose::conversation::message::Message;
 use goose::providers::base::ProviderUsage;
-use goose::utils::safe_truncate;
+use goose::utils::middle_out_truncate;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -10,24 +10,28 @@ use tokio_util::sync::CancellationToken;
 use crate::session::{ledger, output, plan_exemplars, review_exemplars, CliSession};
 
 use super::gates::{
-    gate_banner_line, gate_passed_review_note, next_gate_step, partition_gates, record_gate_phase,
-    resolve_gates, run_gates, GateOutcome, GateStep,
+    gate_banner_line, gate_outputs_review_section, gate_passed_review_note, next_gate_step,
+    partition_gates, record_gate_phase, resolve_gates, run_gates, GateOutcome, GateRun, GateStep,
 };
 use super::limits::handle_phase_error;
 use super::phases::{
-    archive_pending_reviews, gate_banner, orch_phase_idle_timeout, orch_progress_cadence,
-    partial_completion_text, persist_artifact, phase_banner, record_phase, stream_role_completion,
-    stream_role_completion_status, warn_truncated, PendingReviewArchive, PhaseMeta,
-    PhasePolicySummary, EVIDENCE_CHAR_LIMIT, REVIEW_SYSTEM_PROMPT,
+    archive_pending_reviews, gate_banner, has_self_verification, orch_phase_idle_timeout,
+    orch_progress_cadence, partial_completion_text, persist_artifact, phase_banner, record_phase,
+    record_self_verification, self_verification_demand, self_verification_reprompt,
+    self_verification_review_block, stream_role_completion, stream_role_completion_status,
+    warn_truncated, PendingReviewArchive, PhaseMeta, PhasePolicySummary, EVIDENCE_CHAR_LIMIT,
+    REVIEW_SYSTEM_PROMPT,
 };
 use super::planner::run_plan_phase;
+use super::repo_pack;
 use super::roles::{
     build_role_provider, implement_policy_label, is_acp_provider, playbook_banner_fragment,
-    playbook_text, resolve_all_roles, role_stream_system_prompt, user_instruction_preamble,
-    RoleConfig,
+    playbook_text, render_uplift_skip_notice, resolve_all_roles, role_stream_system_prompt,
+    user_instruction_preamble, RoleConfig,
 };
 use super::workspace::{
-    finalize_worktree_approval, git_evidence, render_workspace_banner, setup_orch_workspace,
+    finalize_worktree_approval, git_diff_stat, git_evidence, render_workspace_banner,
+    setup_orch_workspace,
 };
 use super::{
     resolve_orch_implement_policy, OrchImplementPolicy, OrchOutcome, DEFAULT_MAX_CYCLES,
@@ -201,6 +205,21 @@ impl CliSession {
         }
         let working_dir = workspace.impl_dir.display().to_string();
 
+        let repo_pack_root = workspace
+            .repo_root
+            .clone()
+            .unwrap_or_else(|| workspace.original_dir.clone());
+        let repo_pack = if repo_pack::repo_pack_injects(planner_role)
+            || repo_pack::repo_pack_injects(implementer_role)
+        {
+            repo_pack::cached_repo_pack(&repo_pack_root)
+        } else {
+            None
+        };
+        let planner_repo_pack = repo_pack
+            .as_deref()
+            .filter(|_| repo_pack::repo_pack_injects(planner_role));
+
         config.set_param("GOOSE_ACP_PLAN_EXPLORE", true)?;
 
         let session_id = self.session_id.clone();
@@ -224,6 +243,7 @@ impl CliSession {
             &run_id,
             interactive,
             planner_role,
+            planner_repo_pack,
             &meta,
         )
         .await
@@ -311,6 +331,36 @@ impl CliSession {
             "You are the implementer in a plan/implement/review workflow. Execute the plan below for the task. Modify files and run verification with your tools. When done, report what you changed and how you verified it.{}\n\nTask:\n{}\n\nWorking directory:\n{}\n\nPlan:\n{}",
             implementer_playbook, task, working_dir, plan_text
         );
+        if let Some(pack) = repo_pack
+            .as_deref()
+            .filter(|_| repo_pack::repo_pack_injects(implementer_role))
+        {
+            instruction.push_str(&repo_pack::orientation_block(pack));
+            println!(
+                "  {}",
+                console::style("repo pack injected for implementer").dim()
+            );
+        }
+        let failure_modes = review_exemplars::build_failure_modes_injection(
+            task,
+            &implementer_role.provider_name,
+            &implementer_role.model,
+            Some(&run_id),
+        );
+        if let Some(section) = &failure_modes.prompt_section {
+            instruction.push_str("\n\n");
+            instruction.push_str(section);
+            println!(
+                "  {}",
+                console::style(format!(
+                    "known failure modes injected [{}]",
+                    failure_modes.selected_run_ids.join(", ")
+                ))
+                .dim()
+            );
+        }
+        instruction.push_str(&self_verification_demand(&plan_text));
+        render_uplift_skip_notice("implementer", implementer_role);
         let gate_partition = partition_gates(&workspace.impl_dir, &resolved_gates.gates);
         for skip in &gate_partition.skipped {
             println!(
@@ -327,6 +377,8 @@ impl CliSession {
         let mut gate_retries = 0;
         let gate_note = gate_passed_review_note(&gates);
         let mut pending_review_archives = Vec::new();
+        let mut last_gate_runs: Vec<GateRun> = Vec::new();
+        render_uplift_skip_notice("reviewer", reviewer_role);
 
         for cycle in 1..=max_cycles {
             loop {
@@ -418,7 +470,10 @@ impl CliSession {
                 let gate_started = Instant::now();
                 let outcome = run_gates(&workspace.impl_dir, &gates);
                 let (passed, detail) = match &outcome {
-                    GateOutcome::Passed => (true, String::new()),
+                    GateOutcome::Passed { runs } => {
+                        last_gate_runs = runs.clone();
+                        (true, String::new())
+                    }
                     GateOutcome::Failed { command, .. } => (false, command.clone()),
                 };
                 record_gate_phase(
@@ -454,6 +509,41 @@ impl CliSession {
                 }
             }
 
+            let mut implementer_report = self.last_assistant_text().unwrap_or_default();
+            if !has_self_verification(&implementer_report) {
+                println!(
+                    "  {}",
+                    console::style(
+                        "implementer report missing ## Self-verification; reprompting once"
+                    )
+                    .yellow()
+                );
+                self.push_message(
+                    Message::user().with_text(self_verification_reprompt(&plan_text)),
+                );
+                self.process_agent_response(interactive, CancellationToken::default())
+                    .await?;
+                let sv_reply = self.last_assistant_text().unwrap_or_default();
+                if implementer_report.trim().is_empty() {
+                    implementer_report = sv_reply;
+                } else if !sv_reply.trim().is_empty() {
+                    implementer_report.push_str("\n\n");
+                    implementer_report.push_str(&sv_reply);
+                }
+                let recovered = has_self_verification(&implementer_report);
+                if !recovered {
+                    println!(
+                        "  {}",
+                        console::style(
+                            "implementer still omitted ## Self-verification after reprompt; proceeding"
+                        )
+                        .yellow()
+                        .bold()
+                    );
+                }
+                record_self_verification(&meta, cycle, implementer_role, recovered);
+            }
+
             output::set_active_role_status(Some(output::ActiveRoleStatus {
                 role: output::ActiveRole::Reviewer,
                 cycle: Some((cycle, max_cycles)),
@@ -481,14 +571,6 @@ impl CliSession {
                 reviewer_role.provider_name, reviewer_role.model
             )));
             let phase_started = Instant::now();
-            let implementer_report = self
-                .messages
-                .messages()
-                .iter()
-                .rev()
-                .find(|m| m.role == rmcp::model::Role::Assistant)
-                .map(|m| m.as_concat_text())
-                .unwrap_or_default();
             persist_artifact(
                 &workspace.original_dir,
                 &run_id,
@@ -508,16 +590,31 @@ impl CliSession {
             if evidence.truncated {
                 warn_truncated("git evidence", evidence.full.len(), &run_id);
             }
+            let diff_stat = git_diff_stat(&workspace.impl_dir);
+            let gate_outputs = gate_outputs_review_section(&last_gate_runs, 40);
+            let self_verification_checklist =
+                self_verification_review_block(&plan_text, &implementer_report);
             let mut review_request_text = format!(
-                "{}Task:\n{}\n\nPlan:\n{}\n\nGit evidence:\n{}\n\nImplementer report:\n{}\n\nWorking directory: {}{}",
+                "{}Task:\n{}\n\nPlan:\n{}\n\nGit evidence:\n{}\n\n",
                 user_instruction_preamble(REVIEW_SYSTEM_PROMPT, reviewer_role),
                 task,
                 plan_text,
                 evidence.text,
-                safe_truncate(&implementer_report, EVIDENCE_CHAR_LIMIT),
+            );
+            if !diff_stat.is_empty() {
+                review_request_text.push_str(&format!("Diffstat:\n{}\n\n", diff_stat));
+            }
+            if !gate_outputs.is_empty() {
+                review_request_text.push_str(&gate_outputs);
+                review_request_text.push_str("\n\n");
+            }
+            review_request_text.push_str(&format!(
+                "Implementer report:\n{}\n\n{}\n\nWorking directory: {}{}",
+                middle_out_truncate(&implementer_report, 8_000, 22_000),
+                self_verification_checklist,
                 working_dir,
                 gate_note
-            );
+            ));
             if let Some(prompt_section) = &review_exemplar_injection.prompt_section {
                 review_request_text.push_str("\n\n---\n\n");
                 review_request_text.push_str(prompt_section);
@@ -689,8 +786,9 @@ impl CliSession {
                 return Ok(OrchOutcome::MaxCycles);
             }
             instruction = format!(
-                "The reviewer did not approve the implementation. Address every item in the review feedback below, then re-verify and report.\n\nReview feedback:\n{}",
-                review_text
+                "The reviewer did not approve the implementation. Address every item in the review feedback below, then re-verify and report.\n\nReview feedback:\n{}{}",
+                review_text,
+                self_verification_demand(&plan_text)
             );
         }
         Ok(OrchOutcome::MaxCycles)

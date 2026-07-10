@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::orchestrate::{build_role_provider, resolve_all_roles, RoleConfig};
+use super::orchestrate::{build_role_provider, git_evidence, resolve_all_roles, RoleConfig};
 use super::{ledger, output, CliSession};
 
 pub(crate) const GOAL_USAGE: &str = "\
@@ -448,7 +448,13 @@ fn goal_retry_prompt(goal: &str, feedback: &str) -> String {
     )
 }
 
-fn evaluator_prompt(goal: &str, attempt: u32, assistant_text: &str, check: Option<&str>) -> String {
+fn evaluator_prompt(
+    goal: &str,
+    attempt: u32,
+    assistant_text: &str,
+    git_evidence: &str,
+    check: Option<&str>,
+) -> String {
     let check_note = match check {
         Some(command) => format!(
             "\nA deterministic check was configured (`{command}`), but this evaluator prompt should only be used when no check is being run."
@@ -456,7 +462,7 @@ fn evaluator_prompt(goal: &str, attempt: u32, assistant_text: &str, check: Optio
         None => String::new(),
     };
     format!(
-        "Goal:\n{goal}\n\nAttempt: {attempt}\n\nWorker's latest response:\n{assistant_text}{check_note}\n\nReturn GOAL_MET only if the worker's attempt fully satisfies the goal."
+        "Goal:\n{goal}\n\nAttempt: {attempt}\n\nWorker's latest response:\n{assistant_text}\n\nGit evidence:\n{git_evidence}{check_note}\n\nReturn GOAL_MET only if the worker's attempt fully satisfies the goal. Judge against the git evidence, not just the worker's narration."
     )
 }
 
@@ -677,10 +683,12 @@ impl CliSession {
             role.provider_name, role.model
         )));
         let assistant_text = self.goal_last_assistant_text().unwrap_or_default();
+        let evidence = git_evidence(working_dir);
         let messages = vec![Message::user().with_text(evaluator_prompt(
             goal,
             attempt,
             &assistant_text,
+            &evidence.text,
             check,
         ))];
         let completion = goose::session_context::with_session_id(
@@ -963,6 +971,20 @@ impl CliSession {
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    #[test]
+    fn evaluator_prompt_includes_git_evidence() {
+        let prompt = super::evaluator_prompt(
+            "make the homepage load fast",
+            1,
+            "I optimized images.",
+            "$ git diff HEAD\n+ optimized",
+            None,
+        );
+        assert!(prompt.contains("Git evidence:"));
+        assert!(prompt.contains("+ optimized"));
+        assert!(prompt.contains("Judge against the git evidence"));
+    }
 
     #[test]
     fn parse_goal_verdict_extracts_met_reason() {

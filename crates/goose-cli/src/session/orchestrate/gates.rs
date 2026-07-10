@@ -200,9 +200,17 @@ pub(crate) fn gate_banner_line(resolved: &ResolvedGates) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct GateRun {
+    pub command: String,
+    pub output_tail: String,
+}
+
 #[derive(Debug)]
 pub(super) enum GateOutcome {
-    Passed,
+    Passed {
+        runs: Vec<GateRun>,
+    },
     Failed {
         command: String,
         output_tail: String,
@@ -299,6 +307,7 @@ fn gate_skip_reason(impl_dir: &Path, command: &str) -> Option<String> {
 }
 
 pub(super) fn run_gates(impl_dir: &Path, gates: &[String]) -> GateOutcome {
+    let mut runs = Vec::new();
     for command in gates {
         if command.trim().is_empty() {
             continue;
@@ -313,24 +322,53 @@ pub(super) fn run_gates(impl_dir: &Path, gates: &[String]) -> GateOutcome {
             }
         };
 
+        let combined = combined_gate_output(&output);
         if !output.status.success() {
-            let mut combined = format!("status: {}\n", output.status);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stdout.trim().is_empty() {
-                combined.push_str(&format!("stdout:\n{stdout}\n"));
-            }
-            if !stderr.trim().is_empty() {
-                combined.push_str(&format!("stderr:\n{stderr}\n"));
-            }
             return GateOutcome::Failed {
                 command: command.clone(),
                 output_tail: tail_truncate(&combined, GATE_OUTPUT_TAIL_LIMIT),
             };
         }
+        runs.push(GateRun {
+            command: command.clone(),
+            output_tail: tail_truncate(&combined, GATE_OUTPUT_TAIL_LIMIT),
+        });
     }
 
-    GateOutcome::Passed
+    GateOutcome::Passed { runs }
+}
+
+fn combined_gate_output(output: &std::process::Output) -> String {
+    let mut combined = format!("status: {}\n", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim().is_empty() {
+        combined.push_str(&format!("stdout:\n{stdout}\n"));
+    }
+    if !stderr.trim().is_empty() {
+        combined.push_str(&format!("stderr:\n{stderr}\n"));
+    }
+    combined
+}
+
+/// Format the passing gate outputs for the review request: each command with the
+/// last `tail_lines` lines of its output, so the reviewer sees the actual gate
+/// results (test counts, warnings) rather than just "gates passed".
+pub(super) fn gate_outputs_review_section(runs: &[GateRun], tail_lines: usize) -> String {
+    if runs.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("Gate outputs (tail):\n");
+    for run in runs {
+        let lines: Vec<&str> = run.output_tail.lines().collect();
+        let start = lines.len().saturating_sub(tail_lines);
+        section.push_str(&format!(
+            "$ {}\n{}\n\n",
+            run.command,
+            lines[start..].join("\n")
+        ));
+    }
+    section.trim_end().to_string()
 }
 
 fn spawn_gate(impl_dir: &Path, command: &str) -> std::io::Result<std::process::Output> {
@@ -385,7 +423,7 @@ pub(super) fn next_gate_step(
     max_gate_retries: u32,
 ) -> GateStep {
     match outcome {
-        GateOutcome::Passed => GateStep::Proceed,
+        GateOutcome::Passed { .. } => GateStep::Proceed,
         GateOutcome::Failed {
             command,
             output_tail,
@@ -709,12 +747,30 @@ mod tests {
 
         assert!(matches!(
             super::run_gates(temp.path(), &["true".to_string()]),
-            super::GateOutcome::Passed
+            super::GateOutcome::Passed { .. }
         ));
         assert!(matches!(
             super::run_gates(temp.path(), &[]),
-            super::GateOutcome::Passed
+            super::GateOutcome::Passed { .. }
         ));
+    }
+
+    #[test]
+    fn run_gates_captures_passing_output_for_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        match super::run_gates(temp.path(), &["echo passing-gate-output".to_string()]) {
+            super::GateOutcome::Passed { runs } => {
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0].command, "echo passing-gate-output");
+                assert!(runs[0].output_tail.contains("passing-gate-output"));
+                let section = super::gate_outputs_review_section(&runs, 40);
+                assert!(section.contains("$ echo passing-gate-output"));
+                assert!(section.contains("passing-gate-output"));
+                assert!(super::gate_outputs_review_section(&[], 40).is_empty());
+            }
+            super::GateOutcome::Failed { .. } => panic!("expected passing gate"),
+        }
     }
 
     #[test]
@@ -724,7 +780,7 @@ mod tests {
 
         assert!(matches!(
             super::run_gates(temp.path(), &["test -f sentinel".to_string()]),
-            super::GateOutcome::Passed
+            super::GateOutcome::Passed { .. }
         ));
     }
 
@@ -737,7 +793,7 @@ mod tests {
             &["true".to_string(), "false".to_string(), "true".to_string()],
         ) {
             super::GateOutcome::Failed { command, .. } => assert_eq!(command, "false"),
-            super::GateOutcome::Passed => panic!("expected failing gate"),
+            super::GateOutcome::Passed { .. } => panic!("expected failing gate"),
         }
     }
 
@@ -749,7 +805,7 @@ mod tests {
             super::GateOutcome::Failed { output_tail, .. } => {
                 assert!(output_tail.contains("GATE_MARKER"), "{output_tail}");
             }
-            super::GateOutcome::Passed => panic!("expected failing gate"),
+            super::GateOutcome::Passed { .. } => panic!("expected failing gate"),
         }
     }
 
@@ -814,7 +870,11 @@ mod tests {
         let mut gate_retries = 0;
 
         assert!(matches!(
-            super::next_gate_step(super::GateOutcome::Passed, &mut gate_retries, 2),
+            super::next_gate_step(
+                super::GateOutcome::Passed { runs: Vec::new() },
+                &mut gate_retries,
+                2
+            ),
             super::GateStep::Proceed
         ));
         assert_eq!(gate_retries, 0);
@@ -827,7 +887,7 @@ mod tests {
 
         assert!(matches!(
             super::run_gates(temp.path(), &gates),
-            super::GateOutcome::Passed
+            super::GateOutcome::Passed { .. }
         ));
         assert_eq!(super::gate_passed_review_note(&gates), "");
     }

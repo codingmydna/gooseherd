@@ -201,6 +201,152 @@ pub(super) fn plan_structure_reprompt(missing: &[PlanSection]) -> String {
     )
 }
 
+/// Extract the individual acceptance-criterion lines from a structured plan's
+/// `## Acceptance criteria` section (the B1 plan schema). Each returned string is
+/// a trimmed criterion with any leading list marker (`-`, `*`, `+`, `1.`, `2)`)
+/// stripped, in document order. Empty when the plan has no such section.
+pub(super) fn extract_acceptance_criteria(plan: &str) -> Vec<String> {
+    let mut criteria = Vec::new();
+    let mut in_section = false;
+    for line in plan.lines() {
+        if let Some(header) = normalized_plan_header(line) {
+            in_section = header.starts_with(PlanSection::AcceptanceCriteria.keyword());
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let item = strip_list_marker(line.trim());
+        if !item.is_empty() {
+            criteria.push(item.to_string());
+        }
+    }
+    criteria
+}
+
+fn strip_list_marker(line: &str) -> &str {
+    let line = line.trim();
+    for marker in ['-', '*', '+'] {
+        if let Some(rest) = line.strip_prefix(marker) {
+            return rest.trim_start();
+        }
+    }
+    let digits: String = line.chars().take_while(char::is_ascii_digit).collect();
+    if !digits.is_empty() {
+        if let Some(rest) = line
+            .get(digits.len()..)
+            .and_then(|rest| rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')))
+        {
+            return rest.trim_start();
+        }
+    }
+    line
+}
+
+/// Whether an implementer report carries a self-verification section. Tolerant:
+/// matches a `## Self-verification` header case-insensitively, accepts `##`/`###`,
+/// treats hyphen/underscore as a space (`Self verification`), and allows trailing
+/// text on the header line.
+pub(super) fn has_self_verification(report: &str) -> bool {
+    report
+        .lines()
+        .filter_map(normalized_plan_header)
+        .any(|header| {
+            header
+                .replace(['-', '_'], " ")
+                .starts_with("self verification")
+        })
+}
+
+fn acceptance_criteria_block(plan: &str) -> String {
+    let criteria = extract_acceptance_criteria(plan);
+    if criteria.is_empty() {
+        return "The plan lists no explicit acceptance criteria; enumerate the task's own success conditions and map each to evidence.".to_string();
+    }
+    let mut block = String::from("Acceptance criteria:\n");
+    for (index, criterion) in criteria.iter().enumerate() {
+        block.push_str(&format!("{}. {}\n", index + 1, criterion));
+    }
+    block.trim_end().to_string()
+}
+
+/// The `## Self-verification` demand appended to the implementer instruction: end
+/// the report with that section, mapping each acceptance criterion to concrete
+/// evidence (command + observed output, or `file:line`).
+pub(super) fn self_verification_demand(plan: &str) -> String {
+    format!(
+        "\n\nWhen you finish, END your report with a `## Self-verification` section. For EACH acceptance criterion below add one bullet mapping the criterion to concrete evidence: the exact verification command you ran and its observed output, or a `file:line` reference. Do not claim a criterion passes without evidence.\n\n{}",
+        acceptance_criteria_block(plan)
+    )
+}
+
+/// The one bounded reprompt sent to an implementer whose report lacked the
+/// `## Self-verification` section: emit only that section for the criteria.
+pub(super) fn self_verification_reprompt(plan: &str) -> String {
+    format!(
+        "Your report is missing the required `## Self-verification` section. Emit ONLY that section now — a `## Self-verification` header followed by one bullet per acceptance criterion, each mapping the criterion to concrete evidence (the exact command you ran and its observed output, or a `file:line`). Do not repeat the rest of your report.\n\n{}",
+        acceptance_criteria_block(plan)
+    )
+}
+
+/// The self-verification checklist appended to the review request. Presents the
+/// implementer's mapping as claims the reviewer must confirm against the evidence,
+/// and tells the reviewer to distrust any criterion it cannot independently verify.
+pub(super) fn self_verification_review_block(plan: &str, report: &str) -> String {
+    let criteria = extract_acceptance_criteria(plan);
+    let mut block = String::from("## Self-verification checklist\n");
+    if has_self_verification(report) {
+        block.push_str(
+            "The implementer's report ends with a `## Self-verification` section (above). Verify each claim against the git evidence and gate output — open files and re-run checks where you can. Treat any criterion whose evidence you cannot independently confirm as NOT met, and missing or vague evidence as a blocking defect.",
+        );
+    } else {
+        block.push_str(
+            "WARNING: the implementer did NOT provide a `## Self-verification` section despite being asked. Do not take the report's success claims at face value — independently verify every acceptance criterion below against the evidence, and block if you cannot confirm one.",
+        );
+    }
+    if !criteria.is_empty() {
+        block.push_str("\n\nAcceptance criteria to confirm:\n");
+        for (index, criterion) in criteria.iter().enumerate() {
+            block.push_str(&format!("{}. {}\n", index + 1, criterion));
+        }
+    }
+    block.trim_end().to_string()
+}
+
+/// Ledger row noting whether the implementer report carried the self-verification
+/// section, and whether a reprompt was needed. Only appended when the initial
+/// report lacked the section, so /stats can measure compliance.
+pub(super) fn record_self_verification(
+    meta: &PhaseMeta<'_>,
+    cycle: u32,
+    role_cfg: &RoleConfig,
+    recovered: bool,
+) {
+    ledger::append(&ledger::PhaseRecord {
+        ts_ms: ledger::now_ms(),
+        session_id: meta.session_id.to_string(),
+        run_id: meta.run_id.to_string(),
+        phase: "self-verify".to_string(),
+        cycle,
+        role: "implementer".to_string(),
+        provider: role_cfg.provider_name.clone(),
+        config_model: role_cfg.model.clone(),
+        reported_model: None,
+        context_limit: None,
+        input_tokens: None,
+        output_tokens: None,
+        duration_ms: 0,
+        verdict: Some(if recovered { "RECOVERED" } else { "MISSING" }.to_string()),
+        permission_policy: None,
+        permission_denials: None,
+        task_preview: safe_truncate(meta.task, 120),
+        plan_exemplars_injected: None,
+        plan_exemplar_run_ids: None,
+        review_exemplars_injected: None,
+        review_exemplar_run_ids: None,
+    });
+}
+
 /// Appends an assistant text chunk to the collected role text. Streamed text
 /// deltas of one block must concatenate byte-exactly, but a text block that
 /// follows non-text content (a tool call/response) is a new message — without

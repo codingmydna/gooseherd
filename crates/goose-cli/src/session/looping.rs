@@ -615,7 +615,7 @@ impl CliSession {
             .unwrap_or_default()
     }
 
-    fn last_assistant_text(&self) -> Option<String> {
+    pub(super) fn last_assistant_text(&self) -> Option<String> {
         self.messages
             .iter()
             .rev()

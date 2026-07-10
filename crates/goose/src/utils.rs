@@ -58,6 +58,24 @@ pub fn safe_truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Truncate keeping the head and the tail, dropping the middle.
+///
+/// Unlike [`safe_truncate`], which keeps only the head, this preserves the last
+/// `tail_chars` characters as well — so a document whose most important content
+/// lives at the end (an implementer report's final self-verification section, a
+/// long log's error tail) survives truncation. A marker records how many
+/// characters were removed. Char-boundary safe.
+pub fn middle_out_truncate(s: &str, head_chars: usize, tail_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= head_chars.saturating_add(tail_chars) {
+        return s.to_string();
+    }
+    let removed = total - head_chars - tail_chars;
+    let head: String = s.chars().take(head_chars).collect();
+    let tail: String = s.chars().skip(total - tail_chars).collect();
+    format!("{head}\n\n[... truncated {removed} chars ...]\n\n{tail}")
+}
+
 pub fn is_token_cancelled(cancellation_token: &Option<CancellationToken>) -> bool {
     cancellation_token
         .as_ref()
@@ -180,6 +198,42 @@ mod tests {
         let mixed = "Hello こんにちは";
         assert_eq!(safe_truncate(mixed, 20), mixed);
         assert_eq!(safe_truncate(mixed, 8), "Hello...");
+    }
+
+    #[test]
+    fn test_middle_out_truncate_keeps_head_and_tail() {
+        let s = "0123456789";
+        assert_eq!(
+            middle_out_truncate(s, 3, 3),
+            "012\n\n[... truncated 4 chars ...]\n\n789"
+        );
+    }
+
+    #[test]
+    fn test_middle_out_truncate_returns_input_when_within_budget() {
+        let s = "short body";
+        assert_eq!(middle_out_truncate(s, 8, 22), s);
+        assert_eq!(middle_out_truncate(s, 0, 10), s);
+    }
+
+    #[test]
+    fn test_middle_out_truncate_preserves_tail_section() {
+        // The final marker must survive even when the head budget is large.
+        let mut body = "HEAD\n".to_string();
+        body.push_str(&"filler ".repeat(1000));
+        body.push_str("\n## Self-verification\ncriterion -> evidence");
+        let truncated = middle_out_truncate(&body, 20, 60);
+        assert!(truncated.contains("HEAD"));
+        assert!(truncated.contains("## Self-verification"));
+        assert!(truncated.contains("[... truncated"));
+    }
+
+    #[test]
+    fn test_middle_out_truncate_is_char_boundary_safe() {
+        let s = "日本語のテキストをここで切り詰めます末尾";
+        let truncated = middle_out_truncate(s, 2, 2);
+        assert!(truncated.starts_with("日本"));
+        assert!(truncated.ends_with("末尾"));
     }
 
     #[test]

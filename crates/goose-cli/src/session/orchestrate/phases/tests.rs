@@ -344,6 +344,61 @@ fn planner_prompt_omits_question_protocol_when_disabled() {
 }
 
 #[test]
+fn extract_acceptance_criteria_pulls_section_items_and_strips_markers() {
+    let plan = "## Files\nsrc/lib.rs\n## Acceptance criteria\n- criterion one\n2. criterion two\n* criterion three\n## Verification\ncargo test";
+    assert_eq!(
+        super::extract_acceptance_criteria(plan),
+        vec![
+            "criterion one".to_string(),
+            "criterion two".to_string(),
+            "criterion three".to_string(),
+        ]
+    );
+    assert!(super::extract_acceptance_criteria("## Files\nonly files").is_empty());
+}
+
+#[test]
+fn has_self_verification_matches_tolerant_headers() {
+    assert!(super::has_self_verification(
+        "report body\n\n## Self-verification\n- crit: `cargo test` green"
+    ));
+    assert!(super::has_self_verification(
+        "### self verification (criterion -> evidence)\n- ok"
+    ));
+    assert!(!super::has_self_verification(
+        "I verified everything myself, trust me."
+    ));
+}
+
+#[test]
+fn self_verification_demand_lists_criteria_verbatim() {
+    let plan = "## Acceptance criteria\n- gate passes\n- tests added\n## Verification\ncargo test";
+    let demand = super::self_verification_demand(plan);
+    assert!(demand.contains("## Self-verification"));
+    assert!(demand.contains("1. gate passes"));
+    assert!(demand.contains("2. tests added"));
+}
+
+#[test]
+fn self_verification_demand_handles_criterialess_plan() {
+    let demand = super::self_verification_demand("## Files\njust files");
+    assert!(demand.contains("no explicit acceptance criteria"));
+}
+
+#[test]
+fn self_verification_review_block_flags_missing_section() {
+    let plan = "## Acceptance criteria\n- gate passes\n## Verification\ncargo test";
+    let present =
+        super::self_verification_review_block(plan, "## Self-verification\n- gate: green");
+    assert!(present.contains("ends with a `## Self-verification` section"));
+    assert!(present.contains("1. gate passes"));
+
+    let missing = super::self_verification_review_block(plan, "no such section here");
+    assert!(missing.contains("did NOT provide"));
+    assert!(missing.contains("1. gate passes"));
+}
+
+#[test]
 fn review_prompt_contains_reinforced_rubric() {
     assert!(super::REVIEW_SYSTEM_PROMPT.contains("Independent re-verification"));
     assert!(super::REVIEW_SYSTEM_PROMPT.contains("acceptance criteria"));
