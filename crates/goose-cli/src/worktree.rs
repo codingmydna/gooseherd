@@ -208,6 +208,12 @@ pub fn merge_branch(dir: &Path, branch: &str) -> Result<MergeResult> {
     Ok(MergeResult::Conflict)
 }
 
+pub fn commits_ahead(dir: &Path, branch: &str) -> Result<usize> {
+    let range = format!("HEAD..{branch}");
+    let count = git(dir, &["rev-list", "--count", &range])?;
+    Ok(count.trim().parse()?)
+}
+
 pub fn list_goose_worktrees(start: &Path) -> Result<Vec<WorktreeInfo>> {
     let repo_root = find_repo_root(start)?;
     let output = git(&repo_root, &["worktree", "list", "--porcelain"])?;
@@ -722,6 +728,28 @@ mod tests {
         assert_eq!(
             fs::read_to_string(repo.path().join("README.md")).expect("read readme"),
             "changed in worktree\n"
+        );
+    }
+
+    #[test]
+    fn commits_ahead_counts_commits_only_on_worktree_branch() {
+        let repo = init_repo();
+        let created = super::create_named_worktree(repo.path(), "ahead", Some("topic/ahead"))
+            .expect("worktree");
+
+        assert_eq!(
+            super::commits_ahead(repo.path(), "topic/ahead").expect("ahead count"),
+            0
+        );
+
+        fs::write(created.path.join("README.md"), "changed in worktree\n").expect("change readme");
+        assert!(
+            super::commit_all(&created.path, "test: worktree change", &[]).expect("commit branch")
+        );
+
+        assert_eq!(
+            super::commits_ahead(repo.path(), "topic/ahead").expect("ahead count"),
+            1
         );
     }
 
