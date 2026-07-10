@@ -89,9 +89,11 @@ into planner/reviewer roles whose serving model is not Fable; use
 **A full run lifecycle around the loop** — each `/orch` run isolates itself in
 a git worktree (`.goose/worktrees/orch-<run_id>`, env files symlinked), so
 parallel runs on one repo don't contaminate each other's evidence. Configured
-quality gates (`GOOSE_ORCH_GATES`, e.g. fmt/lint/test) run *before* the
-reviewer is called — mechanical failures bounce straight back to the
-implementer without spending reviewer tokens. On approval the run auto-commits
+quality gates run *before* the reviewer is called — a repo-root `.goosegates`
+file (one command per line) takes priority, otherwise orch derives safe
+test/build checks from supported manifests and finally falls back to
+`GOOSE_ORCH_GATES`. Mechanical failures bounce straight back to the implementer
+without spending reviewer tokens. On approval the run auto-commits
 to its branch and prints the merge command (`--merge` merges for you).
 An allowlist permission policy (`GOOSE_ORCH_IMPLEMENT_POLICY: allowlist`)
 confines the implementer to the workspace and an approved command list — for

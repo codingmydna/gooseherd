@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 use crate::session::{ledger, output, plan_exemplars, review_exemplars, CliSession};
 
 use super::gates::{
-    effective_gates, gate_passed_review_note, next_gate_step, partition_gates, record_gate_phase,
-    run_gates, GateOutcome, GateStep,
+    gate_origin_banner, gate_passed_review_note, next_gate_step, partition_gates,
+    record_gate_phase, resolve_gates, run_gates, GateOutcome, GateStep,
 };
 use super::limits::handle_phase_error;
 use super::phases::{
@@ -291,12 +291,16 @@ impl CliSession {
             "You are the implementer in a plan/implement/review workflow. Execute the plan below for the task. Modify files and run verification with your tools. When done, report what you changed and how you verified it.{}\n\nTask:\n{}\n\nWorking directory:\n{}\n\nPlan:\n{}",
             implementer_playbook, task, working_dir, plan_text
         );
-        let configured_gates = effective_gates(
-            config
-                .get_param::<Vec<String>>(GATES_KEY)
-                .unwrap_or_default(),
+        let configured_gates = config
+            .get_param::<Vec<String>>(GATES_KEY)
+            .unwrap_or_default();
+        let resolved_gates = resolve_gates(&workspace.impl_dir, configured_gates);
+        let gate_partition = partition_gates(&workspace.impl_dir, &resolved_gates.gates);
+        println!(
+            "  {} {}",
+            console::style("⎿").dim(),
+            console::style(gate_origin_banner(&resolved_gates, &gate_partition)).dim()
         );
-        let gate_partition = partition_gates(&workspace.impl_dir, &configured_gates);
         for skip in &gate_partition.skipped {
             println!(
                 "  {} {}",
