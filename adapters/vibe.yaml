@@ -1,0 +1,9 @@
+name: vibe
+description: Mistral Vibe CLI
+command: vibe-acp
+install: uv tool install mistral-vibe
+auth: run `vibe` once to configure your Mistral API key
+models:
+  - default
+status: verified
+homepage: https://github.com/mistralai/mistral-vibe

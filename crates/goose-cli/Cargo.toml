@@ -69,6 +69,7 @@ sha2 = { workspace = true }
 clap_complete_nushell = { version = "4", default-features = false }
 libc = "0.2.186"
 ignore.workspace = true
+include_dir = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 anstream = { version = "1", default-features = false, features = ["wincon"] }

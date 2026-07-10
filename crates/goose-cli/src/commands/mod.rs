@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod configure;
 pub mod doctor;
 pub mod herd;

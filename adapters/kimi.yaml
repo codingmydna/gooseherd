@@ -1,0 +1,9 @@
+name: kimi
+description: Kimi CLI (Moonshot AI)
+command: kimi acp
+install: curl -LsSf https://code.kimi.com/install.sh | bash
+auth: run `kimi` once and complete `/login`
+models:
+  - kimi-k2.6
+status: verified
+homepage: https://github.com/MoonshotAI/kimi-cli

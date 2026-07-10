@@ -12,6 +12,7 @@ use goose::providers::generic_acp::{
     GOOSE_ACP_AGENTS_KEY,
 };
 
+use crate::commands::adapters::{catalog, example_model, unknown_name_error, AdapterEntry};
 use crate::session::{gate_banner_line, resolve_gates, GateSource};
 
 const CLAUDE_ADAPTER: &str = "claude-agent-acp";
@@ -187,6 +188,127 @@ fn check_generic_acp_agents(config: &Config) -> Vec<Check> {
     checks
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum CatalogState {
+    Configured,
+    InstalledNotConfigured,
+    NotInstalled,
+}
+
+fn catalog_state(config: &Config, entry: &AdapterEntry) -> CatalogState {
+    if read_acp_agents(config).is_ok_and(|agents| agents.contains_key(&entry.name)) {
+        return CatalogState::Configured;
+    }
+
+    let installed = parse_acp_command(entry.command.command())
+        .ok()
+        .and_then(|(program, _)| resolve_binary(&program))
+        .is_some();
+    if installed {
+        CatalogState::InstalledNotConfigured
+    } else {
+        CatalogState::NotInstalled
+    }
+}
+
+fn format_catalog_entry(entry: &AdapterEntry, state: &CatalogState) -> String {
+    match state {
+        CatalogState::Configured => format!(
+            "✓ {} — {} (configured as {})",
+            entry.name,
+            entry.description,
+            generic_acp_provider_name(&entry.name)
+        ),
+        CatalogState::InstalledNotConfigured => format!(
+            "○ {} — {} (installed — run `goose herd add {}`)",
+            entry.name, entry.description, entry.name
+        ),
+        CatalogState::NotInstalled => format!(
+            "✗ {} — {} (not installed — {})",
+            entry.name, entry.description, entry.install
+        ),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddOutcome {
+    Added,
+    AlreadyConfigured,
+    Overwritten,
+}
+
+pub fn add_agent(config: &Config, name: &str, force: bool) -> Result<AddOutcome> {
+    let entries = catalog()?;
+    let entry = entries
+        .get(name)
+        .ok_or_else(|| unknown_name_error(name, &entries))?;
+    let mut agents = read_acp_agents(config)?;
+
+    if agents.contains_key(name) && !force {
+        return Ok(AddOutcome::AlreadyConfigured);
+    }
+
+    let outcome = if agents
+        .insert(name.to_string(), entry.command.clone())
+        .is_some()
+    {
+        AddOutcome::Overwritten
+    } else {
+        AddOutcome::Added
+    };
+    config.set_param(GOOSE_ACP_AGENTS_KEY, &agents)?;
+    Ok(outcome)
+}
+
+pub async fn handle_herd_add(name: &str, force: bool) -> Result<()> {
+    let config = Config::global();
+    let outcome = add_agent(config, name, force)?;
+    if outcome == AddOutcome::AlreadyConfigured {
+        println!(
+            "{} is already configured as {}. Use --force to overwrite it.",
+            name,
+            generic_acp_provider_name(name)
+        );
+        return Ok(());
+    }
+
+    let entries = catalog()?;
+    let entry = &entries[name];
+    println!(
+        "{} configured {} as {}.",
+        style("✓").green(),
+        name,
+        generic_acp_provider_name(name)
+    );
+    println!();
+    println!("{}", style("Next steps:").bold());
+    if parse_acp_command(entry.command.command())
+        .ok()
+        .and_then(|(program, _)| resolve_binary(&program))
+        .is_none()
+    {
+        println!("  install: {}", entry.install);
+    }
+    println!("  authenticate: {}", entry.auth);
+
+    let env_refs = entry
+        .command
+        .env()
+        .values()
+        .flat_map(|value| env_var_refs(value))
+        .collect::<BTreeSet<_>>();
+    for env_ref in env_refs {
+        println!("  environment: export {env_ref}, or store it with `goose configure`");
+    }
+    println!(
+        "  assign a role: /roles implementer={}/{}",
+        generic_acp_provider_name(name),
+        example_model(entry)
+    );
+    println!("  verify: goose herd");
+    Ok(())
+}
+
 fn roles_configured(config: &Config) -> bool {
     config.get_param::<String>("GOOSE_PLANNER_PROVIDER").is_ok()
         && config
@@ -280,6 +402,23 @@ pub async fn handle_herd() -> Result<()> {
         .chain(generic_acp_checks.iter())
     {
         print_check(check);
+    }
+
+    println!();
+    println!("{}", style("Agent catalog:").bold());
+    match catalog() {
+        Ok(entries) => {
+            for entry in entries.values() {
+                println!(
+                    "  {}",
+                    format_catalog_entry(entry, &catalog_state(config, entry))
+                );
+            }
+        }
+        Err(error) => println!(
+            "  {} could not load agent catalog: {error}",
+            style("!").yellow()
+        ),
     }
 
     let role_check = if roles_ok {
@@ -525,5 +664,110 @@ mod tests {
             .fix
             .as_deref()
             .is_some_and(|fix| fix.contains("could not parse")));
+    }
+
+    #[test]
+    fn add_agent_to_empty_config() {
+        let config = test_config();
+
+        assert_eq!(
+            add_agent(&config, "gemini", false).unwrap(),
+            AddOutcome::Added
+        );
+        assert_eq!(
+            read_acp_agents(&config).unwrap()["gemini"],
+            AcpAgentSpec::Command("gemini --acp".to_string())
+        );
+    }
+
+    #[test]
+    fn add_agent_preserves_existing_entries() {
+        let config = test_config();
+        let custom = AcpAgentSpec::Command("custom-agent --acp".to_string());
+        config
+            .set_param(
+                GOOSE_ACP_AGENTS_KEY,
+                BTreeMap::from([("mycustom".to_string(), custom.clone())]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            add_agent(&config, "kimi", false).unwrap(),
+            AddOutcome::Added
+        );
+        let agents = read_acp_agents(&config).unwrap();
+        assert_eq!(agents["mycustom"], custom);
+        assert_eq!(agents["kimi"].command(), "kimi acp");
+    }
+
+    #[test]
+    fn add_agent_duplicate_is_a_no_op() {
+        let config = test_config();
+        let custom = AcpAgentSpec::Command("my-gemini --acp".to_string());
+        config
+            .set_param(
+                GOOSE_ACP_AGENTS_KEY,
+                BTreeMap::from([("gemini".to_string(), custom.clone())]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            add_agent(&config, "gemini", false).unwrap(),
+            AddOutcome::AlreadyConfigured
+        );
+        assert_eq!(read_acp_agents(&config).unwrap()["gemini"], custom);
+    }
+
+    #[test]
+    fn add_agent_force_overwrites_existing_entry() {
+        let config = test_config();
+        config
+            .set_param(
+                GOOSE_ACP_AGENTS_KEY,
+                BTreeMap::from([(
+                    "gemini".to_string(),
+                    AcpAgentSpec::Command("my-gemini --acp".to_string()),
+                )]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            add_agent(&config, "gemini", true).unwrap(),
+            AddOutcome::Overwritten
+        );
+        assert_eq!(
+            read_acp_agents(&config).unwrap()["gemini"],
+            AcpAgentSpec::Command("gemini --acp".to_string())
+        );
+    }
+
+    #[test]
+    fn add_agent_unknown_name_lists_catalog() {
+        let message = add_agent(&test_config(), "missing", false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(message.contains("unknown agent `missing`"));
+        for name in ["gemini", "glm", "kimi", "opencode", "vibe"] {
+            assert!(message.contains(name));
+        }
+    }
+
+    #[test]
+    fn formats_catalog_states() {
+        let entry = catalog().unwrap().remove("gemini").unwrap();
+
+        assert_eq!(
+            format_catalog_entry(&entry, &CatalogState::Configured),
+            "✓ gemini — Google Gemini CLI (configured as gemini-acp)"
+        );
+        assert_eq!(
+            format_catalog_entry(&entry, &CatalogState::InstalledNotConfigured),
+            "○ gemini — Google Gemini CLI (installed — run `goose herd add gemini`)"
+        );
+        assert_eq!(
+            format_catalog_entry(&entry, &CatalogState::NotInstalled),
+            "✗ gemini — Google Gemini CLI (not installed — npm install -g @google/gemini-cli)"
+        );
     }
 }

@@ -1,0 +1,9 @@
+name: opencode
+description: opencode CLI
+command: opencode acp
+install: npm install -g opencode-ai
+auth: opencode auth login
+models:
+  - default
+status: verified
+homepage: https://opencode.ai

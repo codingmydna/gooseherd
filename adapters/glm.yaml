@@ -1,0 +1,13 @@
+name: glm
+description: GLM 5.2 (Z.ai) through the claude-agent-acp adapter
+command:
+  command: claude-agent-acp
+  env:
+    ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
+    ANTHROPIC_AUTH_TOKEN: ${ZAI_API_KEY}
+install: npm install -g @agentclientprotocol/claude-agent-acp
+auth: export ZAI_API_KEY or store it with `goose configure` (secret ZAI_API_KEY)
+models:
+  - glm-5.2
+status: community
+homepage: https://z.ai

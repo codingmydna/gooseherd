@@ -1935,6 +1935,7 @@ dependencies = [
  "goose-mcp",
  "goose-providers",
  "ignore",
+ "include_dir",
  "indicatif",
  "libc",
  "open",

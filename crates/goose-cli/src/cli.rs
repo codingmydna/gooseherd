@@ -631,6 +631,17 @@ enum WorktreeCommand {
 }
 
 #[derive(Subcommand)]
+enum HerdCommand {
+    /// Add an ACP agent from the built-in catalog
+    Add {
+        #[arg(help = "Agent catalog name")]
+        name: String,
+        #[arg(long, help = "Overwrite an existing agent with the catalog entry")]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Configure goose settings
     #[command(about = "Configure goose settings")]
@@ -652,7 +663,10 @@ enum Command {
     #[command(
         about = "Check your multi-model setup (claude-acp + codex-acp) and offer the recommended split-role config"
     )]
-    Herd {},
+    Herd {
+        #[command(subcommand)]
+        command: Option<HerdCommand>,
+    },
 
     /// Manage system prompts and behaviors
     #[command(about = "Run one of the mcp servers bundled with goose")]
@@ -1021,7 +1035,7 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
     match command {
         Some(Command::Configure {}) => "configure",
         Some(Command::Doctor {}) => "doctor",
-        Some(Command::Herd {}) => "herd",
+        Some(Command::Herd { .. }) => "herd",
         Some(Command::Info { .. }) => "info",
         Some(Command::Mcp { .. }) => "mcp",
         Some(Command::Session { .. }) => "session",
@@ -1670,7 +1684,12 @@ pub async fn cli() -> anyhow::Result<()> {
         }
         Some(Command::Configure {}) => handle_configure().await,
         Some(Command::Doctor {}) => crate::commands::doctor::handle_doctor().await,
-        Some(Command::Herd {}) => crate::commands::herd::handle_herd().await,
+        Some(Command::Herd { command }) => match command {
+            Some(HerdCommand::Add { name, force }) => {
+                crate::commands::herd::handle_herd_add(&name, force).await
+            }
+            None => crate::commands::herd::handle_herd().await,
+        },
         Some(Command::Info { verbose, check }) => handle_info(verbose, check).await,
         Some(Command::Mcp { server }) => handle_mcp_command(server).await,
         Some(Command::Session {
