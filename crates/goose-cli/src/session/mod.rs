@@ -21,6 +21,7 @@ mod task_execution_display;
 mod terminal_setup;
 mod thinking;
 mod ux;
+mod verdict;
 mod worktree;
 
 use crate::session::task_execution_display::{

@@ -622,7 +622,7 @@ impl Provider for AcpProvider {
     async fn stream(
         &self,
         model_config: &ModelConfig,
-        _system: &str,
+        system: &str,
         messages: &[Message],
         _tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
@@ -636,6 +636,10 @@ impl Provider for AcpProvider {
 
         let claim = self.claim_handoff_context(messages);
         let prompt_blocks = messages_to_prompt(messages, claim.include_context);
+        // ACP has no separate system channel, so a non-empty system prompt
+        // (e.g. the orchestration playbook injection) is folded into the first
+        // prompt block. Without this the system prompt is silently dropped.
+        let prompt_blocks = fold_system_into_prompt(system, prompt_blocks);
         // Drop any tool-call buffer state left over from a prior prompt
         // (e.g. cancelled or interrupted before its terminal status arrived).
         if let Ok(mut buffer) = self.pending_tool_updates.lock() {
@@ -1592,6 +1596,26 @@ fn filter_supported_servers(
         .collect()
 }
 
+/// Fold a non-empty `system` prompt into the front of the ACP prompt blocks.
+///
+/// ACP carries no separate system channel, so the system prompt is prepended to
+/// the first text block as a delimited `<system-context>` preamble (or inserted
+/// as a standalone leading text block when the first block is not text). An
+/// empty system prompt leaves the blocks untouched.
+fn fold_system_into_prompt(system: &str, mut blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    if system.trim().is_empty() {
+        return blocks;
+    }
+    let preamble = format!("<system-context>\n{system}\n</system-context>\n\n");
+    match blocks.first_mut() {
+        Some(ContentBlock::Text(text)) => {
+            text.text = format!("{preamble}{}", text.text);
+        }
+        _ => blocks.insert(0, ContentBlock::Text(TextContent::new(preamble))),
+    }
+    blocks
+}
+
 fn messages_to_prompt(messages: &[Message], include_handoff_context: bool) -> Vec<ContentBlock> {
     let mut content_blocks = Vec::new();
 
@@ -2315,6 +2339,49 @@ mod tests {
 
         assert_eq!(blocks.len(), 1);
         assert_eq!(prompt_text(&blocks[0]), "current request");
+    }
+
+    #[test]
+    fn fold_system_into_prompt_leaves_blocks_unchanged_when_system_empty() {
+        let blocks = vec![ContentBlock::Text(TextContent::new("current request"))];
+
+        let folded = fold_system_into_prompt("   ", blocks);
+
+        assert_eq!(folded.len(), 1);
+        assert_eq!(prompt_text(&folded[0]), "current request");
+    }
+
+    #[test]
+    fn fold_system_into_prompt_prepends_delimited_preamble_preserving_original() {
+        let blocks = vec![ContentBlock::Text(TextContent::new("current request"))];
+
+        let folded = fold_system_into_prompt("PLAYBOOK BODY", blocks);
+
+        assert_eq!(folded.len(), 1);
+        let text = prompt_text(&folded[0]);
+        assert_eq!(
+            text,
+            "<system-context>\nPLAYBOOK BODY\n</system-context>\n\ncurrent request"
+        );
+        assert!(text.contains("PLAYBOOK BODY"));
+        assert!(text.ends_with("current request"));
+    }
+
+    #[test]
+    fn fold_system_into_prompt_inserts_leading_block_when_first_is_not_text() {
+        let blocks = vec![ContentBlock::Image(ImageContent::new(
+            "base64-image",
+            "image/png",
+        ))];
+
+        let folded = fold_system_into_prompt("PLAYBOOK BODY", blocks);
+
+        assert_eq!(folded.len(), 2);
+        assert_eq!(
+            prompt_text(&folded[0]),
+            "<system-context>\nPLAYBOOK BODY\n</system-context>\n\n"
+        );
+        assert!(matches!(folded[1], ContentBlock::Image(_)));
     }
 
     #[test]

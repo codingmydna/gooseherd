@@ -138,8 +138,39 @@ pub(super) fn implement_policy_label(policy: OrchImplementPolicy, is_acp: bool) 
     }
 }
 
-pub(super) fn role_system_prompt(base: &str, role: &RoleConfig) -> String {
-    build_role_system_prompt(base, role, playbook_mode())
+/// Whether the orchestration user message should carry the base role
+/// instructions. Native providers receive both the instructions and the
+/// operating playbook through the `system` prompt, so the user message omits
+/// them. ACP providers keep the base instructions in the user message; their
+/// system prompt — folded into the first prompt block by the ACP client —
+/// then carries only the playbook, so the instructions are never duplicated.
+pub(super) fn instructions_in_user_message(provider_name: &str) -> bool {
+    is_acp_provider(provider_name)
+}
+
+/// Instruction preamble to prepend to an orchestration user message for a role,
+/// empty for native providers (see [`instructions_in_user_message`]).
+pub(super) fn user_instruction_preamble(instructions: &str, role: &RoleConfig) -> String {
+    if instructions_in_user_message(&role.provider_name) {
+        format!("{instructions}\n\n---\n\n")
+    } else {
+        String::new()
+    }
+}
+
+/// System prompt to pass to `stream` for an orchestration planner/reviewer role.
+/// Native providers receive the base instructions plus the operating playbook.
+/// ACP providers receive only the playbook — their base instructions travel in
+/// the user message (see [`instructions_in_user_message`]) and this system
+/// prompt is folded into the first prompt block by the ACP client.
+pub(super) fn role_stream_system_prompt(base: &str, role: &RoleConfig) -> String {
+    if instructions_in_user_message(&role.provider_name) {
+        build_role_system_prompt("", role, playbook_mode())
+            .trim_start()
+            .to_string()
+    } else {
+        build_role_system_prompt(base, role, playbook_mode())
+    }
 }
 
 fn build_role_system_prompt(base: &str, role: &RoleConfig, mode: InjectionMode) -> String {
@@ -217,5 +248,70 @@ mod tests {
 
         assert!(prompt.contains("# Operating playbook"));
         assert!(prompt.contains(PLAYBOOK_PREAMBLE));
+    }
+
+    #[test]
+    fn instructions_kept_in_user_message_only_for_acp_providers() {
+        assert!(instructions_in_user_message("claude-acp"));
+        assert!(instructions_in_user_message("codex-acp"));
+        assert!(!instructions_in_user_message("openai"));
+        assert!(!instructions_in_user_message("anthropic"));
+    }
+
+    #[test]
+    fn user_instruction_preamble_present_for_acp_absent_for_native() {
+        assert_eq!(
+            user_instruction_preamble("INSTRUCTIONS", &role("claude-acp", "opus")),
+            "INSTRUCTIONS\n\n---\n\n"
+        );
+        assert_eq!(
+            user_instruction_preamble("INSTRUCTIONS", &role("openai", "gpt-5.5")),
+            ""
+        );
+    }
+
+    #[test]
+    fn native_stream_system_carries_instructions_acp_carries_playbook_only() {
+        // Native, non-fable: full instructions + playbook in the system prompt.
+        let native = role_stream_system_prompt_with_mode(
+            "INSTRUCTIONS",
+            &role("openai", "gpt-5.5"),
+            InjectionMode::Auto,
+        );
+        assert!(native.contains("INSTRUCTIONS"));
+        assert!(native.contains("# Operating playbook"));
+
+        // ACP, non-fable: playbook only — the base instructions travel in the
+        // user message, so the system prompt must not duplicate them.
+        let acp = role_stream_system_prompt_with_mode(
+            "INSTRUCTIONS",
+            &role("claude-acp", "opus"),
+            InjectionMode::Auto,
+        );
+        assert!(!acp.contains("INSTRUCTIONS"));
+        assert!(acp.starts_with("# Operating playbook"));
+
+        // ACP, fable: no playbook injection, so the system prompt is empty and
+        // the folding step becomes a no-op.
+        let acp_fable = role_stream_system_prompt_with_mode(
+            "INSTRUCTIONS",
+            &role("claude-acp", "claude-fable-5"),
+            InjectionMode::Auto,
+        );
+        assert_eq!(acp_fable, "");
+    }
+
+    fn role_stream_system_prompt_with_mode(
+        base: &str,
+        role: &RoleConfig,
+        mode: InjectionMode,
+    ) -> String {
+        if instructions_in_user_message(&role.provider_name) {
+            build_role_system_prompt("", role, mode)
+                .trim_start()
+                .to_string()
+        } else {
+            build_role_system_prompt(base, role, mode)
+        }
     }
 }

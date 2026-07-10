@@ -16,14 +16,15 @@ use super::gates::{
 use super::limits::handle_phase_error;
 use super::phases::{
     archive_pending_reviews, gate_banner, orch_phase_idle_timeout, orch_progress_cadence,
-    parse_verdict_approved, partial_completion_text, persist_artifact, phase_banner, record_phase,
-    stream_role_completion, stream_role_completion_status, warn_truncated, PendingReviewArchive,
-    PhaseMeta, PhasePolicySummary, EVIDENCE_CHAR_LIMIT, REVIEW_SYSTEM_PROMPT,
+    partial_completion_text, persist_artifact, phase_banner, record_phase, stream_role_completion,
+    stream_role_completion_status, warn_truncated, PendingReviewArchive, PhaseMeta,
+    PhasePolicySummary, EVIDENCE_CHAR_LIMIT, REVIEW_SYSTEM_PROMPT,
 };
 use super::planner::run_plan_phase;
 use super::roles::{
     build_role_provider, implement_policy_label, is_acp_provider, playbook_banner_fragment,
-    playbook_text, resolve_all_roles, role_system_prompt, RoleConfig,
+    playbook_text, resolve_all_roles, role_stream_system_prompt, user_instruction_preamble,
+    RoleConfig,
 };
 use super::workspace::{
     finalize_worktree_approval, git_evidence, render_workspace_banner, setup_orch_workspace,
@@ -32,6 +33,7 @@ use super::{
     resolve_orch_implement_policy, OrchImplementPolicy, OrchOutcome, DEFAULT_MAX_CYCLES,
     DEFAULT_MAX_GATE_RETRIES, GATES_KEY, MAX_CYCLES_KEY, MAX_GATE_RETRIES_KEY,
 };
+use crate::session::verdict::{self, ReviewVerdict};
 
 impl CliSession {
     pub(crate) async fn handle_orchestrate(
@@ -507,8 +509,8 @@ impl CliSession {
                 warn_truncated("git evidence", evidence.full.len(), &run_id);
             }
             let mut review_request_text = format!(
-                "{}\n\n---\n\nTask:\n{}\n\nPlan:\n{}\n\nGit evidence:\n{}\n\nImplementer report:\n{}\n\nWorking directory: {}{}",
-                REVIEW_SYSTEM_PROMPT,
+                "{}Task:\n{}\n\nPlan:\n{}\n\nGit evidence:\n{}\n\nImplementer report:\n{}\n\nWorking directory: {}{}",
+                user_instruction_preamble(REVIEW_SYSTEM_PROMPT, reviewer_role),
                 task,
                 plan_text,
                 evidence.text,
@@ -527,7 +529,7 @@ impl CliSession {
                 Some((cycle, max_cycles)),
                 orch_progress_cadence(),
             );
-            let reviewer_system = role_system_prompt(REVIEW_SYSTEM_PROMPT, reviewer_role);
+            let reviewer_system = role_stream_system_prompt(REVIEW_SYSTEM_PROMPT, reviewer_role);
             let (review_text, review_usage) = if let Some(timeout) = role_idle_timeout {
                 let completion = match stream_role_completion_status(
                     &reviewer,
@@ -606,14 +608,28 @@ impl CliSession {
                 &review_text,
             );
             let reviewer_context_limit = reviewer.get_context_limit(&reviewer_model).await.ok();
-            let approved = parse_verdict_approved(&review_text);
-            let verdict = if approved {
-                "APPROVED"
-            } else if review_text.contains("VERDICT:") {
-                "REVISE"
-            } else {
-                "NO_VERDICT"
+            let review_verdict = match verdict::parse_review_verdict(&review_text) {
+                Some(review_verdict) => review_verdict,
+                None => {
+                    println!(
+                        "  {}",
+                        console::style(
+                            "reviewer verdict line missing or malformed; reprompting once"
+                        )
+                        .yellow()
+                    );
+                    self.reprompt_review_verdict(
+                        &reviewer,
+                        &reviewer_model,
+                        &reviewer_system,
+                        &review_request,
+                        &review_text,
+                    )
+                    .await
+                }
             };
+            let approved = review_verdict.approved();
+            let verdict = review_verdict.ledger_str();
             pending_review_archives.push(PendingReviewArchive {
                 cycle,
                 verdict: verdict.to_string(),
@@ -678,5 +694,33 @@ impl CliSession {
             );
         }
         Ok(OrchOutcome::MaxCycles)
+    }
+
+    /// One bounded reprompt when the reviewer omitted or malformed its verdict
+    /// line. Replays the review request and the reviewer's reply, asks for only
+    /// the verdict line, and falls back to `NoVerdict` if that also fails.
+    async fn reprompt_review_verdict(
+        &self,
+        reviewer: &Arc<dyn goose::providers::base::Provider>,
+        reviewer_model: &goose_providers::model::ModelConfig,
+        reviewer_system: &str,
+        review_request: &Message,
+        review_text: &str,
+    ) -> ReviewVerdict {
+        let messages = vec![
+            review_request.clone(),
+            Message::assistant().with_text(review_text),
+            Message::user().with_text(verdict::REVIEW_REPROMPT),
+        ];
+        match goose::session_context::with_session_id(
+            Some(self.session_id.clone()),
+            reviewer.complete(reviewer_model, reviewer_system, &messages, &[]),
+        )
+        .await
+        {
+            Ok((message, _usage)) => verdict::parse_review_verdict(&message.as_concat_text())
+                .unwrap_or(ReviewVerdict::NoVerdict),
+            Err(_) => ReviewVerdict::NoVerdict,
+        }
     }
 }

@@ -25,12 +25,17 @@ pub(super) const EVIDENCE_CHAR_LIMIT: usize = 30_000;
 
 const PLAN_SYSTEM_PROMPT: &str = r#"You are the planning lead in a two-model workflow. A separate implementer model will execute your plan with file-editing and shell tools. Your session is read-only: you can explore the working directory but cannot modify anything.
 
-Produce a concrete, step-by-step implementation plan for the given task:
-- Explore freely: read files, search, and delegate read-only subagent explorations (in parallel when useful). File modifications will be denied by policy; shell commands are denied unless the session allows them — do not retry denied calls.
-- List the files to create or modify and what changes each needs.
-- Define acceptance criteria and how the implementer should verify the result (commands to run, expected output).
-- Keep the plan focused; do not attempt to implement the changes yourself.
-- Even if some exploration is blocked, always deliver your best plan from what you could read.
+Produce a concrete, step-by-step implementation plan for the given task. Explore freely first: read files, search, and delegate read-only subagent explorations (in parallel when useful). File modifications will be denied by policy; shell commands are denied unless the session allows them — do not retry denied calls. Even if some exploration is blocked, always deliver your best plan from what you could read. Do not implement the changes yourself.
+
+Structure the plan with exactly these markdown sections, in this order:
+## Files
+The files to create or modify, each with the change it needs.
+## Steps
+The ordered implementation steps.
+## Acceptance criteria
+Each criterion a concrete, checkable statement of done.
+## Verification
+The commands the implementer should run and the expected outcome of each.
 
 Output only the plan."#;
 
@@ -101,12 +106,99 @@ pub(super) fn plan_quality_action(
     }
 }
 
-pub(super) fn parse_verdict_approved(review: &str) -> bool {
-    review
-        .lines()
-        .find_map(|l| l.split_once("VERDICT:"))
-        .map(|(_, after)| after.contains("APPROVED"))
-        .unwrap_or(false)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanSection {
+    Files,
+    Steps,
+    AcceptanceCriteria,
+    Verification,
+}
+
+impl PlanSection {
+    const ALL: [PlanSection; 4] = [
+        PlanSection::Files,
+        PlanSection::Steps,
+        PlanSection::AcceptanceCriteria,
+        PlanSection::Verification,
+    ];
+
+    fn keyword(self) -> &'static str {
+        match self {
+            PlanSection::Files => "files",
+            PlanSection::Steps => "steps",
+            PlanSection::AcceptanceCriteria => "acceptance criteria",
+            PlanSection::Verification => "verification",
+        }
+    }
+
+    pub(super) fn header(self) -> &'static str {
+        match self {
+            PlanSection::Files => "## Files",
+            PlanSection::Steps => "## Steps",
+            PlanSection::AcceptanceCriteria => "## Acceptance criteria",
+            PlanSection::Verification => "## Verification",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanStructureAction {
+    Accept,
+    Reprompt,
+    ProceedWithWarning,
+}
+
+/// Required plan sections absent from `plan`. Tolerant: headers match
+/// case-insensitively, both `## ` and `### ` are accepted, extra sections are
+/// allowed, and a header matches a section when its text begins with the
+/// section name (so `## Verification commands` satisfies Verification).
+pub(super) fn validate_plan_structure(plan: &str) -> Vec<PlanSection> {
+    let headers: Vec<String> = plan.lines().filter_map(normalized_plan_header).collect();
+    PlanSection::ALL
+        .into_iter()
+        .filter(|section| {
+            !headers
+                .iter()
+                .any(|header| header.starts_with(section.keyword()))
+        })
+        .collect()
+}
+
+fn normalized_plan_header(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("##") {
+        return None;
+    }
+    let text = trimmed.trim_start_matches('#').trim();
+    (!text.is_empty()).then(|| text.to_ascii_lowercase())
+}
+
+pub(super) fn plan_structure_action(
+    missing: &[PlanSection],
+    structure_retries: u32,
+) -> PlanStructureAction {
+    if missing.is_empty() {
+        PlanStructureAction::Accept
+    } else if structure_retries == 0 {
+        PlanStructureAction::Reprompt
+    } else {
+        PlanStructureAction::ProceedWithWarning
+    }
+}
+
+pub(super) fn missing_sections_label(missing: &[PlanSection]) -> String {
+    missing
+        .iter()
+        .map(|section| section.header())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(super) fn plan_structure_reprompt(missing: &[PlanSection]) -> String {
+    format!(
+        "Your plan is missing required section(s): {}. Re-emit the COMPLETE plan (not a patch) with every required section present: ## Files, ## Steps, ## Acceptance criteria, ## Verification. Do not ask questions.",
+        missing_sections_label(missing)
+    )
 }
 
 /// Appends an assistant text chunk to the collected role text. Streamed text
@@ -216,6 +308,7 @@ pub(super) fn warn_truncated(what: &str, full_len: usize, run_id: &str) {
     );
 }
 
+#[derive(Debug)]
 pub(super) struct RoleCompletion {
     pub(super) text: String,
     pub(super) usage: Option<ProviderUsage>,
@@ -262,29 +355,6 @@ pub(super) async fn stream_role_completion(
         session_id,
         debug,
         None,
-    )
-    .await?;
-    Ok((completion.text, completion.usage))
-}
-
-#[cfg(test)]
-async fn stream_role_completion_with_idle_timeout(
-    provider: &Arc<dyn Provider>,
-    model_config: &goose_providers::model::ModelConfig,
-    system: &str,
-    messages: &[Message],
-    session_id: &str,
-    debug: bool,
-    idle_timeout: Option<Duration>,
-) -> Result<(String, Option<ProviderUsage>)> {
-    let completion = stream_role_completion_status(
-        provider,
-        model_config,
-        system,
-        messages,
-        session_id,
-        debug,
-        idle_timeout,
     )
     .await?;
     Ok((completion.text, completion.usage))

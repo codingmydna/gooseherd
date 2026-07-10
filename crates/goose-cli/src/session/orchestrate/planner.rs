@@ -9,13 +9,17 @@ use std::time::Instant;
 use crate::session::{orch_ask, output, plan_exemplars};
 
 use super::phases::{
-    orch_ask_enabled, orch_max_question_rounds, orch_min_plan_chars, orch_phase_idle_timeout,
-    orch_progress_cadence, partial_completion_text, persist_artifact, phase_banner,
-    plan_quality_action, plan_round_action, planner_prompt, record_phase, record_question_round,
-    render_auto_answer_banner, stream_role_completion_status, PhaseMeta, PlanQualityAction,
-    PlanRoundAction,
+    missing_sections_label, orch_ask_enabled, orch_max_question_rounds, orch_min_plan_chars,
+    orch_phase_idle_timeout, orch_progress_cadence, partial_completion_text, persist_artifact,
+    phase_banner, plan_quality_action, plan_round_action, plan_structure_action,
+    plan_structure_reprompt, planner_prompt, record_phase, record_question_round,
+    render_auto_answer_banner, stream_role_completion_status, validate_plan_structure, PhaseMeta,
+    PlanQualityAction, PlanRoundAction, PlanStructureAction,
 };
-use super::roles::{build_role_provider, playbook_banner_fragment, role_system_prompt, RoleConfig};
+use super::roles::{
+    build_role_provider, playbook_banner_fragment, role_stream_system_prompt,
+    user_instruction_preamble, RoleConfig,
+};
 
 pub(super) struct PlanPhaseOutput {
     pub(super) plan_text: String,
@@ -68,15 +72,17 @@ pub(super) async fn run_plan_phase(
     let ask_enabled = orch_ask_enabled();
     let planner_instructions = planner_prompt(ask_enabled);
     let mut plan_request_text = format!(
-        "{}\n\n---\n\nTask:\n{}\n\nWorking directory: {}",
-        planner_instructions, task, working_dir
+        "{}Task:\n{}\n\nWorking directory: {}",
+        user_instruction_preamble(&planner_instructions, planner_role),
+        task,
+        working_dir
     );
     if let Some(prompt_section) = &plan_exemplar_injection.prompt_section {
         plan_request_text.push_str("\n\n---\n\n");
         plan_request_text.push_str(prompt_section);
     }
     let plan_request = Message::user().with_text(plan_request_text);
-    let planner_system = role_system_prompt(&planner_instructions, planner_role);
+    let planner_system = role_stream_system_prompt(&planner_instructions, planner_role);
     let max_question_rounds = orch_max_question_rounds();
     let ui_available = interactive && std::io::stdout().is_terminal();
     let mut planner_messages = vec![plan_request];
@@ -85,6 +91,8 @@ pub(super) async fn run_plan_phase(
     let mut force_final_plan = false;
     let min_plan_chars = orch_min_plan_chars();
     let mut short_plan_retries = 0;
+    let mut structure_retries = 0;
+    let mut plan_structure_note: Option<String> = None;
 
     let (mut plan_text, plan_usage) = loop {
         output::show_thinking();
@@ -190,6 +198,41 @@ pub(super) async fn run_plan_phase(
                         }
                     }
                 }
+                let missing_sections = validate_plan_structure(&planner_text);
+                match plan_structure_action(&missing_sections, structure_retries) {
+                    PlanStructureAction::Accept => {}
+                    PlanStructureAction::Reprompt => {
+                        structure_retries += 1;
+                        let label = missing_sections_label(&missing_sections);
+                        println!(
+                            "  {}",
+                            console::style(format!(
+                                "planner plan is missing required section(s) ({label}); reprompting once for the full plan"
+                            ))
+                            .yellow()
+                            .bold()
+                        );
+                        planner_messages.push(Message::assistant().with_text(planner_text));
+                        planner_messages.push(
+                            Message::user().with_text(plan_structure_reprompt(&missing_sections)),
+                        );
+                        force_final_plan = true;
+                        continue;
+                    }
+                    PlanStructureAction::ProceedWithWarning => {
+                        let label = missing_sections_label(&missing_sections);
+                        println!(
+                            "  {}",
+                            console::style(format!(
+                                "planner plan still missing required section(s) ({label}) after reprompt; proceeding with the plan as-is"
+                            ))
+                            .yellow()
+                            .bold()
+                        );
+                        plan_structure_note =
+                            Some(format!("plan structure incomplete: missing {label}"));
+                    }
+                }
                 break (planner_text, completion.usage);
             }
             PlanRoundAction::Ask => {
@@ -276,7 +319,7 @@ pub(super) async fn run_plan_phase(
         plan_usage.as_ref(),
         planner_context_limit,
         phase_started.elapsed().as_millis() as u64,
-        None,
+        plan_structure_note.as_deref(),
         None,
         Some(&plan_exemplar_injection),
         None,

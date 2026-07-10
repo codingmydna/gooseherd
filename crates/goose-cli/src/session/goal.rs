@@ -138,35 +138,34 @@ impl GoalRunStats {
 }
 
 pub(super) fn parse_goal_verdict(text: &str) -> GoalVerdict {
-    let lines = text.lines().collect::<Vec<_>>();
-    for (index, line) in lines.iter().enumerate() {
-        let Some((met, inline_reason)) = parse_verdict_line(line) else {
-            continue;
-        };
-        let mut reason_parts = Vec::new();
-        if !inline_reason.is_empty() {
-            reason_parts.push(inline_reason);
-        }
-        reason_parts.extend(
-            lines
-                .iter()
-                .skip(index + 1)
-                .map(|line| line.trim())
-                .filter(|line| !line.is_empty())
-                .map(ToString::to_string),
-        );
-        let reason = reason_parts.join("\n");
-        return if met {
-            GoalVerdict::Met(default_reason(reason, "Evaluator marked the goal met."))
-        } else {
-            GoalVerdict::NotMet(default_reason(reason, "Evaluator marked the goal not met."))
-        };
-    }
+    // Last verdict line wins (shared verdict protocol): rubric echoes and quoted
+    // tokens earlier in the reply lose to the evaluator's closing verdict.
+    let Some((index, (met, inline_reason))) =
+        crate::session::verdict::last_line_match(text, parse_verdict_line)
+    else {
+        return GoalVerdict::NoVerdict(default_reason(
+            text.trim().to_string(),
+            "Evaluator did not return GOAL_MET or GOAL_NOT_MET.",
+        ));
+    };
 
-    GoalVerdict::NoVerdict(default_reason(
-        text.trim().to_string(),
-        "Evaluator did not return GOAL_MET or GOAL_NOT_MET.",
-    ))
+    let mut reason_parts = Vec::new();
+    if !inline_reason.is_empty() {
+        reason_parts.push(inline_reason);
+    }
+    reason_parts.extend(
+        text.lines()
+            .skip(index + 1)
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string),
+    );
+    let reason = reason_parts.join("\n");
+    if met {
+        GoalVerdict::Met(default_reason(reason, "Evaluator marked the goal met."))
+    } else {
+        GoalVerdict::NotMet(default_reason(reason, "Evaluator marked the goal not met."))
+    }
 }
 
 fn parse_verdict_line(line: &str) -> Option<(bool, String)> {
@@ -384,6 +383,23 @@ fn provider_usage_total(usage: &ProviderUsage) -> i64 {
             },
         )
         .unwrap_or(0) as i64
+}
+
+fn combine_provider_usage(first: &ProviderUsage, second: &ProviderUsage) -> ProviderUsage {
+    let opt_add = |a: Option<i32>, b: Option<i32>| match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    ProviderUsage::new(
+        first.model.clone(),
+        Usage::new(
+            opt_add(first.usage.input_tokens, second.usage.input_tokens),
+            opt_add(first.usage.output_tokens, second.usage.output_tokens),
+            opt_add(first.usage.total_tokens, second.usage.total_tokens),
+        ),
+    )
 }
 
 fn provider_usage_tokens(usage: Option<&ProviderUsage>) -> (Option<i64>, Option<i64>) {
@@ -661,11 +677,15 @@ impl CliSession {
             role.provider_name, role.model
         )));
         let assistant_text = self.goal_last_assistant_text().unwrap_or_default();
-        let request =
-            Message::user().with_text(evaluator_prompt(goal, attempt, &assistant_text, check));
+        let messages = vec![Message::user().with_text(evaluator_prompt(
+            goal,
+            attempt,
+            &assistant_text,
+            check,
+        ))];
         let completion = goose::session_context::with_session_id(
             Some(self.session_id.clone()),
-            provider.complete(&model_config, EVALUATOR_SYSTEM_PROMPT, &[request], &[]),
+            provider.complete(&model_config, EVALUATOR_SYSTEM_PROMPT, &messages, &[]),
         )
         .await
         .with_context(|| {
@@ -674,10 +694,56 @@ impl CliSession {
                 role.provider_name, role.model
             )
         });
+        let (message, usage) = match completion {
+            Ok(pair) => pair,
+            Err(err) => {
+                output::set_active_role_status(None);
+                output::set_thinking_context(None);
+                return Err(err);
+            }
+        };
+        let verdict = parse_goal_verdict(&message.as_concat_text());
+        let (verdict, usage) = if matches!(verdict, GoalVerdict::NoVerdict(_)) {
+            self.reprompt_goal_verdict(&provider, &model_config, messages, message, verdict, usage)
+                .await
+        } else {
+            (verdict, usage)
+        };
         output::set_active_role_status(None);
         output::set_thinking_context(None);
-        let (message, usage) = completion?;
-        Ok((parse_goal_verdict(&message.as_concat_text()), Some(usage)))
+        Ok((verdict, Some(usage)))
+    }
+
+    /// One bounded reprompt when the evaluator omitted its `GOAL_MET` /
+    /// `GOAL_NOT_MET` line. Replays the evaluation and the evaluator's reply,
+    /// asks for only the verdict line, and keeps the original no-verdict outcome
+    /// if that also fails.
+    async fn reprompt_goal_verdict(
+        &self,
+        provider: &std::sync::Arc<dyn goose::providers::base::Provider>,
+        model_config: &goose_providers::model::ModelConfig,
+        mut messages: Vec<Message>,
+        first_reply: Message,
+        no_verdict: GoalVerdict,
+        first_usage: ProviderUsage,
+    ) -> (GoalVerdict, ProviderUsage) {
+        messages.push(first_reply);
+        messages.push(Message::user().with_text(crate::session::verdict::GOAL_REPROMPT));
+        match goose::session_context::with_session_id(
+            Some(self.session_id.clone()),
+            provider.complete(model_config, EVALUATOR_SYSTEM_PROMPT, &messages, &[]),
+        )
+        .await
+        {
+            Ok((message, retry_usage)) => {
+                let combined = combine_provider_usage(&first_usage, &retry_usage);
+                match parse_goal_verdict(&message.as_concat_text()) {
+                    GoalVerdict::NoVerdict(_) => (no_verdict, combined),
+                    resolved => (resolved, combined),
+                }
+            }
+            Err(_) => (no_verdict, first_usage),
+        }
     }
 
     pub(super) async fn render_goal_status(&self) -> Result<()> {
@@ -919,6 +985,27 @@ mod tests {
             verdict,
             super::GoalVerdict::NotMet("Missing regression coverage.".to_string())
         );
+    }
+
+    #[test]
+    fn parse_goal_verdict_last_verdict_line_wins() {
+        // An early quoted verdict must lose to the evaluator's closing verdict.
+        let verdict = super::parse_goal_verdict(
+            "GOAL_MET looked plausible at first\nAfter re-checking:\nGOAL_NOT_MET\nThe check still fails.",
+        );
+
+        assert_eq!(
+            verdict,
+            super::GoalVerdict::NotMet("The check still fails.".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_goal_verdict_without_marker_is_no_verdict() {
+        assert!(matches!(
+            super::parse_goal_verdict("The goal looks done to me, nice work."),
+            super::GoalVerdict::NoVerdict(_)
+        ));
     }
 
     #[test]
