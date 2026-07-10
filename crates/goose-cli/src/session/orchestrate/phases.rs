@@ -60,11 +60,9 @@ Review rubric:
 - Keep no-fix-needed observations separate from blocking defects.
 - If REVISE, use a numbered list where each defect includes location, mechanism, reproduction/evidence, and fix direction.
 
-Your reply MUST start with exactly one of these lines:
+Write your analysis first — for REVISE, a numbered list of concrete, actionable defects (file, problem, required fix); only demand changes for real problems, do not invent nitpicks. Then END your reply with exactly one of these two lines, and use the token `VERDICT:` nowhere else in the reply:
 VERDICT: APPROVED
-VERDICT: REVISE
-
-If REVISE, follow with a numbered list of concrete, actionable defects (file, problem, required fix). Only demand changes for real problems; do not invent nitpicks."#;
+VERDICT: REVISE"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanRoundAction {
@@ -392,7 +390,7 @@ pub(super) fn planner_prompt(ask_enabled: bool) -> String {
     }
 }
 
-pub(super) fn orch_phase_idle_timeout() -> Duration {
+pub(crate) fn orch_phase_idle_timeout() -> Duration {
     let secs = Config::global()
         .get_param::<u64>(PHASE_IDLE_TIMEOUT_KEY)
         .ok()
@@ -678,6 +676,7 @@ pub(super) fn record_phase(
     policy: Option<&PhasePolicySummary>,
     plan_exemplar_injection: Option<&exemplars::ExemplarInjection>,
     review_exemplar_injection: Option<&exemplars::ExemplarInjection>,
+    playbook_delivered: Option<bool>,
 ) {
     let reported_model = usage.map(|u| u.model.clone());
     let (input_tokens, output_tokens) = usage
@@ -769,7 +768,11 @@ pub(super) fn record_phase(
         review_exemplars_injected: review_exemplar_injection.map(|injection| injection.injected),
         review_exemplar_run_ids: review_exemplar_injection
             .map(|injection| injection.selected_run_ids.clone()),
-        playbook_injected: Some(playbook_injected(role_cfg)),
+        // Honest per-path delivery: ACP implementers never receive the playbook
+        // (it is not folded into their user instruction), so the caller passes
+        // the real value; plan/review roles fold it via the system prompt and
+        // fall back to the role-derived default.
+        playbook_injected: Some(playbook_delivered.unwrap_or_else(|| playbook_injected(role_cfg))),
         arena_rank: None,
         arena_winner: None,
     });

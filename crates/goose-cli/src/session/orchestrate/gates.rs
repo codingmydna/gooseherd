@@ -13,7 +13,7 @@ const GATE_OUTPUT_TAIL_LIMIT: usize = 4_000;
 const LOCAL_GATES_FILE: &str = ".goose-gates.yaml";
 const GATE_TIMEOUT_KEY: &str = "GOOSE_ORCH_GATE_TIMEOUT_SECS";
 const GATE_ENV_KEY: &str = "GOOSE_ORCH_GATE_ENV";
-const DEFAULT_GATE_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_GATE_TIMEOUT_SECS: u64 = 3600;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GateSource {
@@ -419,7 +419,11 @@ pub(super) async fn run_gates(impl_dir: &Path, gates: &[String]) -> GateOutcome 
             Ok(GateSpawn::TimedOut) => {
                 return GateOutcome::Failed {
                     command: command.clone(),
-                    output_tail: format!("timed out after {}s", timeout.as_secs()),
+                    output_tail: format!(
+                        "timed out after {}s (raise {} if this gate legitimately needs longer, e.g. a cold build)",
+                        timeout.as_secs(),
+                        GATE_TIMEOUT_KEY
+                    ),
                 };
             }
             Err(error) => {
@@ -432,9 +436,19 @@ pub(super) async fn run_gates(impl_dir: &Path, gates: &[String]) -> GateOutcome 
 
         let combined = combined_gate_output(&output);
         if !output.status.success() {
+            let mut output_tail = tail_truncate(&combined, GATE_OUTPUT_TAIL_LIMIT);
+            // A default-scrubbed env drops *_PASSWORD/_TOKEN/_SECRET and AWS_*,
+            // so a gate that needs service credentials fails with an opaque auth
+            // error; point the user at the escape hatch.
+            if env_mode == GateEnvMode::Scrub {
+                output_tail.push_str(&format!(
+                    "\n\n(gate env is scrubbed by default; set {}=inherit if this gate needs credentials)",
+                    GATE_ENV_KEY
+                ));
+            }
             return GateOutcome::Failed {
                 command: command.clone(),
-                output_tail: tail_truncate(&combined, GATE_OUTPUT_TAIL_LIMIT),
+                output_tail,
             };
         }
         runs.push(GateRun {
@@ -1074,8 +1088,36 @@ mod tests {
         match super::run_gates(temp.path(), &["sleep 30".to_string()]).await {
             super::GateOutcome::Failed { output_tail, .. } => {
                 assert!(output_tail.contains("timed out"), "{output_tail}");
+                // The timeout message names the knob to raise.
+                assert!(
+                    output_tail.contains("GOOSE_ORCH_GATE_TIMEOUT_SECS"),
+                    "{output_tail}"
+                );
             }
             super::GateOutcome::Passed { .. } => panic!("expected timeout failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_gates_failure_under_scrub_appends_env_hint() {
+        let _guard = env_lock::lock_env([
+            ("GOOSE_ORCH_GATE_ENV", Some("scrub")),
+            ("GOOSE_ORCH_GATE_TIMEOUT_SECS", Some("60")),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        match super::run_gates(temp.path(), &["false".to_string()]).await {
+            super::GateOutcome::Failed { output_tail, .. } => {
+                assert!(
+                    output_tail.contains("gate env is scrubbed by default"),
+                    "{output_tail}"
+                );
+                assert!(
+                    output_tail.contains("GOOSE_ORCH_GATE_ENV=inherit"),
+                    "{output_tail}"
+                );
+            }
+            super::GateOutcome::Passed { .. } => panic!("expected failing gate"),
         }
     }
 

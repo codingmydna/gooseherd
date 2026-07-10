@@ -338,6 +338,7 @@ pub(super) async fn run_plan_phase(
         None,
         Some(&plan_exemplar_injection),
         None,
+        None,
     );
 
     persist_artifact(artifact_dir, run_id, "plan.md", &plan_text);

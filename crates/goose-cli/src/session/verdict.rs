@@ -3,10 +3,14 @@
 //!
 //! All three ask a model to end its reply with a marker line (`VERDICT:
 //! APPROVED`, `GOAL_MET`, `RANKING: ...`). The rules are the same everywhere:
-//! the model's *last* verdict line wins (so rubric echoes and quoted tokens
-//! earlier in the reply are ignored), the token is exact-matched (so `NOT
-//! APPROVED` does not count as `APPROVED`), and a missing or malformed verdict
-//! earns exactly one bounded reprompt before falling back to no-verdict.
+//! the token is exact-matched (so `NOT APPROVED` does not count as `APPROVED`),
+//! and a missing or malformed verdict earns exactly one bounded reprompt before
+//! falling back to no-verdict. When a reply carries several verdict-marker lines
+//! that resolve to *conflicting* tokens (a real `VERDICT: REVISE` plus a quoted
+//! `VERDICT: APPROVED` in the defect list), it is treated as malformed so the
+//! reprompt — which asks for only the verdict line — can disambiguate, rather
+//! than letting either position silently win. Duplicate lines that agree on one
+//! token still parse.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum FinalToken {
@@ -48,19 +52,31 @@ fn canonical_match(token: &str, allowed: &[&str]) -> Option<String> {
         .map(|candidate| (*candidate).to_string())
 }
 
-/// Parse a model's final verdict token. Scans for the last line containing
-/// `marker`, then exact-matches (case-insensitively) the first token after the
-/// marker against `allowed`. Text before the marker on that line, and earlier
-/// verdict lines (rubric echoes), are ignored.
+/// Parse a model's final verdict token. Collects every line containing `marker`
+/// and, for each, exact-matches (case-insensitively) the first token after the
+/// marker against `allowed`. If the resolving lines agree on a single token it
+/// is [`FinalToken::Parsed`]; if two or more resolve to conflicting tokens the
+/// reply is [`FinalToken::Malformed`] (so a quoted opposite verdict cannot win);
+/// if no line resolves the last marker line is reported as malformed. Text
+/// before the marker on a line, and marker lines that resolve to nothing, are
+/// ignored unless no line resolves at all.
 pub(super) fn parse_final_token(text: &str, marker: &str, allowed: &[&str]) -> FinalToken {
-    let Some((_, (line, after))) = last_line_match(text, |line| {
-        line.split_once(marker).map(|(_, after)| (line, after))
-    }) else {
+    let marker_lines: Vec<&str> = text.lines().filter(|line| line.contains(marker)).collect();
+    let Some(last_line) = marker_lines.last() else {
         return FinalToken::Missing;
     };
-    match canonical_match(first_token(after), allowed) {
-        Some(token) => FinalToken::Parsed(token),
-        None => FinalToken::Malformed(line.trim().to_string()),
+    let resolved: Vec<String> = marker_lines
+        .iter()
+        .filter_map(|line| line.split_once(marker))
+        .filter_map(|(_, after)| canonical_match(first_token(after), allowed))
+        .collect();
+    let distinct: std::collections::BTreeSet<String> = resolved
+        .iter()
+        .map(|token| token.to_ascii_uppercase())
+        .collect();
+    match distinct.len() {
+        1 => FinalToken::Parsed(resolved[0].clone()),
+        _ => FinalToken::Malformed(last_line.trim().to_string()),
     }
 }
 
@@ -137,15 +153,22 @@ mod tests {
     }
 
     #[test]
-    fn last_verdict_line_wins_over_rubric_echo() {
-        let text = "I must reply with VERDICT: APPROVED or VERDICT: REVISE.\n\nVERDICT: REVISE\n1. Fix the null deref.";
-        assert_eq!(parse_review_verdict(text), Some(ReviewVerdict::Revise));
+    fn conflicting_verdict_lines_are_malformed_and_reprompt() {
+        // A real REVISE verdict followed by a quoted APPROVED in the defect list
+        // must not silently approve; the ambiguity triggers the reprompt.
+        let text =
+            "VERDICT: REVISE\n1. Fix the null deref.\n2. Once fixed I would issue VERDICT: APPROVED.";
+        assert_eq!(parse_review_verdict(text), None);
 
-        let approved = "The rubric says VERDICT: APPROVED or VERDICT: REVISE.\n\nVERDICT: APPROVED";
-        assert_eq!(
-            parse_review_verdict(approved),
-            Some(ReviewVerdict::Approved)
-        );
+        // The mirror image (rubric echo mentions both tokens) is equally ambiguous.
+        let echo = "I must reply with VERDICT: APPROVED or VERDICT: REVISE.\n\nVERDICT: REVISE\n1. Fix the null deref.";
+        assert_eq!(parse_review_verdict(echo), None);
+    }
+
+    #[test]
+    fn duplicate_same_token_verdict_lines_parse() {
+        let text = "The rubric says VERDICT: APPROVED or VERDICT: APPROVED.\n\nVERDICT: APPROVED";
+        assert_eq!(parse_review_verdict(text), Some(ReviewVerdict::Approved));
     }
 
     #[test]

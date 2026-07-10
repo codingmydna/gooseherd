@@ -11,6 +11,7 @@ mod runner;
 mod workspace;
 
 pub(crate) use gates::{gate_banner_line, resolve_gates, seed_allowed_commands, GateSource};
+pub(super) use phases::orch_phase_idle_timeout;
 pub(super) use roles::{build_role_provider, resolve_all_roles, resolve_judge_role, RoleConfig};
 pub(super) use workspace::git_evidence;
 
@@ -33,6 +34,18 @@ pub enum OrchOutcome {
 enum OrchImplementPolicy {
     Auto,
     Allowlist,
+}
+
+impl OrchImplementPolicy {
+    /// The `GOOSE_ORCH_IMPLEMENT_POLICY` string the provider's
+    /// `ImplementPolicy::from_config` expects, so the resolved policy actually
+    /// reaches the ACP implementer instead of defaulting to `auto`.
+    fn as_config_str(self) -> &'static str {
+        match self {
+            OrchImplementPolicy::Auto => "auto",
+            OrchImplementPolicy::Allowlist => "allowlist",
+        }
+    }
 }
 
 /// Resolve the orchestration implement policy. An explicit

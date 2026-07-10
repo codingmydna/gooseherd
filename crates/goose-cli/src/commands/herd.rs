@@ -567,9 +567,66 @@ fn write_recommended_config(config: &Config) -> Result<()> {
 
     let mut presets: BTreeMap<String, String> =
         config.get_param("GOOSE_ROLE_PRESETS").unwrap_or_default();
-    presets.insert("premium".to_string(), PREMIUM_PRESET_SPEC.to_string());
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    match premium_preset_action(
+        presets.get("premium").map(String::as_str),
+        PREMIUM_PRESET_SPEC,
+        interactive,
+    ) {
+        PremiumPresetAction::Insert => {
+            presets.insert("premium".to_string(), PREMIUM_PRESET_SPEC.to_string());
+        }
+        PremiumPresetAction::KeepExisting => {
+            println!(
+                "  {} kept your existing customized 'premium' preset (run interactively to overwrite)",
+                style("·").dim()
+            );
+        }
+        PremiumPresetAction::Ask => {
+            let overwrite = cliclack::confirm(
+                "A customized 'premium' preset already exists. Replace it with the recommended spec?",
+            )
+            .initial_value(false)
+            .interact()?;
+            if overwrite {
+                presets.insert("premium".to_string(), PREMIUM_PRESET_SPEC.to_string());
+            } else {
+                println!("  {} kept your existing 'premium' preset", style("·").dim());
+            }
+        }
+    }
     config.set_param("GOOSE_ROLE_PRESETS", &presets)?;
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PremiumPresetAction {
+    /// No existing preset, or it already matches — write it.
+    Insert,
+    /// A customized preset exists and we cannot prompt (non-TTY) — leave it.
+    KeepExisting,
+    /// A customized preset exists on an interactive terminal — ask (default No).
+    Ask,
+}
+
+/// Decide what to do with the recommended `premium` preset. An existing preset
+/// that already matches (or is absent) is written; a customized one is never
+/// clobbered silently — interactively we ask, non-interactively we keep it.
+fn premium_preset_action(
+    existing: Option<&str>,
+    recommended: &str,
+    interactive: bool,
+) -> PremiumPresetAction {
+    match existing {
+        Some(existing) if existing != recommended => {
+            if interactive {
+                PremiumPresetAction::Ask
+            } else {
+                PremiumPresetAction::KeepExisting
+            }
+        }
+        _ => PremiumPresetAction::Insert,
+    }
 }
 
 pub async fn handle_herd() -> Result<()> {
@@ -669,6 +726,38 @@ mod tests {
         let config_file = tempfile::NamedTempFile::new().unwrap();
         let secrets_file = tempfile::NamedTempFile::new().unwrap();
         Config::new_with_file_secrets(config_file.path(), secrets_file.path()).unwrap()
+    }
+
+    #[test]
+    fn premium_preset_action_never_clobbers_a_customized_preset_silently() {
+        // Absent → write the recommended spec.
+        assert_eq!(
+            premium_preset_action(None, PREMIUM_PRESET_SPEC, false),
+            PremiumPresetAction::Insert
+        );
+        // Already matches → idempotent write.
+        assert_eq!(
+            premium_preset_action(Some(PREMIUM_PRESET_SPEC), PREMIUM_PRESET_SPEC, true),
+            PremiumPresetAction::Insert
+        );
+        // Customized + interactive → ask (default No handled at the call site).
+        assert_eq!(
+            premium_preset_action(
+                Some("implementer=codex-acp/gpt-5.6-sol"),
+                PREMIUM_PRESET_SPEC,
+                true
+            ),
+            PremiumPresetAction::Ask
+        );
+        // Customized + non-interactive → keep it, never overwrite.
+        assert_eq!(
+            premium_preset_action(
+                Some("implementer=codex-acp/gpt-5.6-sol"),
+                PREMIUM_PRESET_SPEC,
+                false
+            ),
+            PremiumPresetAction::KeepExisting
+        );
     }
 
     #[test]

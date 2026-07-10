@@ -311,11 +311,20 @@ pub fn get_input(
         return Ok(InputResult::Message(trimmed.to_string()));
     }
 
+    // A leading '/' only denotes a command when the first token is
+    // command-shaped. An absolute path like "/Users/kimjs/x.rs please look"
+    // must reach the model as a normal message, not be eaten by the
+    // nearest-command typo handler.
+    let first_token = input.split_whitespace().next().unwrap_or_default();
+    if !is_command_token(first_token) {
+        return Ok(InputResult::Message(input.trim().to_string()));
+    }
+
     // Handle slash commands
     match handle_slash_command(&input) {
         Some(result) => Ok(result),
         None => {
-            let token = input.split_whitespace().next().unwrap_or_default();
+            let token = first_token;
             match super::commands_registry::nearest_command(token) {
                 Some(suggestion) => {
                     println!(
@@ -331,6 +340,24 @@ pub fn get_input(
             }
         }
     }
+}
+
+/// Whether `token` is shaped like a slash command: a single leading '/', then a
+/// letter or '?', then only lowercase letters, digits, or hyphens (the regex
+/// `^/[a-z?][a-z0-9-]*$`). Absolute paths ("/Users/x", "/etc/hosts.txt") and
+/// anything with a dot or a second slash are not commands.
+fn is_command_token(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix('/') else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '?' && !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn handle_slash_command(input: &str) -> Option<InputResult> {
@@ -662,6 +689,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn is_command_token_accepts_commands_rejects_paths() {
+        // Command-shaped tokens (typos included) stay in the command path.
+        assert!(is_command_token("/stats"));
+        assert!(is_command_token("/stauts"));
+        assert!(is_command_token("/model"));
+        assert!(is_command_token("/?"));
+        assert!(is_command_token("/loop-once"));
+        // Absolute paths with a second slash, an uppercase segment, or a dot are
+        // normal messages, not commands.
+        assert!(!is_command_token("/Users/kimjs/x.rs"));
+        assert!(!is_command_token("/etc/hosts"));
+        assert!(!is_command_token("/var.log"));
+        assert!(!is_command_token("/"));
+        assert!(!is_command_token("plain"));
     }
 
     #[test]

@@ -127,3 +127,32 @@ injection + machine gates + ledger fingerprinting. Gaps, in leverage order:
 Workstream A lands first (staged commits, `cargo check/clippy/test` green per stage),
 then B (each item test-covered), then C. A ships as one reviewed branch; B/C as focused
 follow-ups. Nothing here is pushed to the public repo without the owner's go.
+
+## Post-review backlog
+
+Findings from the adversarial review deferred as backlog (not addressed in the
+review-fix pass):
+
+- **[11] Live steer echo vs spinner redraw** — self-echoed steer characters are
+  overwritten by the cliclack spinner's steady-tick/elapsed-label redraw, so
+  typing while a tool call streams looks invisible (the steer still submits).
+- **[12] Termios restore on SIGTERM** — raw-mode/O_NONBLOCK restore relies only
+  on `Drop`; a SIGTERM/SIGQUIT mid-turn leaves the tty in raw no-echo until
+  `stty sane`. Needs a signal handler that restores the terminal.
+- **[14] Partial steer line dropped at turn end** — an unsubmitted steer line is
+  discarded when the turn ends instead of flowing to the next rustyline prompt
+  as the old canonical-mode reader promised.
+- **[22] Arena judge can read contestant logs** — `.goose-arena/<LABEL>.log`
+  files carry the `goose run` banner with provider/model in cleartext in the
+  judge's cwd; an exploring ACP judge could de-blind the lineup. Scrub/relocate
+  logs before judging.
+- **[26] Preset switch leaves stale effort keys** (pre-existing) — `apply_roles_spec`
+  only sets keys present in the new spec and never clears prior
+  `GOOSE_*_EFFORT` / `GOOSE_CODEX_REASONING_EFFORT`, producing a hybrid config.
+- **[27] Fresh-DB vs migrated-DB schema divergence** (verified pre-existing
+  upstream drift) — `create_schema` stamps version 14 without the
+  `threads`/`thread_messages` tables and `sessions.thread_id` column that
+  migration 10 adds on upgraded DBs. Confirmed present at the pre-overhaul base
+  (`b156e2065`: same `CURRENT_SCHEMA_VERSION = 14`, same create/migration split),
+  so it is not a regression of this branch. Latent until a future migration
+  assumes the v10 path ran.

@@ -40,6 +40,15 @@ use super::{
 };
 use crate::session::verdict::{self, ReviewVerdict};
 
+/// Whether a self-verification reprompt reply adds new content to the report.
+/// A reply identical to the existing report means the reprompt turn produced no
+/// new assistant text (only tool calls, or an interrupted turn), so appending it
+/// would duplicate the whole report in the review evidence.
+fn sv_reply_is_new(report: &str, reply: &str) -> bool {
+    let reply = reply.trim();
+    !reply.is_empty() && reply != report.trim()
+}
+
 impl CliSession {
     pub(crate) async fn handle_orchestrate(
         &mut self,
@@ -87,6 +96,11 @@ impl CliSession {
                 .get_param::<bool>("GOOSE_ORCH_AUTO_MERGE")
                 .unwrap_or(false);
         let original_working_dir = self.get_session().await?.working_dir;
+        // The orchestration path is authoritative over the implementer's
+        // permission mode; save the session's mode so every exit path restores
+        // it (the runner installs a GOOSE_MODE override and drives the agent's
+        // mode directly, so recreate cannot re-apply a stale cached mode).
+        let previous_agent_mode = self.agent.goose_mode().await;
 
         println!(
             "{}",
@@ -133,8 +147,18 @@ impl CliSession {
         // dies with the provider instance.
         config.clear_runtime_override("GOOSE_ACP_PLAN_EXPLORE");
         config.clear_runtime_override(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY);
+        config.clear_runtime_override(goose::acp::ORCH_IMPLEMENT_POLICY_KEY);
         config.clear_runtime_override(goose::acp::ORCH_ALLOWED_COMMANDS_KEY);
         config.clear_runtime_override("GOOSE_MODE");
+        // Restore the session's pre-orchestration permission mode on the agent
+        // and the (about-to-be-recreated) provider, undoing the orch override.
+        if let Err(e) = self
+            .agent
+            .update_goose_mode(previous_agent_mode, &self.session_id)
+            .await
+        {
+            output::render_error(&format!("Failed to restore session permission mode: {}", e));
+        }
         if let Err(e) = self
             .agent
             .config
@@ -325,8 +349,14 @@ impl CliSession {
         };
 
         // Steer the implementer's permission mode/policy in-memory only, so a
-        // crash mid-run cannot leave the user's on-disk mode downgraded.
+        // crash mid-run cannot leave the user's on-disk mode downgraded. The
+        // implement-policy override is what the provider's ImplementPolicy reads;
+        // without it a headless allowlist run silently degrades to `auto`.
         config.set_runtime_override(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, acp_allowlist)?;
+        config.set_runtime_override(
+            goose::acp::ORCH_IMPLEMENT_POLICY_KEY,
+            implement_policy.as_config_str(),
+        )?;
         config.set_runtime_override("GOOSE_MODE", implementer_goose_mode)?;
         if acp_allowlist
             && config
@@ -344,6 +374,27 @@ impl CliSession {
                 .dim()
             );
             config.set_runtime_override(goose::acp::ORCH_ALLOWED_COMMANDS_KEY, seed)?;
+        }
+        // Drive the agent's mode to the orch value BEFORE recreating the
+        // implementer provider. recreate ends by re-applying the agent's cached
+        // mode to the fresh provider (and the ACP subprocess); without this it
+        // would re-send the stale session mode and clobber the GOOSE_MODE
+        // override, defeating allowlist enforcement.
+        if let Err(err) = self
+            .agent
+            .update_goose_mode(implementer_goose_mode, &self.session_id)
+            .await
+        {
+            return handle_phase_error(
+                err,
+                "implementer",
+                implementer_role,
+                &run_id,
+                task,
+                reviewer_role,
+                &[],
+                Some(&repo_scope),
+            );
         }
         let impl_model_config = goose::model_config::model_config_from_user_config(
             &implementer_role.provider_name,
@@ -512,6 +563,9 @@ impl CliSession {
                     Some(&policy_summary),
                     None,
                     None,
+                    // ACP implementers never receive the playbook (it is only
+                    // in the native user instruction), so record real delivery.
+                    Some(!implementer_is_acp),
                 );
 
                 if gates.is_empty() {
@@ -585,7 +639,7 @@ impl CliSession {
                 let sv_reply = self.last_assistant_text().unwrap_or_default();
                 if implementer_report.trim().is_empty() {
                     implementer_report = sv_reply;
-                } else if !sv_reply.trim().is_empty() {
+                } else if sv_reply_is_new(&implementer_report, &sv_reply) {
                     implementer_report.push_str("\n\n");
                     implementer_report.push_str(&sv_reply);
                 }
@@ -783,6 +837,7 @@ impl CliSession {
                         &reviewer_system,
                         &review_request,
                         &review_text,
+                        role_idle_timeout,
                     )
                     .await
                 }
@@ -809,6 +864,7 @@ impl CliSession {
                 None,
                 None,
                 Some(&review_exemplar_injection),
+                None,
             );
 
             if approved {
@@ -872,6 +928,8 @@ impl CliSession {
     /// One bounded reprompt when the reviewer omitted or malformed its verdict
     /// line. Replays the review request and the reviewer's reply, asks for only
     /// the verdict line, and falls back to `NoVerdict` if that also fails.
+    /// Routed through the idle-timeout streaming helper so a reviewer that
+    /// already stalled once cannot hang a headless run indefinitely.
     async fn reprompt_review_verdict(
         &self,
         reviewer: &Arc<dyn goose::providers::base::Provider>,
@@ -879,21 +937,52 @@ impl CliSession {
         reviewer_system: &str,
         review_request: &Message,
         review_text: &str,
+        idle_timeout: Option<std::time::Duration>,
     ) -> ReviewVerdict {
         let messages = vec![
             review_request.clone(),
             Message::assistant().with_text(review_text),
             Message::user().with_text(verdict::REVIEW_REPROMPT),
         ];
-        match goose::session_context::with_session_id(
-            Some(self.session_id.clone()),
-            reviewer.complete(reviewer_model, reviewer_system, &messages, &[]),
+        match stream_role_completion_status(
+            reviewer,
+            reviewer_model,
+            reviewer_system,
+            &messages,
+            &self.session_id,
+            self.debug,
+            idle_timeout,
         )
         .await
         {
-            Ok((message, _usage)) => verdict::parse_review_verdict(&message.as_concat_text())
-                .unwrap_or(ReviewVerdict::NoVerdict),
+            Ok(completion) => {
+                verdict::parse_review_verdict(&completion.text).unwrap_or(ReviewVerdict::NoVerdict)
+            }
             Err(_) => ReviewVerdict::NoVerdict,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sv_reply_is_new;
+
+    #[test]
+    fn sv_reply_identical_to_report_is_not_appended() {
+        let report = "## Summary\nDid the work.\n\n## Self-verification\n- criterion: ok";
+        // The reprompt turn added no new assistant text: last_assistant_text
+        // returned the original report verbatim → must not duplicate it.
+        assert!(!sv_reply_is_new(report, report));
+        assert!(!sv_reply_is_new(report, &format!("  {report}  ")));
+        assert!(!sv_reply_is_new(report, "   "));
+    }
+
+    #[test]
+    fn sv_reply_with_new_text_is_appended() {
+        let report = "## Summary\nDid the work.";
+        assert!(sv_reply_is_new(
+            report,
+            "## Self-verification\n- criterion: ok"
+        ));
     }
 }

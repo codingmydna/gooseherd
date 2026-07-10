@@ -851,14 +851,14 @@ impl Config {
         self.runtime_overrides.lock().unwrap().get(key).cloned()
     }
 
-    /// One-time self-heal for permission flags that an older build (which used
-    /// the config file as an IPC channel) could leave persisted as `true` after
-    /// a crash mid-run. Removes only the transient orch flags, only when they
-    /// are truthy, and returns the keys it cleared so the caller can notify.
-    /// A clean config is left untouched (no write).
+    /// One-time self-heal for the internal-only `GOOSE_ORCH_IMPLEMENT_ACTIVE`
+    /// flag that an older build (which used the config file as an IPC channel)
+    /// could leave persisted as `true` after a crash mid-run. Removes it only
+    /// when truthy, and returns the keys it cleared so the caller can notify. A
+    /// clean config is left untouched (no write). `GOOSE_ACP_PLAN_EXPLORE` is a
+    /// documented user-settable knob and is deliberately never healed.
     pub fn heal_stale_orch_flags(&self) -> Vec<String> {
-        const STALE_TRANSIENT_KEYS: [&str; 2] =
-            ["GOOSE_ORCH_IMPLEMENT_ACTIVE", "GOOSE_ACP_PLAN_EXPLORE"];
+        const STALE_TRANSIENT_KEYS: [&str; 1] = ["GOOSE_ORCH_IMPLEMENT_ACTIVE"];
 
         let _guard = self.guard.lock().unwrap();
         let mut values = match self.load_write_config() {
@@ -2159,7 +2159,9 @@ mod tests {
         ]);
         let config = new_test_config();
         config.set_param("GOOSE_ORCH_IMPLEMENT_ACTIVE", true)?;
-        config.set_param("GOOSE_ACP_PLAN_EXPLORE", false)?;
+        // A deliberately-set, documented user knob — must survive healing even
+        // when truthy (it is not an internal IPC flag).
+        config.set_param("GOOSE_ACP_PLAN_EXPLORE", true)?;
         config.set_param("unrelated_key", "keep_me")?;
 
         let healed = config.heal_stale_orch_flags();
@@ -2169,8 +2171,8 @@ mod tests {
             config.get_param::<bool>("GOOSE_ORCH_IMPLEMENT_ACTIVE"),
             Err(ConfigError::NotFound(_))
         ));
-        // A non-stale value and unrelated keys are left intact.
-        assert!(!config.get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")?);
+        // The documented knob and unrelated keys are left intact.
+        assert!(config.get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")?);
         assert_eq!(config.get_param::<String>("unrelated_key")?, "keep_me");
         Ok(())
     }

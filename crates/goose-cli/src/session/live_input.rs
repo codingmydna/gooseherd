@@ -88,30 +88,66 @@ impl LineParser {
                     }
                 }
                 WaitInputClass::Ordinary => {
-                    let byte = self.buf.remove(0);
                     self.esc_deferred = false;
-                    match byte {
+                    match self.buf[0] {
                         b'\n' | b'\r' => {
+                            self.buf.remove(0);
                             let line = std::mem::take(&mut self.line).trim().to_string();
                             echo("\n");
                             events.push(LiveInputEvent::Steer(line));
                         }
                         0x7f | 0x08 => {
+                            self.buf.remove(0);
                             if self.line.pop().is_some() {
                                 echo("\u{8} \u{8}");
                             }
                         }
                         b' '..=b'~' => {
-                            let ch = byte as char;
+                            let ch = self.buf.remove(0) as char;
                             self.line.push(ch);
                             echo(ch.encode_utf8(&mut [0u8; 4]));
                         }
-                        _ => {}
+                        0x00..=0x1f => {
+                            self.buf.remove(0);
+                        }
+                        lead => {
+                            // Start of a multi-byte UTF-8 sequence (CJK, accents,
+                            // emoji). Consume the whole sequence, buffering an
+                            // incomplete tail across reads; resync past an invalid
+                            // byte rather than dropping the character silently.
+                            let expected = utf8_char_len(lead);
+                            if self.buf.len() < expected {
+                                break;
+                            }
+                            match std::str::from_utf8(&self.buf[..expected]) {
+                                Ok(text) => {
+                                    let ch = text.chars().next().unwrap();
+                                    self.buf.drain(..expected);
+                                    self.line.push(ch);
+                                    echo(ch.encode_utf8(&mut [0u8; 4]));
+                                }
+                                Err(_) => {
+                                    self.buf.remove(0);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
         events
+    }
+}
+
+/// Expected byte length of a UTF-8 sequence from its lead byte. Continuation
+/// bytes and invalid leads report 1 so the caller resyncs by a single byte.
+fn utf8_char_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
     }
 }
 
@@ -288,5 +324,52 @@ mod tests {
         let mut echoed = String::new();
         parser.feed(b"hi", &mut |s| echoed.push_str(s));
         assert_eq!(echoed, "hi");
+    }
+
+    #[test]
+    fn alt_key_chord_is_swallowed_not_interrupted() {
+        // Alt-x arrives as ESC + 'x' in one read; it must not interrupt the turn.
+        let mut parser = LineParser::default();
+        assert!(feed(&mut parser, &[0x1b, b'x']).is_empty());
+        // Alt+Backspace (ESC + DEL) likewise swallowed, and a later line parses.
+        assert!(feed(&mut parser, &[0x1b, 0x7f]).is_empty());
+        assert_eq!(
+            feed(&mut parser, b"go\n"),
+            vec![LiveInputEvent::Steer("go".to_string())]
+        );
+    }
+
+    #[test]
+    fn paste_containing_embedded_escape_does_not_interrupt() {
+        let mut parser = LineParser::default();
+        let events = feed(&mut parser, b"abc\x1bdef\n");
+        // No interrupt event; the line is delivered (the ESC + next byte is
+        // swallowed as an Alt chord).
+        assert_eq!(events, vec![LiveInputEvent::Steer("abcef".to_string())]);
+    }
+
+    #[test]
+    fn korean_utf8_split_across_reads_delivers_full_line() {
+        let mut parser = LineParser::default();
+        let text = "먼저 테스트 고쳐";
+        let bytes = text.as_bytes();
+        let split = 5; // slice mid multi-byte sequence
+        assert!(feed(&mut parser, &bytes[..split]).is_empty());
+        let mut rest = bytes[split..].to_vec();
+        rest.push(b'\n');
+        assert_eq!(
+            feed(&mut parser, &rest),
+            vec![LiveInputEvent::Steer(text.to_string())]
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_byte_is_skipped_without_panic() {
+        let mut parser = LineParser::default();
+        // A stray continuation byte 0x80 is resynced past; the ASCII survives.
+        assert_eq!(
+            feed(&mut parser, &[0x80, b'o', b'k', b'\n']),
+            vec![LiveInputEvent::Steer("ok".to_string())]
+        );
     }
 }

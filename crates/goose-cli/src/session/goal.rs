@@ -9,7 +9,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::orchestrate::{build_role_provider, git_evidence, resolve_judge_role, RoleConfig};
+use super::orchestrate::{
+    build_role_provider, git_evidence, orch_phase_idle_timeout, resolve_judge_role, RoleConfig,
+};
 use super::{ledger, output, CliSession};
 
 pub(crate) const GOAL_USAGE: &str = "\
@@ -734,20 +736,21 @@ impl CliSession {
     ) -> (GoalVerdict, ProviderUsage) {
         messages.push(first_reply);
         messages.push(Message::user().with_text(crate::session::verdict::GOAL_REPROMPT));
-        match goose::session_context::with_session_id(
+        // Bound the reprompt: an evaluator that already stalled once must not
+        // hang a headless goal run forever (complete() has no timeout of its own).
+        let completion = goose::session_context::with_session_id(
             Some(self.session_id.clone()),
             provider.complete(model_config, EVALUATOR_SYSTEM_PROMPT, &messages, &[]),
-        )
-        .await
-        {
-            Ok((message, retry_usage)) => {
+        );
+        match tokio::time::timeout(orch_phase_idle_timeout(), completion).await {
+            Ok(Ok((message, retry_usage))) => {
                 let combined = combine_provider_usage(&first_usage, &retry_usage);
                 match parse_goal_verdict(&message.as_concat_text()) {
                     GoalVerdict::NoVerdict(_) => (no_verdict, combined),
                     resolved => (resolved, combined),
                 }
             }
-            Err(_) => (no_verdict, first_usage),
+            _ => (no_verdict, first_usage),
         }
     }
 

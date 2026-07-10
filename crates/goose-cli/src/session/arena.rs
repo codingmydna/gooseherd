@@ -91,12 +91,18 @@ fn stable_hash(input: &str) -> u64 {
     hash
 }
 
-/// A stable run id for one arena, derived from the session and task so the shuffle
-/// is reproducible for the same invocation but varies across tasks.
+/// A unique run id for one arena. Derived from the session, task, and a
+/// monotonic timestamp so re-running the same task in one session produces a
+/// fresh id (and thus a fresh shuffle and non-colliding ledger rows) rather than
+/// reusing the previous run's mapping.
 fn arena_run_id(session_id: &str, task: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
     format!(
         "arena-{:016x}",
-        stable_hash(&format!("{session_id}\u{0}{task}"))
+        stable_hash(&format!("{session_id}\u{0}{task}\u{0}{nanos}"))
     )
 }
 
@@ -214,12 +220,16 @@ impl CliSession {
         let explicit_policy = config
             .get_param::<String>("GOOSE_ORCH_IMPLEMENT_POLICY")
             .ok();
-        let seed = config
-            .get_param::<String>("GOOSE_ORCH_ALLOWED_COMMANDS")
-            .unwrap_or_else(|_| {
-                let resolved = resolve_gates(&repo_root, None, Vec::new());
-                seed_allowed_commands(&repo_root, &resolved).join(",")
-            });
+        // Reuse the provider-side parser so a list-form allowlist configured for
+        // /orch is honored here too, not silently ignored (which would seed only
+        // the manifest defaults and deny commands the owner explicitly allowed).
+        let configured = goose::acp::orch_allowed_commands_from_config();
+        let seed = if configured.is_empty() {
+            let resolved = resolve_gates(&repo_root, None, Vec::new());
+            seed_allowed_commands(&repo_root, &resolved).join(",")
+        } else {
+            configured.join(",")
+        };
         let any_acp = lineup
             .iter()
             .any(|(provider, _)| provider.ends_with("-acp"));

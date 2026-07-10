@@ -269,22 +269,42 @@ fn config_from_json(json: &str) -> Result<DeclarativeProviderConfig> {
     Ok(config)
 }
 
+/// Load every `*.json` custom provider in `dir`, tolerating a bad file. One
+/// malformed file is skipped with a visible error (not just a tracing warning)
+/// and the remaining providers still register, so a single typo cannot wipe out
+/// an entire configured provider directory.
 pub fn load_custom_providers(dir: &Path) -> Result<Vec<DeclarativeProviderConfig>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
 
-    std::fs::read_dir(dir)?
-        .filter_map(|entry| {
-            let path = entry.ok()?.path();
-            (path.extension()? == "json").then_some(path)
-        })
-        .map(|path| {
-            let content = std::fs::read_to_string(&path)?;
-            deserialize_provider_config(&content)
-                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))
-        })
-        .collect()
+    let mut providers = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let Some(path) = entry.ok().map(|entry| entry.path()) else {
+            continue;
+        };
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("skipping custom provider {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        match deserialize_provider_config(&content) {
+            Ok(config) => providers.push(config),
+            Err(e) => {
+                eprintln!(
+                    "skipping custom provider {}: failed to parse: {}",
+                    path.display(),
+                    e
+                )
+            }
+        }
+    }
+    Ok(providers)
 }
 
 pub fn from_json(
@@ -590,5 +610,26 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Required environment variable TEST_PROVIDER_REQUIRED_HOST is not set"));
+    }
+
+    #[test]
+    fn load_custom_providers_skips_only_the_malformed_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = json!({
+            "name": "glm",
+            "engine": "openai_compatible",
+            "display_name": "GLM",
+            "base_url": "http://localhost:1234",
+            "models": [model_json()]
+        })
+        .to_string();
+        std::fs::write(dir.path().join("glm.json"), good).unwrap();
+        std::fs::write(dir.path().join("grok.json"), "{ not valid json,,").unwrap();
+
+        let providers = load_custom_providers(dir.path()).expect("directory load must not fail");
+
+        // The valid provider still registers despite the broken sibling file.
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "glm");
     }
 }

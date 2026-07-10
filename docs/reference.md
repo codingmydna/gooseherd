@@ -65,7 +65,7 @@ gate re-dispatches the implementer (never spends reviewer tokens).
 | Knob | Default | Description |
 |---|---|---|
 | `GOOSE_ORCH_GATES` | unset | Global fallback gate commands (list) |
-| `GOOSE_ORCH_GATE_TIMEOUT_SECS` | 900 | Per-gate timeout |
+| `GOOSE_ORCH_GATE_TIMEOUT_SECS` | 3600 | Per-gate timeout (a cold worktree build can exceed 15 min; raise if a real gate legitimately needs longer) |
 | `GOOSE_ORCH_GATE_ENV` | `scrub` | `scrub` removes credential env vars; `inherit` passes them through |
 | `GOOSE_ORCH_MAX_GATE_RETRIES` | 2 | Reimplement retries on gate failure before aborting |
 

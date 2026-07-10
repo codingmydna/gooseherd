@@ -356,14 +356,23 @@ pub struct RunBehavior {
 
 /// `goose session -r` with no id on an interactive tty shows the recent-session
 /// picker; with an id, or when piped, it resolves silently (latest / specified).
-fn resume_uses_picker(has_identifier: bool, stdin_tty: bool, stdout_tty: bool) -> bool {
-    !has_identifier && stdin_tty && stdout_tty
+/// `goose run --resume` is a headless one-shot — it must never block on the
+/// picker even on a TTY (expect/tmux/CI wrappers allocate one), so only the
+/// interactive `session` command opts in.
+fn resume_uses_picker(
+    is_session_command: bool,
+    has_identifier: bool,
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> bool {
+    is_session_command && !has_identifier && stdin_tty && stdout_tty
 }
 
 async fn get_or_create_session_id(
     identifier: Option<Identifier>,
     resume: bool,
     no_session: bool,
+    is_session_command: bool,
     goose_mode: GooseMode,
 ) -> Result<Option<String>> {
     if no_session {
@@ -374,6 +383,7 @@ async fn get_or_create_session_id(
 
     let resolved_id = if resume {
         if resume_uses_picker(
+            is_session_command,
             identifier.is_some(),
             std::io::stdin().is_terminal(),
             std::io::stdout().is_terminal(),
@@ -1189,7 +1199,8 @@ async fn handle_interactive_session(
     }
 
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
-    let mut session_id = get_or_create_session_id(identifier, resume, false, goose_mode).await?;
+    let mut session_id =
+        get_or_create_session_id(identifier, resume, false, true, goose_mode).await?;
 
     if edit || fork {
         if let Some(ref id) = session_id {
@@ -1423,6 +1434,9 @@ async fn handle_run_command(
         identifier,
         run_behavior.resume,
         run_behavior.no_session,
+        // `goose run --resume` resolves the latest session silently — never the
+        // interactive picker, which would hang PTY-wrapped headless automation.
+        false,
         goose_mode,
     )
     .await?;
@@ -1497,7 +1511,7 @@ async fn handle_loop_command(
     }
 
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
-    let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
+    let session_id = get_or_create_session_id(None, false, false, false, goose_mode).await?;
     let mut session = build_session(SessionBuilderConfig {
         session_id,
         resume: false,
@@ -1555,7 +1569,7 @@ async fn handle_goal_command(
     }
 
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
-    let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
+    let session_id = get_or_create_session_id(None, false, false, false, goose_mode).await?;
     let mut session = build_session(SessionBuilderConfig {
         session_id,
         resume: false,
@@ -1611,7 +1625,7 @@ async fn handle_goal_command(
 
 async fn handle_orch_command(text: String, max_cycles: Option<u32>, merge: bool) -> Result<()> {
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
-    let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
+    let session_id = get_or_create_session_id(None, false, false, false, goose_mode).await?;
 
     let mut session = build_session(SessionBuilderConfig {
         session_id,
@@ -1656,7 +1670,7 @@ async fn handle_default_session() -> Result<()> {
     }
 
     let goose_mode = Config::global().get_goose_mode().unwrap_or_default();
-    let session_id = get_or_create_session_id(None, false, false, goose_mode).await?;
+    let session_id = get_or_create_session_id(None, false, false, false, goose_mode).await?;
 
     let mut session = build_session(SessionBuilderConfig {
         session_id,
@@ -1866,10 +1880,17 @@ mod tests {
 
     #[test]
     fn resume_shows_picker_only_without_id_on_a_tty() {
-        assert!(resume_uses_picker(false, true, true));
-        assert!(!resume_uses_picker(true, true, true));
-        assert!(!resume_uses_picker(false, false, true));
-        assert!(!resume_uses_picker(false, true, false));
+        assert!(resume_uses_picker(true, false, true, true));
+        assert!(!resume_uses_picker(true, true, true, true));
+        assert!(!resume_uses_picker(true, false, false, true));
+        assert!(!resume_uses_picker(true, false, true, false));
+    }
+
+    #[test]
+    fn goose_run_resume_never_uses_picker_even_on_a_tty() {
+        // `goose run --resume` (is_session_command = false) must resolve the
+        // latest session silently, never blocking on the interactive picker.
+        assert!(!resume_uses_picker(false, false, true, true));
     }
 
     #[test]

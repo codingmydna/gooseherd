@@ -48,7 +48,12 @@ pub(super) fn orientation_block(pack: &str) -> String {
 /// itself fails.
 pub(super) fn cached_repo_pack(repo_root: &Path) -> Option<String> {
     let canonical = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let head = git_head(&canonical).unwrap_or_else(|| "no-head".to_string());
+    // Without a git HEAD there is no stamp that can ever invalidate: a cached
+    // entry would be served forever (a day-one skeleton after the repo grows, or
+    // a previous project's pack at the same path). Skip the cache and rebuild.
+    let Some(head) = git_head(&canonical) else {
+        return build_repo_pack(&canonical).ok();
+    };
     let cache_path = cache_path_for(&canonical);
 
     if let Some(cached) = read_cache(&cache_path, &head) {
