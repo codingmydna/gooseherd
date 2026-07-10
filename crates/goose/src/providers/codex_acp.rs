@@ -13,7 +13,7 @@ use crate::providers::base::{
 };
 
 pub(crate) const CODEX_ACP_PROVIDER_NAME: &str = "codex-acp";
-const CODEX_ACP_DOC_URL: &str = "https://github.com/zed-industries/codex-acp";
+const CODEX_ACP_DOC_URL: &str = "https://github.com/agentclientprotocol/codex-acp";
 
 pub struct CodexAcpProvider;
 
@@ -29,7 +29,7 @@ impl goose_providers::base::ProviderDescriptor for CodexAcpProvider {
             vec![],
         )
         .with_setup_steps(vec![
-            "Install the ACP adapter: `npm install -g @zed-industries/codex-acp`",
+            "Install the ACP adapter: `npm install -g @agentclientprotocol/codex-acp`",
             "Run `codex` once to authenticate with your OpenAI account",
             "Add to your goose config file (`~/.config/goose/config.yaml` on macOS/Linux):\n  GOOSE_PROVIDER: codex-acp\n  GOOSE_MODEL: current\n  codex-acp_configured: true",
             "Restart goose for changes to take effect",

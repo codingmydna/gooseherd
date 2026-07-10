@@ -1,0 +1,5 @@
+# Machine quality gates for orchestration runs on this repo. Each entry is a
+# shell command that must exit 0 before the reviewer is called.
+- cargo fmt --check
+- cargo clippy --workspace --all-targets -- -D warnings
+- cargo test -p goose-cli --lib

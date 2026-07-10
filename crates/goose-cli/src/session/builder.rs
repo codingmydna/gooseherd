@@ -251,7 +251,9 @@ fn resolve_provider_and_model(
         .or_else(|| recipe_settings.and_then(|s| s.goose_provider.clone()))
         .or_else(|| config.get_goose_provider().ok())
         .unwrap_or_else(|| {
-            output::render_error("No provider configured. Run 'goose configure' first.");
+            output::render_error(
+                "No provider configured. Run `goose herd` (recommended) or `goose configure`.",
+            );
             process::exit(1);
         });
 
@@ -262,7 +264,9 @@ fn resolve_provider_and_model(
         .or_else(|| recipe_settings.and_then(|s| s.goose_model.clone()))
         .or_else(|| config.get_goose_model().ok())
         .unwrap_or_else(|| {
-            output::render_error("No model configured. Run 'goose configure' first.");
+            output::render_error(
+                "No model configured. Run `goose herd` (recommended) or `goose configure`.",
+            );
             process::exit(1);
         });
 
@@ -555,11 +559,15 @@ pub async fn build_session(session_config: SessionBuilderConfig) -> CliSession {
                     && is_provider_unavailable_error(&e) =>
             {
                 let fallback_provider = config.get_goose_provider().unwrap_or_else(|_| {
-                    output::render_error("No provider configured. Run 'goose configure' first.");
+                    output::render_error(
+                "No provider configured. Run `goose herd` (recommended) or `goose configure`.",
+            );
                     process::exit(1);
                 });
                 let fallback_model = config.get_goose_model().unwrap_or_else(|_| {
-                    output::render_error("No model configured. Run 'goose configure' first.");
+                    output::render_error(
+                        "No model configured. Run `goose herd` (recommended) or `goose configure`.",
+                    );
                     process::exit(1);
                 });
                 eprintln!(

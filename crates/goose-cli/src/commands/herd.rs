@@ -230,6 +230,63 @@ fn format_catalog_entry(entry: &AdapterEntry, state: &CatalogState) -> String {
     }
 }
 
+fn print_catalog_section(config: &Config) {
+    println!();
+    println!("{}", style("Agent catalog:").bold());
+    match catalog() {
+        Ok(entries) => {
+            for entry in entries.values() {
+                println!(
+                    "  {}",
+                    format_catalog_entry(entry, &catalog_state(config, entry))
+                );
+            }
+        }
+        Err(error) => println!(
+            "  {} could not load agent catalog: {error}",
+            style("!").yellow()
+        ),
+    }
+}
+
+/// Environment diagnostics printed by `goose doctor` before any session is built,
+/// so setup problems are visible even when no provider is configured. Reuses the
+/// same check functions as `goose herd`.
+pub fn print_environment_diagnostics(config: &Config) {
+    println!("{}", style("Environment").bold());
+    match config.get_goose_provider() {
+        Ok(provider) => {
+            let model = config
+                .get_goose_model()
+                .unwrap_or_else(|_| "<unset>".to_string());
+            print_check(&Check::ok(
+                "provider configured",
+                Some(format!("{provider} / {model}")),
+            ));
+        }
+        Err(_) => print_check(&Check::fail(
+            "provider configured",
+            "goose herd (recommended) or goose configure",
+        )),
+    }
+
+    let (claude_checks, _) = check_claude_cli();
+    let (codex_checks, _) = check_codex_cli();
+    let (claude_adapter_check, _) = check_adapter(CLAUDE_ADAPTER, CLAUDE_ADAPTER_PKG);
+    let (codex_adapter_check, _) = check_adapter(CODEX_ADAPTER, CODEX_ADAPTER_PKG);
+    let generic_acp_checks = check_generic_acp_agents(config);
+    for check in claude_checks
+        .iter()
+        .chain(codex_checks.iter())
+        .chain([&claude_adapter_check, &codex_adapter_check])
+        .chain(generic_acp_checks.iter())
+    {
+        print_check(check);
+    }
+
+    print_catalog_section(config);
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum AddOutcome {
     Added,
@@ -343,6 +400,142 @@ fn repo_gate_check(config: &Config, repo_dir: &Path) -> Check {
     }
 }
 
+const LOCAL_GATES_FILE: &str = ".goose-gates.yaml";
+
+/// The primary crate to scope a `cargo test` starter gate to, so it stays fast in
+/// a workspace. Prefers `[package].name`, then the first `default-members` entry,
+/// then the first `members` entry.
+fn primary_cargo_crate(repo_dir: &Path) -> Option<String> {
+    let root = std::fs::read_to_string(repo_dir.join("Cargo.toml")).ok()?;
+    if let Some(name) = package_name(&root) {
+        return Some(name);
+    }
+    let member = first_workspace_member(&root)?;
+    let member_path = repo_dir.join(&member);
+    std::fs::read_to_string(member_path.join("Cargo.toml"))
+        .ok()
+        .and_then(|contents| package_name(&contents))
+        .or_else(|| {
+            Path::new(&member)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+}
+
+fn package_name(cargo_toml: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if in_package {
+            if let Some(value) = trimmed.strip_prefix("name") {
+                if let Some(value) = value.trim_start().strip_prefix('=') {
+                    let name = value.trim().trim_matches('"');
+                    if !name.is_empty() {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn first_workspace_member(cargo_toml: &str) -> Option<String> {
+    ["default-members", "members"]
+        .into_iter()
+        .find_map(|key| first_member_for_key(cargo_toml, key))
+}
+
+fn first_member_for_key(cargo_toml: &str, key: &str) -> Option<String> {
+    let mut collecting = false;
+    let mut buffer = String::new();
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim_start();
+        if !collecting {
+            let Some(rest) = trimmed.strip_prefix(key) else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            buffer.push_str(rest);
+            collecting = true;
+        } else {
+            buffer.push(' ');
+            buffer.push_str(trimmed);
+        }
+        if buffer.contains(']') {
+            break;
+        }
+    }
+    if !collecting {
+        return None;
+    }
+    buffer
+        .split('"')
+        .nth(1)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+}
+
+/// Starter machine gates for a Cargo repo. Cargo gates are never auto-derived
+/// (only package.json/go.mod are), so a fresh Rust repo has no gates until the
+/// user commits `.goose-gates.yaml` — this offers a fast, correct default.
+fn starter_cargo_gates(repo_dir: &Path) -> Option<Vec<String>> {
+    if !repo_dir.join("Cargo.toml").is_file() {
+        return None;
+    }
+    let test = match primary_cargo_crate(repo_dir) {
+        Some(crate_name) => format!("cargo test -p {crate_name} --lib"),
+        None => "cargo test --lib".to_string(),
+    };
+    Some(vec![
+        "cargo fmt --check".to_string(),
+        "cargo clippy --workspace --all-targets -- -D warnings".to_string(),
+        test,
+    ])
+}
+
+fn maybe_offer_starter_gates(repo_dir: &Path) -> Result<()> {
+    let gates_path = repo_dir.join(LOCAL_GATES_FILE);
+    if gates_path.exists() {
+        return Ok(());
+    }
+    let Some(gates) = starter_cargo_gates(repo_dir) else {
+        return Ok(());
+    };
+    let yaml = serde_yaml::to_string(&gates)?;
+
+    println!();
+    if std::io::stdin().is_terminal() {
+        println!(
+            "This looks like a Cargo repo with no {LOCAL_GATES_FILE}. A starter gates file \
+             would run before every reviewer:"
+        );
+        for gate in &gates {
+            println!("  - {gate}");
+        }
+        let write = cliclack::confirm(format!("Write {LOCAL_GATES_FILE}?"))
+            .initial_value(true)
+            .interact()?;
+        if write {
+            std::fs::write(&gates_path, yaml)?;
+            println!("  {} wrote {}", style("✓").green(), gates_path.display());
+        }
+    } else {
+        println!(
+            "No {LOCAL_GATES_FILE} in this Cargo repo. Suggested starter (write it to the repo root):"
+        );
+        print!("{yaml}");
+    }
+    Ok(())
+}
+
 fn print_check(check: &Check) {
     let mark = if check.ok {
         style("✓").green()
@@ -404,22 +597,7 @@ pub async fn handle_herd() -> Result<()> {
         print_check(check);
     }
 
-    println!();
-    println!("{}", style("Agent catalog:").bold());
-    match catalog() {
-        Ok(entries) => {
-            for entry in entries.values() {
-                println!(
-                    "  {}",
-                    format_catalog_entry(entry, &catalog_state(config, entry))
-                );
-            }
-        }
-        Err(error) => println!(
-            "  {} could not load agent catalog: {error}",
-            style("!").yellow()
-        ),
-    }
+    print_catalog_section(config);
 
     let role_check = if roles_ok {
         let planner: String = config.get_param("GOOSE_PLANNER_PROVIDER")?;
@@ -466,6 +644,8 @@ pub async fn handle_herd() -> Result<()> {
             );
         }
     }
+
+    maybe_offer_starter_gates(&repo_dir)?;
 
     println!();
     println!("{}", style("Next steps:").bold());
@@ -769,5 +949,83 @@ mod tests {
             format_catalog_entry(&entry, &CatalogState::NotInstalled),
             "✗ gemini — Google Gemini CLI (not installed — npm install -g @google/gemini-cli)"
         );
+    }
+
+    #[test]
+    fn primary_cargo_crate_uses_package_name() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(primary_cargo_crate(temp.path()).as_deref(), Some("solo"));
+    }
+
+    #[test]
+    fn primary_cargo_crate_prefers_default_members() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\n  \"crates/other\",\n  \"crates/app\",\n]\ndefault-members = [\"crates/app\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("crates/app")).unwrap();
+        std::fs::write(
+            temp.path().join("crates/app/Cargo.toml"),
+            "[package]\nname = \"myapp\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(primary_cargo_crate(temp.path()).as_deref(), Some("myapp"));
+    }
+
+    #[test]
+    fn primary_cargo_crate_falls_back_to_first_member() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/first\", \"crates/second\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("crates/first")).unwrap();
+        std::fs::write(
+            temp.path().join("crates/first/Cargo.toml"),
+            "[package]\nname = \"firstcrate\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            primary_cargo_crate(temp.path()).as_deref(),
+            Some("firstcrate")
+        );
+    }
+
+    #[test]
+    fn starter_cargo_gates_scopes_test_to_primary_crate() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"solo\"\n",
+        )
+        .unwrap();
+
+        let gates = starter_cargo_gates(temp.path()).unwrap();
+
+        assert_eq!(
+            gates,
+            vec![
+                "cargo fmt --check",
+                "cargo clippy --workspace --all-targets -- -D warnings",
+                "cargo test -p solo --lib",
+            ]
+        );
+    }
+
+    #[test]
+    fn starter_cargo_gates_none_without_cargo_toml() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(starter_cargo_gates(temp.path()).is_none());
     }
 }

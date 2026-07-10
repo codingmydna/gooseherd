@@ -31,12 +31,20 @@ pub(in crate::session) struct OrchRoles {
 pub(in crate::session) fn resolve_all_roles() -> Result<OrchRoles> {
     let config = Config::global();
     let default = RoleConfig {
-        provider_name: config
-            .get_goose_provider()
-            .map_err(|e| anyhow::anyhow!("No provider configured: {}", e))?,
-        model: config
-            .get_goose_model()
-            .map_err(|e| anyhow::anyhow!("No model configured: {}", e))?,
+        provider_name: config.get_goose_provider().map_err(|e| {
+            anyhow::anyhow!(
+                "No provider configured for orchestration roles. \
+                 Run `goose herd` to set up planner/implementer/reviewer roles: {}",
+                e
+            )
+        })?,
+        model: config.get_goose_model().map_err(|e| {
+            anyhow::anyhow!(
+                "No model configured for orchestration roles. \
+                 Run `goose herd` to set up planner/implementer/reviewer roles: {}",
+                e
+            )
+        })?,
         effort: None,
     };
     let planner = resolve_role("PLANNER", &default);

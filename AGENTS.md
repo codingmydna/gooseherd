@@ -6,10 +6,12 @@ gates verify — over ACP-driven vendor CLIs (claude-acp, codex-acp, any agent v
 one config entry) and native OpenAI/Anthropic-compatible APIs. Desktop app, web
 UI, and hosted services are non-goals.
 
-## Crate map
+For every config knob, the exit-code contracts, and the `.goose-gates.yaml`
+spec, see [docs/reference.md](docs/reference.md). The architecture and the
+decisions behind the current layout are recorded in
+[docs/overhaul-2026-07.md](docs/overhaul-2026-07.md).
 
-The trim is staged and in progress per `docs/overhaul-2026-07.md`; this is the
-target layout, and some crates below still exist mid-trim.
+## Crate map
 
 ```
 crates/
