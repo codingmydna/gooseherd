@@ -47,7 +47,7 @@ fn build_env_filter(extra_directives: &[&str]) -> EnvFilter {
 
 /// Set up file-based (and optionally console) tracing for a goose component.
 ///
-/// This is the shared implementation used by both `goose-cli` and `goose-server`.
+/// This is the shared implementation used by `goose-cli`.
 /// Call `try_init` on the returned subscriber — callers are responsible for the
 /// `Once`-guard or direct init as appropriate for their use case.
 pub fn build_logging_subscriber(
