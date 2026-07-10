@@ -5035,6 +5035,7 @@ dependencies = [
  "goose",
  "goose-mcp",
  "goose-providers",
+ "ignore",
  "indicatif 0.18.4",
  "libc",
  "open",
