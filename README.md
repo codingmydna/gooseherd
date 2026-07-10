@@ -1,6 +1,23 @@
 # gooseherd
 
-A gooseherd tends geese. This one tends AI models.
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/codingmydna/gooseherd)](https://github.com/codingmydna/gooseherd/releases)
+[![Rust](https://img.shields.io/badge/rust-stable-orange)](https://www.rust-lang.org)
+
+**Stop guessing which model is worth your money — your repo already knows.**
+
+*A gooseherd tends geese. This one tends AI models.*
+
+<!-- demo-gif -->
+
+**When to reach for gooseherd:**
+
+- You want your expensive subscription limits spent on planning and review,
+  while a cheaper model does the implementation.
+- You want to compare models blind on your repo's actual tasks, not on
+  benchmarks — `/arena` runs them head-to-head and a ledger keeps score.
+- You don't want the agent that wrote the code approving its own work —
+  mechanical gates run before an independent reviewer sees the diff.
 
 gooseherd is a fork of [goose](https://github.com/aaif-goose/goose) that turns it
 into a multi-model orchestrator: a frontier model plans and reviews, a cheaper
@@ -35,6 +52,38 @@ VERDICT: APPROVED
   ⎿ review done · model default · in 2 / out 224 · 6.7s · APPROVED
 ```
 
+### Your repo learns which model wins
+
+Every run leaves evidence, and the evidence compounds.
+
+**`/arena`** — run the same task on several models at once, each in its own
+detached git worktree, then have the reviewer blind-judge the diffs:
+
+```
+arena results
+  A-codex-acp      codex-acp/gpt-5.5   failed/timeout  900s
+  B-claude-acp     claude-acp/default  completed        48s  2 files changed, 29 insertions(+)
+
+RANKING: B-claude-acp > A-codex-acp
+```
+
+Worktrees are kept afterwards so you can inspect every attempt yourself.
+
+**A run ledger and `/stats`** — every orchestration phase is appended to
+`orch_ledger.jsonl`: configured model vs. the model the provider actually
+reported, tokens, durations, verdicts, and the session's advertised context
+limit (a useful fingerprint for catching silent model downgrades —
+`GOOSE_<ROLE>_EXPECT_MODEL` warns when the reported model doesn't match).
+
+**Exemplar hill-climbing** — approved plans are archived and similar past
+plans are injected as few-shot exemplars for future planners
+(`GOOSE_PLAN_EXEMPLARS`), so the expensive model's planning shape survives
+into cheaper ones. Fable 5's playbook and plan/review exemplars are injected
+into planner/reviewer roles whose serving model is not Fable; use
+`GOOSE_ORCH_PLAYBOOK=auto|always|never`,
+`GOOSE_PLAN_EXEMPLARS_INJECT=auto|always|never`, or
+`GOOSE_REVIEW_EXEMPLARS_INJECT=auto|always|never` to override.
+
 **A full run lifecycle around the loop** — each `/orch` run isolates itself in
 a git worktree (`.goose/worktrees/orch-<run_id>`, env files symlinked), so
 parallel runs on one repo don't contaminate each other's evidence. Configured
@@ -42,16 +91,9 @@ quality gates (`GOOSE_ORCH_GATES`, e.g. fmt/lint/test) run *before* the
 reviewer is called — mechanical failures bounce straight back to the
 implementer without spending reviewer tokens. On approval the run auto-commits
 to its branch and prints the merge command (`--merge` merges for you).
-Approved plans are archived and similar past plans are injected as few-shot
-exemplars for future planners (`GOOSE_PLAN_EXEMPLARS`), so the expensive
-model's planning shape survives into cheaper ones. Fable 5's playbook and
-plan/review exemplars are injected into planner/reviewer roles whose serving
-model is not Fable; use `GOOSE_ORCH_PLAYBOOK=auto|always|never`,
-`GOOSE_PLAN_EXEMPLARS_INJECT=auto|always|never`, or
-`GOOSE_REVIEW_EXEMPLARS_INJECT=auto|always|never` to override. An allowlist
-permission policy (`GOOSE_ORCH_IMPLEMENT_POLICY: allowlist`) confines the
-implementer to the workspace and an approved command list — for running
-orchestration on repos you actually care about.
+An allowlist permission policy (`GOOSE_ORCH_IMPLEMENT_POLICY: allowlist`)
+confines the implementer to the workspace and an approved command list — for
+running orchestration on repos you actually care about.
 
 **Bring any ACP agent** — besides the built-in claude/codex/copilot/amp/pi
 adapters, any ACP-speaking CLI plugs in via config:
@@ -87,25 +129,6 @@ exploration are approved; edits, deletes, and moves are rejected. This works
 for any ACP agent, with the agent's own restrictions (Claude Code plan mode,
 Codex read-only sandbox) kept as a second barrier.
 
-**`/arena`** — run the same task on several models at once, each in its own
-detached git worktree, then have the reviewer blind-judge the diffs:
-
-```
-arena results
-  A-codex-acp      codex-acp/gpt-5.5   failed/timeout  900s
-  B-claude-acp     claude-acp/default  completed        48s  2 files changed, 29 insertions(+)
-
-RANKING: B-claude-acp > A-codex-acp
-```
-
-Worktrees are kept afterwards so you can inspect every attempt yourself.
-
-**A run ledger and `/stats`** — every orchestration phase is appended to
-`orch_ledger.jsonl`: configured model vs. the model the provider actually
-reported, tokens, durations, verdicts, and the session's advertised context
-limit (a useful fingerprint for catching silent model downgrades —
-`GOOSE_<ROLE>_EXPECT_MODEL` warns when the reported model doesn't match).
-
 **Quality-of-life commands** — `/status` (roles, connection type, effort,
 usage), `/usage`, `/roles` (change role assignments without leaving the
 session), `/model provider/model` (switch the live session and persist it),
@@ -119,6 +142,15 @@ line, todo checklists (`☐/◐/✔`), role-colored response bullets during
 orchestration (planner cyan, implementer yellow, reviewer magenta), a live
 spinner with elapsed time and running tools, and mid-turn steering — type
 while a turn is running and it's injected at the next tool boundary.
+
+## How it compares
+
+| Project | Approach |
+|---|---|
+| [zeroshot](https://github.com/the-open-engine/zeroshot) | Plan/implement/verify loop on top of subscription CLIs, with blind validators. No goose extension ecosystem, arena, or exemplar learning. |
+| [Qwen Code's Agent Arena](https://qwenlm.github.io/qwen-code-docs/en/users/features/arena/) | Built-in one-shot multi-model arena — same task, isolated worktrees, pick a winner. Results are not accumulated or fed back into future runs. |
+| [upstream goose](https://github.com/aaif-goose/goose) | Model-driven orchestration is on the roadmap. No deterministic harness loop, fixed roles, or machine gates today. |
+| gooseherd | Fixed-role loop (plan → implement → review) with machine gates, plus a persistent per-repo arena ledger and exemplar hill-climbing. |
 
 ## Setup
 
