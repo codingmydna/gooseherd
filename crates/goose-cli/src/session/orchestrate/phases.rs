@@ -104,9 +104,22 @@ pub(super) fn plan_quality_action(
 pub(super) fn parse_verdict_approved(review: &str) -> bool {
     review
         .lines()
-        .find(|l| l.trim_start().starts_with("VERDICT:"))
-        .map(|l| l.contains("APPROVED"))
+        .find_map(|l| l.split_once("VERDICT:"))
+        .map(|(_, after)| after.contains("APPROVED"))
         .unwrap_or(false)
+}
+
+/// Appends an assistant text chunk to the collected role text. Streamed text
+/// deltas of one block must concatenate byte-exactly, but a text block that
+/// follows non-text content (a tool call/response) is a new message — without
+/// a separator it would glue onto the previous sentence and break line-based
+/// parsing such as the review verdict.
+pub(super) fn append_role_text(text: &mut String, chunk: &str, separator_pending: &mut bool) {
+    if *separator_pending && !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    *separator_pending = false;
+    text.push_str(chunk);
 }
 
 pub(super) fn phase_banner(text: &str, role: output::ActiveRole) {
@@ -297,6 +310,7 @@ pub(super) async fn stream_role_completion_status(
     let mut buffer = crate::session::streaming_buffer::MarkdownBuffer::new();
     let mut thinking_header_shown = false;
     let mut text = String::new();
+    let mut separator_pending = false;
     let mut usage: Option<ProviderUsage> = None;
     let _thinking_turn = output::begin_thinking_turn();
     let mut status_tick = tokio::time::interval(output::thinking_status_refresh_interval());
@@ -323,7 +337,9 @@ pub(super) async fn stream_role_completion_status(
                 if let Some(message) = message {
                     for content in &message.content {
                         if let goose::conversation::message::MessageContent::Text(t) = content {
-                            text.push_str(&t.text);
+                            append_role_text(&mut text, &t.text, &mut separator_pending);
+                        } else {
+                            separator_pending = true;
                         }
                     }
                     output::hide_thinking();

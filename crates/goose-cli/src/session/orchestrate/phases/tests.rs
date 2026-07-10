@@ -287,3 +287,64 @@ fn review_prompt_contains_reinforced_rubric() {
     assert!(super::REVIEW_SYSTEM_PROMPT.contains("reproduction"));
     assert!(super::REVIEW_SYSTEM_PROMPT.contains("fix direction"));
 }
+
+#[test]
+fn parse_verdict_finds_line_start_verdict() {
+    assert!(super::parse_verdict_approved(
+        "VERDICT: APPROVED\n\nAll checks passed."
+    ));
+    assert!(!super::parse_verdict_approved(
+        "VERDICT: REVISE\n1. Fix foo."
+    ));
+    assert!(!super::parse_verdict_approved("no verdict at all"));
+}
+
+#[test]
+fn parse_verdict_survives_glued_preamble() {
+    // Streamed assistant messages used to be concatenated without a
+    // separator, so the verdict could end up mid-line after a preamble.
+    assert!(super::parse_verdict_approved(
+        "I'll verify the file state first.VERDICT: APPROVED\n\nDetails follow."
+    ));
+    assert!(!super::parse_verdict_approved(
+        "Checking the diff now.VERDICT: REVISE\n1. Fix foo."
+    ));
+}
+
+#[test]
+fn parse_verdict_ignores_text_before_marker_on_same_line() {
+    // "APPROVED" appearing before the marker must not count.
+    assert!(!super::parse_verdict_approved(
+        "The plan said APPROVED is expected.VERDICT: REVISE\n1. Fix foo."
+    ));
+}
+
+#[test]
+fn append_role_text_separates_blocks_after_tool_content() {
+    let mut text = String::new();
+    let mut pending = false;
+    super::append_role_text(&mut text, "I'll check the fi", &mut pending);
+    super::append_role_text(&mut text, "le state first.", &mut pending);
+    assert_eq!(text, "I'll check the file state first.");
+    pending = true; // a tool request/response arrived
+    super::append_role_text(&mut text, "VERDICT: APPROVED", &mut pending);
+    assert_eq!(text, "I'll check the file state first.\nVERDICT: APPROVED");
+    // continuation deltas after the separator stay byte-exact
+    super::append_role_text(&mut text, " — details.", &mut pending);
+    assert_eq!(
+        text,
+        "I'll check the file state first.\nVERDICT: APPROVED — details."
+    );
+}
+
+#[test]
+fn append_role_text_no_separator_when_text_empty_or_newline_terminated() {
+    let mut text = String::new();
+    let mut pending = true;
+    super::append_role_text(&mut text, "first", &mut pending);
+    assert_eq!(text, "first");
+    text.push('\n');
+    pending = true;
+    super::append_role_text(&mut text, "second", &mut pending);
+    assert_eq!(text, "first\nsecond");
+}
