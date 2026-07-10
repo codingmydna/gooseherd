@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 use crate::session::{ledger, output, plan_exemplars, review_exemplars, CliSession};
 
 use super::gates::{
-    effective_gates, gate_passed_review_note, next_gate_step, partition_gates, record_gate_phase,
-    run_gates, GateOutcome, GateStep,
+    gate_banner_line, gate_passed_review_note, next_gate_step, partition_gates, record_gate_phase,
+    resolve_gates, run_gates, GateOutcome, GateStep,
 };
 use super::limits::handle_phase_error;
 use super::phases::{
@@ -170,6 +170,24 @@ impl CliSession {
         let run_id = format!("{:x}", ledger::now_ms());
         let workspace = setup_orch_workspace(&original_dir, &run_id);
         render_workspace_banner(&workspace, auto_merge);
+        let resolved_gates = resolve_gates(
+            &workspace.impl_dir,
+            Some(&workspace.original_dir),
+            config
+                .get_param::<Vec<String>>(GATES_KEY)
+                .unwrap_or_default(),
+        );
+        println!(
+            "  {}",
+            console::style(gate_banner_line(&resolved_gates)).dim()
+        );
+        if let Some(warning) = &resolved_gates.warning {
+            println!(
+                "  {} {}",
+                console::style("⚠").yellow(),
+                console::style(warning).yellow()
+            );
+        }
         if workspace.is_worktree() {
             self.agent
                 .config
@@ -291,12 +309,7 @@ impl CliSession {
             "You are the implementer in a plan/implement/review workflow. Execute the plan below for the task. Modify files and run verification with your tools. When done, report what you changed and how you verified it.{}\n\nTask:\n{}\n\nWorking directory:\n{}\n\nPlan:\n{}",
             implementer_playbook, task, working_dir, plan_text
         );
-        let configured_gates = effective_gates(
-            config
-                .get_param::<Vec<String>>(GATES_KEY)
-                .unwrap_or_default(),
-        );
-        let gate_partition = partition_gates(&workspace.impl_dir, &configured_gates);
+        let gate_partition = partition_gates(&workspace.impl_dir, &resolved_gates.gates);
         for skip in &gate_partition.skipped {
             println!(
                 "  {} {}",

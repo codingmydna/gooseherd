@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Result;
@@ -11,6 +11,8 @@ use goose::providers::generic_acp::{
     env_var_refs, generic_acp_provider_name, parse_acp_command, read_acp_agents,
     GOOSE_ACP_AGENTS_KEY,
 };
+
+use crate::session::{gate_banner_line, resolve_gates, GateSource};
 
 const CLAUDE_ADAPTER: &str = "claude-agent-acp";
 const CODEX_ADAPTER: &str = "codex-acp";
@@ -192,18 +194,31 @@ fn roles_configured(config: &Config) -> bool {
             .is_ok()
 }
 
-fn gate_advisory(config: &Config) -> Option<String> {
-    let gates = config
+fn repo_gate_check(config: &Config, repo_dir: &Path) -> Check {
+    let global_gates = config
         .get_param::<Vec<String>>("GOOSE_ORCH_GATES")
         .unwrap_or_default();
-    if gates.iter().any(|gate| !gate.trim().is_empty()) {
-        return None;
-    }
+    let resolved = resolve_gates(repo_dir, None, global_gates);
+    let detail = gate_banner_line(&resolved)
+        .strip_prefix("gates: ")
+        .unwrap_or_default()
+        .to_string();
 
-    Some(
-        "orch mechanical gates not configured (GOOSE_ORCH_GATES)\n      tip: set GOOSE_ORCH_GATES=[\"cargo fmt --check\", \"cargo test -p goose-cli\"] to run fmt/tests/lint before review"
-            .to_string(),
-    )
+    if let Some(warning) = resolved.warning {
+        Check {
+            label: "repo gates".to_string(),
+            ok: false,
+            detail: Some(detail),
+            fix: Some(warning),
+        }
+    } else if !resolved.gates.is_empty() || matches!(resolved.source, GateSource::LocalFile(_)) {
+        Check::ok("repo gates", Some(detail))
+    } else {
+        Check::fail(
+            "repo gates",
+            "commit .goose-gates.yaml with gate commands, or set GOOSE_ORCH_GATES; package.json and go.mod gates are derived automatically",
+        )
+    }
 }
 
 fn print_check(check: &Check) {
@@ -256,6 +271,7 @@ pub async fn handle_herd() -> Result<()> {
     let config = Config::global();
     let generic_acp_checks = check_generic_acp_agents(config);
     let mut roles_ok = roles_configured(config);
+    let repo_dir = std::env::current_dir()?;
 
     for check in claude_checks
         .iter()
@@ -281,15 +297,7 @@ pub async fn handle_herd() -> Result<()> {
     };
     print_check(&role_check);
 
-    if let Some(advisory) = gate_advisory(config) {
-        let mut lines = advisory.lines();
-        if let Some(label) = lines.next() {
-            println!("  {} {}", style("•").yellow(), label);
-        }
-        for line in lines {
-            println!("{}", style(line).cyan());
-        }
-    }
+    print_check(&repo_gate_check(config, &repo_dir));
 
     let both_vendors_available =
         claude_found && codex_found && claude_adapter_found && codex_adapter_found;
@@ -469,23 +477,53 @@ mod tests {
     }
 
     #[test]
-    fn gate_advisory_present_when_unset() {
+    fn repo_gate_check_fails_when_no_gates_are_available() {
         let config = test_config();
+        let temp = tempfile::tempdir().expect("tempdir");
 
-        let advisory = gate_advisory(&config).expect("advisory");
+        let check = repo_gate_check(&config, temp.path());
 
-        assert!(advisory.contains("GOOSE_ORCH_GATES"));
-        assert!(advisory.contains("cargo fmt --check"));
-        assert!(advisory.contains("cargo test -p goose-cli"));
+        assert!(!check.ok);
+        assert!(check
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains(".goose-gates.yaml")));
+        assert!(check
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("GOOSE_ORCH_GATES")));
     }
 
     #[test]
-    fn gate_advisory_absent_when_set() {
+    fn repo_gate_check_reports_global_gates() {
         let config = test_config();
+        let temp = tempfile::tempdir().expect("tempdir");
         config
             .set_param("GOOSE_ORCH_GATES", vec!["cargo fmt --check".to_string()])
             .unwrap();
 
-        assert!(gate_advisory(&config).is_none());
+        let check = repo_gate_check(&config, temp.path());
+
+        assert!(check.ok);
+        assert!(check
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("global GOOSE_ORCH_GATES")));
+    }
+
+    #[test]
+    fn repo_gate_check_reports_invalid_local_file() {
+        let config = test_config();
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join(".goose-gates.yaml"), "command: test\n")
+            .expect("write local gates");
+
+        let check = repo_gate_check(&config, temp.path());
+
+        assert!(!check.ok);
+        assert!(check
+            .fix
+            .as_deref()
+            .is_some_and(|fix| fix.contains("could not parse")));
     }
 }

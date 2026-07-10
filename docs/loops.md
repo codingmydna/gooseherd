@@ -21,10 +21,14 @@ the resulting diff against the task and plan.
 
 ## Verification Loop
 
-Use `GOOSE_ORCH_GATES` for mechanical gates inside `/orch`, and use
-`/goal --check` when a single deterministic success criterion should control
-retries. Gates run before review, so failing tests or lint bounce straight back
-to the worker without spending reviewer tokens.
+Use a repo-local `.goose-gates.yaml` for mechanical gates inside `/orch`, and
+use `/goal --check` when a single deterministic success criterion should control
+retries. The file is a YAML list such as `- pnpm run test`. Without it, orch
+derives existing `test` and `build` scripts from `package.json` using the repo's
+lockfile, or `go build ./...` and `go test ./...` from `go.mod`. It never derives
+lint commands. `GOOSE_ORCH_GATES` remains the global fallback (and the existing
+behavior for Cargo repos). Gates run before review, so failures bounce straight
+back to the worker without spending reviewer tokens.
 
 Example:
 

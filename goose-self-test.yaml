@@ -9,6 +9,7 @@ activities:
   - Test file operations (create, read, update, delete, undo)
   - Validate shell command execution and error handling
   - Validate goose worktree command workflow
+  - Validate orch repo gate resolution and source reporting
   - Analyze code structure and parsing capabilities
   - Test extension discovery and management
   - Test load tool for knowledge injection and discovery
@@ -91,6 +92,7 @@ instructions: |
   ### Phase 4: Advanced Self-Testing
   Push boundaries and test limits:
   - Intentionally trigger errors
+  - Verify orch reports whether repo gates are local, derived, global, or unavailable
   - Test timeout scenarios
   - Validate security controls
   - Measure performance metrics
