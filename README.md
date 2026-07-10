@@ -8,7 +8,9 @@
 
 *A gooseherd tends geese. This one tends AI models.*
 
-<!-- demo-gif -->
+![A real /orch run: the planner writes a plan, gpt-5.6 implements, the reviewer sends it back once, then approves](docs/assets/orch-demo.gif)
+
+*An unedited `/orch` run (idle time compressed): Claude plans, GPT-5.6 implements, the machine gates run, and the reviewer rejects cycle 1 before approving cycle 2.*
 
 **When to reach for gooseherd:**
 
