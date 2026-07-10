@@ -9,7 +9,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::orchestrate::{build_role_provider, resolve_all_roles, RoleConfig};
+use super::orchestrate::{
+    build_role_provider, git_evidence, orch_phase_idle_timeout, resolve_judge_role, RoleConfig,
+};
 use super::{ledger, output, CliSession};
 
 pub(crate) const GOAL_USAGE: &str = "\
@@ -138,35 +140,34 @@ impl GoalRunStats {
 }
 
 pub(super) fn parse_goal_verdict(text: &str) -> GoalVerdict {
-    let lines = text.lines().collect::<Vec<_>>();
-    for (index, line) in lines.iter().enumerate() {
-        let Some((met, inline_reason)) = parse_verdict_line(line) else {
-            continue;
-        };
-        let mut reason_parts = Vec::new();
-        if !inline_reason.is_empty() {
-            reason_parts.push(inline_reason);
-        }
-        reason_parts.extend(
-            lines
-                .iter()
-                .skip(index + 1)
-                .map(|line| line.trim())
-                .filter(|line| !line.is_empty())
-                .map(ToString::to_string),
-        );
-        let reason = reason_parts.join("\n");
-        return if met {
-            GoalVerdict::Met(default_reason(reason, "Evaluator marked the goal met."))
-        } else {
-            GoalVerdict::NotMet(default_reason(reason, "Evaluator marked the goal not met."))
-        };
-    }
+    // Last verdict line wins (shared verdict protocol): rubric echoes and quoted
+    // tokens earlier in the reply lose to the evaluator's closing verdict.
+    let Some((index, (met, inline_reason))) =
+        crate::session::verdict::last_line_match(text, parse_verdict_line)
+    else {
+        return GoalVerdict::NoVerdict(default_reason(
+            text.trim().to_string(),
+            "Evaluator did not return GOAL_MET or GOAL_NOT_MET.",
+        ));
+    };
 
-    GoalVerdict::NoVerdict(default_reason(
-        text.trim().to_string(),
-        "Evaluator did not return GOAL_MET or GOAL_NOT_MET.",
-    ))
+    let mut reason_parts = Vec::new();
+    if !inline_reason.is_empty() {
+        reason_parts.push(inline_reason);
+    }
+    reason_parts.extend(
+        text.lines()
+            .skip(index + 1)
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string),
+    );
+    let reason = reason_parts.join("\n");
+    if met {
+        GoalVerdict::Met(default_reason(reason, "Evaluator marked the goal met."))
+    } else {
+        GoalVerdict::NotMet(default_reason(reason, "Evaluator marked the goal not met."))
+    }
 }
 
 fn parse_verdict_line(line: &str) -> Option<(bool, String)> {
@@ -386,6 +387,23 @@ fn provider_usage_total(usage: &ProviderUsage) -> i64 {
         .unwrap_or(0) as i64
 }
 
+fn combine_provider_usage(first: &ProviderUsage, second: &ProviderUsage) -> ProviderUsage {
+    let opt_add = |a: Option<i32>, b: Option<i32>| match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    ProviderUsage::new(
+        first.model.clone(),
+        Usage::new(
+            opt_add(first.usage.input_tokens, second.usage.input_tokens),
+            opt_add(first.usage.output_tokens, second.usage.output_tokens),
+            opt_add(first.usage.total_tokens, second.usage.total_tokens),
+        ),
+    )
+}
+
 fn provider_usage_tokens(usage: Option<&ProviderUsage>) -> (Option<i64>, Option<i64>) {
     usage
         .map(|usage| {
@@ -409,19 +427,20 @@ fn resolve_evaluator_role() -> Result<RoleConfig> {
             effort: config.get_param::<String>(EVALUATOR_EFFORT_KEY).ok(),
         }),
         (None, None) => {
-            let roles = resolve_all_roles().map_err(|error| {
+            // No explicit evaluator: fall back to the judge role, which resolves
+            // GOOSE_JUDGE_* → reviewer → planner → session default.
+            let mut role = resolve_judge_role().map_err(|error| {
                 anyhow::anyhow!(
-                    "No evaluator model configured. Set {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or configure the reviewer fallback with GOOSE_REVIEWER_PROVIDER and GOOSE_REVIEWER_MODEL. Reviewer fallback resolution failed: {error}"
+                    "No evaluator model configured. Set {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or configure the judge/reviewer fallback with GOOSE_JUDGE_* / GOOSE_REVIEWER_*. Fallback resolution failed: {error}"
                 )
             })?;
-            let mut role = roles.reviewer;
             if let Ok(effort) = config.get_param::<String>(EVALUATOR_EFFORT_KEY) {
                 role.effort = Some(effort);
             }
             Ok(role)
         }
         _ => anyhow::bail!(
-            "Incomplete evaluator config. Set both {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or unset both to fall back to GOOSE_REVIEWER_PROVIDER / GOOSE_REVIEWER_MODEL."
+            "Incomplete evaluator config. Set both {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or unset both to fall back to GOOSE_JUDGE_* / GOOSE_REVIEWER_*."
         ),
     }
 }
@@ -432,7 +451,13 @@ fn goal_retry_prompt(goal: &str, feedback: &str) -> String {
     )
 }
 
-fn evaluator_prompt(goal: &str, attempt: u32, assistant_text: &str, check: Option<&str>) -> String {
+fn evaluator_prompt(
+    goal: &str,
+    attempt: u32,
+    assistant_text: &str,
+    git_evidence: &str,
+    check: Option<&str>,
+) -> String {
     let check_note = match check {
         Some(command) => format!(
             "\nA deterministic check was configured (`{command}`), but this evaluator prompt should only be used when no check is being run."
@@ -440,7 +465,7 @@ fn evaluator_prompt(goal: &str, attempt: u32, assistant_text: &str, check: Optio
         None => String::new(),
     };
     format!(
-        "Goal:\n{goal}\n\nAttempt: {attempt}\n\nWorker's latest response:\n{assistant_text}{check_note}\n\nReturn GOAL_MET only if the worker's attempt fully satisfies the goal."
+        "Goal:\n{goal}\n\nAttempt: {attempt}\n\nWorker's latest response:\n{assistant_text}\n\nGit evidence:\n{git_evidence}{check_note}\n\nReturn GOAL_MET only if the worker's attempt fully satisfies the goal. Judge against the git evidence, not just the worker's narration."
     )
 }
 
@@ -636,15 +661,11 @@ impl CliSession {
         }
 
         let role = evaluator_role.context("evaluator role missing")?;
-        let prev_plan_explore = Config::global()
-            .get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")
-            .ok();
-        Config::global().set_param("GOOSE_ACP_PLAN_EXPLORE", true)?;
+        // Give the evaluator read-only exploration via an in-memory override
+        // (never a config-file write), cleared as soon as it is constructed.
+        Config::global().set_runtime_override("GOOSE_ACP_PLAN_EXPLORE", true)?;
         let built = build_role_provider(role, working_dir).await;
-        match prev_plan_explore {
-            Some(value) => Config::global().set_param("GOOSE_ACP_PLAN_EXPLORE", value)?,
-            None => Config::global().set_param("GOOSE_ACP_PLAN_EXPLORE", false)?,
-        }
+        Config::global().clear_runtime_override("GOOSE_ACP_PLAN_EXPLORE");
         let (provider, model_config) = built.with_context(|| {
             format!(
                 "Failed to create evaluator provider {}/{}. Set {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or unset them to use the reviewer fallback (GOOSE_REVIEWER_PROVIDER / GOOSE_REVIEWER_MODEL).",
@@ -661,11 +682,17 @@ impl CliSession {
             role.provider_name, role.model
         )));
         let assistant_text = self.goal_last_assistant_text().unwrap_or_default();
-        let request =
-            Message::user().with_text(evaluator_prompt(goal, attempt, &assistant_text, check));
+        let evidence = git_evidence(working_dir);
+        let messages = vec![Message::user().with_text(evaluator_prompt(
+            goal,
+            attempt,
+            &assistant_text,
+            &evidence.text,
+            check,
+        ))];
         let completion = goose::session_context::with_session_id(
             Some(self.session_id.clone()),
-            provider.complete(&model_config, EVALUATOR_SYSTEM_PROMPT, &[request], &[]),
+            provider.complete(&model_config, EVALUATOR_SYSTEM_PROMPT, &messages, &[]),
         )
         .await
         .with_context(|| {
@@ -674,10 +701,57 @@ impl CliSession {
                 role.provider_name, role.model
             )
         });
+        let (message, usage) = match completion {
+            Ok(pair) => pair,
+            Err(err) => {
+                output::set_active_role_status(None);
+                output::set_thinking_context(None);
+                return Err(err);
+            }
+        };
+        let verdict = parse_goal_verdict(&message.as_concat_text());
+        let (verdict, usage) = if matches!(verdict, GoalVerdict::NoVerdict(_)) {
+            self.reprompt_goal_verdict(&provider, &model_config, messages, message, verdict, usage)
+                .await
+        } else {
+            (verdict, usage)
+        };
         output::set_active_role_status(None);
         output::set_thinking_context(None);
-        let (message, usage) = completion?;
-        Ok((parse_goal_verdict(&message.as_concat_text()), Some(usage)))
+        Ok((verdict, Some(usage)))
+    }
+
+    /// One bounded reprompt when the evaluator omitted its `GOAL_MET` /
+    /// `GOAL_NOT_MET` line. Replays the evaluation and the evaluator's reply,
+    /// asks for only the verdict line, and keeps the original no-verdict outcome
+    /// if that also fails.
+    async fn reprompt_goal_verdict(
+        &self,
+        provider: &std::sync::Arc<dyn goose::providers::base::Provider>,
+        model_config: &goose_providers::model::ModelConfig,
+        mut messages: Vec<Message>,
+        first_reply: Message,
+        no_verdict: GoalVerdict,
+        first_usage: ProviderUsage,
+    ) -> (GoalVerdict, ProviderUsage) {
+        messages.push(first_reply);
+        messages.push(Message::user().with_text(crate::session::verdict::GOAL_REPROMPT));
+        // Bound the reprompt: an evaluator that already stalled once must not
+        // hang a headless goal run forever (complete() has no timeout of its own).
+        let completion = goose::session_context::with_session_id(
+            Some(self.session_id.clone()),
+            provider.complete(model_config, EVALUATOR_SYSTEM_PROMPT, &messages, &[]),
+        );
+        match tokio::time::timeout(orch_phase_idle_timeout(), completion).await {
+            Ok(Ok((message, retry_usage))) => {
+                let combined = combine_provider_usage(&first_usage, &retry_usage);
+                match parse_goal_verdict(&message.as_concat_text()) {
+                    GoalVerdict::NoVerdict(_) => (no_verdict, combined),
+                    resolved => (resolved, combined),
+                }
+            }
+            _ => (no_verdict, first_usage),
+        }
     }
 
     pub(super) async fn render_goal_status(&self) -> Result<()> {
@@ -860,6 +934,9 @@ impl CliSession {
             plan_exemplar_run_ids: None,
             review_exemplars_injected: None,
             review_exemplar_run_ids: None,
+            playbook_injected: None,
+            arena_rank: None,
+            arena_winner: None,
         });
     }
 
@@ -890,6 +967,9 @@ impl CliSession {
             plan_exemplar_run_ids: None,
             review_exemplars_injected: None,
             review_exemplar_run_ids: None,
+            playbook_injected: None,
+            arena_rank: None,
+            arena_winner: None,
         });
     }
 }
@@ -897,6 +977,20 @@ impl CliSession {
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    #[test]
+    fn evaluator_prompt_includes_git_evidence() {
+        let prompt = super::evaluator_prompt(
+            "make the homepage load fast",
+            1,
+            "I optimized images.",
+            "$ git diff HEAD\n+ optimized",
+            None,
+        );
+        assert!(prompt.contains("Git evidence:"));
+        assert!(prompt.contains("+ optimized"));
+        assert!(prompt.contains("Judge against the git evidence"));
+    }
 
     #[test]
     fn parse_goal_verdict_extracts_met_reason() {
@@ -919,6 +1013,27 @@ mod tests {
             verdict,
             super::GoalVerdict::NotMet("Missing regression coverage.".to_string())
         );
+    }
+
+    #[test]
+    fn parse_goal_verdict_last_verdict_line_wins() {
+        // An early quoted verdict must lose to the evaluator's closing verdict.
+        let verdict = super::parse_goal_verdict(
+            "GOAL_MET looked plausible at first\nAfter re-checking:\nGOAL_NOT_MET\nThe check still fails.",
+        );
+
+        assert_eq!(
+            verdict,
+            super::GoalVerdict::NotMet("The check still fails.".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_goal_verdict_without_marker_is_no_verdict() {
+        assert!(matches!(
+            super::parse_goal_verdict("The goal looks done to me, nice work."),
+            super::GoalVerdict::NoVerdict(_)
+        ));
     }
 
     #[test]

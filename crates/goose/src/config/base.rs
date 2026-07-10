@@ -133,6 +133,13 @@ pub struct Config {
     secrets: SecretStorage,
     guard: Mutex<()>,
     secrets_cache: Arc<Mutex<Option<HashMap<String, Value>>>>,
+    /// Process-local, non-persisted parameter overrides. Consulted by
+    /// `get_param` after environment variables but before any config file, so a
+    /// caller (e.g. the orchestrator toggling permission modes) can steer
+    /// resolution for the lifetime of the process without ever touching the
+    /// user's `config.yaml`. A crash therefore cannot leave a persisted
+    /// downgrade behind, and concurrent runs don't race on the file.
+    runtime_overrides: Arc<Mutex<HashMap<String, Value>>>,
 }
 
 enum SecretStorage {
@@ -183,6 +190,7 @@ impl Default for Config {
             },
             guard: Mutex::new(()),
             secrets_cache: Arc::new(Mutex::new(None)),
+            runtime_overrides: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let keyring_disabled = env::var("GOOSE_DISABLE_KEYRING").is_ok()
@@ -195,6 +203,7 @@ impl Default for Config {
             secrets,
             guard: Mutex::new(()),
             secrets_cache: Arc::new(Mutex::new(None)),
+            runtime_overrides: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -413,6 +422,7 @@ impl Config {
             secrets,
             guard: Mutex::new(()),
             secrets_cache: Arc::new(Mutex::new(None)),
+            runtime_overrides: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -431,6 +441,7 @@ impl Config {
             },
             guard: Mutex::new(()),
             secrets_cache: Arc::new(Mutex::new(None)),
+            runtime_overrides: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -445,6 +456,7 @@ impl Config {
             },
             guard: Mutex::new(()),
             secrets_cache: Arc::new(Mutex::new(None)),
+            runtime_overrides: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -735,6 +747,12 @@ impl Config {
             return Ok(serde_json::from_value(value)?);
         }
 
+        // In-memory overrides sit where the config file used to for these keys:
+        // below an explicit environment variable, above the persisted file.
+        if let Some(value) = self.runtime_override(key) {
+            return Ok(serde_json::from_value(value)?);
+        }
+
         let values = self.load()?;
         let value = values
             .get(key)
@@ -802,6 +820,66 @@ impl Config {
             values.insert(serde_yaml::to_value(key)?, serde_yaml::to_value(value)?);
         }
         self.save_values(&values)
+    }
+
+    /// Set a process-local, non-persisted override for a parameter.
+    ///
+    /// The override is consulted by [`Config::get_param`] after environment
+    /// variables but before any config file, and is never written to disk. Use
+    /// it for transient, run-scoped steering (permission modes during
+    /// orchestration) that must not survive a crash or race concurrent runs.
+    /// Explicit `set_param`/`configure` writes still persist as before.
+    pub fn set_runtime_override<V: Serialize>(
+        &self,
+        key: &str,
+        value: V,
+    ) -> Result<(), ConfigError> {
+        let value = serde_json::to_value(value)?;
+        self.runtime_overrides
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value);
+        Ok(())
+    }
+
+    /// Remove a previously set runtime override, if any.
+    pub fn clear_runtime_override(&self, key: &str) {
+        self.runtime_overrides.lock().unwrap().remove(key);
+    }
+
+    fn runtime_override(&self, key: &str) -> Option<Value> {
+        self.runtime_overrides.lock().unwrap().get(key).cloned()
+    }
+
+    /// One-time self-heal for the internal-only `GOOSE_ORCH_IMPLEMENT_ACTIVE`
+    /// flag that an older build (which used the config file as an IPC channel)
+    /// could leave persisted as `true` after a crash mid-run. Removes it only
+    /// when truthy, and returns the keys it cleared so the caller can notify. A
+    /// clean config is left untouched (no write). `GOOSE_ACP_PLAN_EXPLORE` is a
+    /// documented user-settable knob and is deliberately never healed.
+    pub fn heal_stale_orch_flags(&self) -> Vec<String> {
+        const STALE_TRANSIENT_KEYS: [&str; 1] = ["GOOSE_ORCH_IMPLEMENT_ACTIVE"];
+
+        let _guard = self.guard.lock().unwrap();
+        let mut values = match self.load_write_config() {
+            Ok(values) => values,
+            Err(_) => return Vec::new(),
+        };
+        let mut healed = Vec::new();
+        for key in STALE_TRANSIENT_KEYS {
+            let is_truthy = values
+                .get(key)
+                .map(|v| v.as_bool() == Some(true) || v.as_str() == Some("true"))
+                .unwrap_or(false);
+            if is_truthy {
+                values.shift_remove(key);
+                healed.push(key.to_string());
+            }
+        }
+        if !healed.is_empty() {
+            let _ = self.save_values(&values);
+        }
+        healed
     }
 
     /// Delete a configuration value in the config file.
@@ -2018,6 +2096,91 @@ mod tests {
 
         let result: Result<String, ConfigError> = config.get_param("nonexistent_key");
         assert!(matches!(result, Err(ConfigError::NotFound(_))));
+    }
+
+    #[test]
+    fn runtime_override_wins_over_file_and_clears_back() -> Result<(), ConfigError> {
+        let _guard = env_lock::lock_env([("GOOSE_ACP_PLAN_EXPLORE", None::<&str>)]);
+        let config = new_test_config();
+        config.set_param("GOOSE_ACP_PLAN_EXPLORE", false)?;
+
+        // With no override, the persisted file value is returned.
+        assert!(!config.get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")?);
+
+        // The override takes precedence while it is set.
+        config.set_runtime_override("GOOSE_ACP_PLAN_EXPLORE", true)?;
+        assert!(config.get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")?);
+
+        // Clearing it restores the persisted value.
+        config.clear_runtime_override("GOOSE_ACP_PLAN_EXPLORE");
+        assert!(!config.get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")?);
+        Ok(())
+    }
+
+    #[test]
+    fn env_var_still_wins_over_runtime_override() -> Result<(), ConfigError> {
+        let _guard = env_lock::lock_env([("GOOSE_MODE", Some("chat"))]);
+        let config = new_test_config();
+
+        config.set_runtime_override("GOOSE_MODE", "auto")?;
+
+        // An explicit environment variable outranks the in-memory override,
+        // preserving the pre-existing precedence order (env > file).
+        let value: String = config.get_param("GOOSE_MODE")?;
+        assert_eq!(value, "chat");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_override_never_writes_config_file() -> Result<(), ConfigError> {
+        let config_file = NamedTempFile::new().unwrap();
+        let secrets_file = NamedTempFile::new().unwrap();
+        let config = Config::new_with_file_secrets(config_file.path(), secrets_file.path())?;
+
+        // Simulate an orchestration toggle followed by cleanup.
+        config.set_runtime_override("GOOSE_ORCH_IMPLEMENT_ACTIVE", true)?;
+        config.set_runtime_override("GOOSE_MODE", "approve")?;
+        config.clear_runtime_override("GOOSE_ORCH_IMPLEMENT_ACTIVE");
+
+        let content = std::fs::read_to_string(config_file.path())?;
+        assert!(
+            !content.contains("GOOSE_ORCH_IMPLEMENT_ACTIVE"),
+            "runtime overrides must not persist to config.yaml"
+        );
+        assert!(!content.contains("GOOSE_MODE"));
+        Ok(())
+    }
+
+    #[test]
+    fn heal_stale_orch_flags_removes_only_truthy_transient_keys() -> Result<(), ConfigError> {
+        let _guard = env_lock::lock_env([
+            ("GOOSE_ORCH_IMPLEMENT_ACTIVE", None::<&str>),
+            ("GOOSE_ACP_PLAN_EXPLORE", None),
+        ]);
+        let config = new_test_config();
+        config.set_param("GOOSE_ORCH_IMPLEMENT_ACTIVE", true)?;
+        // A deliberately-set, documented user knob — must survive healing even
+        // when truthy (it is not an internal IPC flag).
+        config.set_param("GOOSE_ACP_PLAN_EXPLORE", true)?;
+        config.set_param("unrelated_key", "keep_me")?;
+
+        let healed = config.heal_stale_orch_flags();
+
+        assert_eq!(healed, vec!["GOOSE_ORCH_IMPLEMENT_ACTIVE".to_string()]);
+        assert!(matches!(
+            config.get_param::<bool>("GOOSE_ORCH_IMPLEMENT_ACTIVE"),
+            Err(ConfigError::NotFound(_))
+        ));
+        // The documented knob and unrelated keys are left intact.
+        assert!(config.get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")?);
+        assert_eq!(config.get_param::<String>("unrelated_key")?, "keep_me");
+        Ok(())
+    }
+
+    #[test]
+    fn heal_stale_orch_flags_is_noop_on_clean_config() {
+        let config = new_test_config();
+        assert!(config.heal_stale_orch_flags().is_empty());
     }
 
     #[test]

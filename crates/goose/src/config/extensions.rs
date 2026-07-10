@@ -32,10 +32,24 @@ pub fn name_to_key(name: &str) -> String {
     result.to_lowercase()
 }
 
+/// Builtin MCP extensions that gooseherd removed (goose-mcp is memory-only).
+/// Existing configs that still reference them must warn-and-skip, never fail
+/// the session.
+pub(crate) const REMOVED_BUILTIN_EXTENSIONS: &[&str] =
+    &["tutorial", "computercontroller", "autovisualiser"];
+
 pub(crate) fn is_extension_available(config: &ExtensionConfig) -> bool {
     match config {
         ExtensionConfig::Platform { name, .. } => {
             crate::agents::extension::PLATFORM_EXTENSIONS.contains_key(name_to_key(name).as_str())
+        }
+        ExtensionConfig::Builtin { name, .. }
+            if REMOVED_BUILTIN_EXTENSIONS.contains(&name_to_key(name).as_str()) =>
+        {
+            warn!(
+                "builtin extension '{name}' was removed in gooseherd; remove it from config.yaml"
+            );
+            false
         }
         _ => true,
     }
@@ -352,6 +366,21 @@ mod tests {
 
         assert!(!is_extension_available(&unknown_platform));
         assert!(is_extension_available(&builtin));
+    }
+
+    #[test]
+    fn test_removed_builtin_extensions_are_skipped() {
+        for removed in REMOVED_BUILTIN_EXTENSIONS {
+            let ext = builtin_entry(removed, true).config;
+            assert!(
+                !is_extension_available(&ext),
+                "removed builtin `{removed}` should be skipped, not loaded"
+            );
+        }
+        // A surviving builtin (memory) is still available.
+        assert!(is_extension_available(
+            &builtin_entry("memory", true).config
+        ));
     }
 
     #[test]

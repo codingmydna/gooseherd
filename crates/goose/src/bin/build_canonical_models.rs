@@ -9,7 +9,7 @@
 ///
 use anyhow::{Context, Result};
 use clap::Parser;
-use goose::providers::create_with_named_model;
+use goose::providers::create;
 use goose_providers::canonical::{
     canonical_name, CanonicalModel, CanonicalModelRegistry, Limit, Modalities, Modality,
     ModelMapping, Pricing, ThinkingMode,
@@ -624,7 +624,7 @@ async fn check_provider(
 ) -> Result<(Vec<String>, Vec<ModelMapping>, Vec<String>)> {
     println!("Checking provider: {}", provider_name);
 
-    let provider = match create_with_named_model(provider_name, Vec::new()).await {
+    let provider = match create(provider_name, Vec::new()).await {
         Ok(p) => p,
         Err(e) => {
             println!("  ⚠ Failed to create provider: {}", e);
@@ -684,14 +684,7 @@ async fn check_canonical_mappings() -> Result<()> {
         ("anthropic", "claude-3-5-sonnet-20241022"),
         ("openai", "gpt-4"),
         ("openrouter", "anthropic/claude-3.5-sonnet"),
-        ("google", "gemini-1.5-pro-002"),
-        ("databricks", "claude-3-5-sonnet-20241022"),
-        ("tetrate", "claude-3-5-sonnet-computer-use"),
-        ("xai", "grok-code-fast-1"),
-        ("azure_openai", "gpt-4o"),
-        ("aws_bedrock", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
         ("venice", "llama-3.3-70b"),
-        ("gcp_vertex_ai", "gemini-1.5-pro-002"),
     ];
 
     let mut report = MappingReport::new();

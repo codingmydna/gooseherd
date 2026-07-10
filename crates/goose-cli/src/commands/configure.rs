@@ -14,13 +14,10 @@ use goose::config::extensions::{
 };
 use goose::config::paths::Paths;
 use goose::config::permission::PermissionLevel;
-use goose::config::signup_tetrate::TetrateAuth;
+use goose::config::search_path::SearchPaths;
 use goose::config::{
-    configure_tetrate, Config, ConfigError, ExperimentManager, ExtensionEntry, GooseMode,
-    PermissionManager,
+    Config, ConfigError, ExperimentManager, ExtensionEntry, GooseMode, PermissionManager,
 };
-#[cfg(feature = "telemetry")]
-use goose::posthog::{get_telemetry_choice, TELEMETRY_ENABLED_KEY};
 use goose::providers::base::ConfigKey;
 use goose::providers::provider_test::test_provider_configuration;
 use goose::providers::{create, providers, retry_operation, RetryConfig};
@@ -51,68 +48,6 @@ pub async fn handle_configure() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(feature = "telemetry")]
-pub fn configure_telemetry_consent_dialog() -> anyhow::Result<bool> {
-    let config = Config::global();
-
-    println!();
-    println!("{}", style("Help improve goose").bold());
-    println!();
-    println!(
-        "{}",
-        style("Would you like to help improve goose by sharing anonymous usage data?").dim()
-    );
-    println!(
-        "{}",
-        style("This helps us understand how goose is used and identify areas for improvement.")
-            .dim()
-    );
-    println!();
-    println!("{}", style("What we collect:").dim());
-    println!(
-        "{}",
-        style("  • Operating system, version, and architecture").dim()
-    );
-    println!("{}", style("  • goose version and install method").dim());
-    println!("{}", style("  • Provider and model used").dim());
-    println!(
-        "{}",
-        style("  • Extensions and tool usage counts (names only)").dim()
-    );
-    println!(
-        "{}",
-        style("  • Session metrics (duration, interaction count, token usage)").dim()
-    );
-    println!(
-        "{}",
-        style("  • Error types (e.g., \"rate_limit\", \"auth\" - no details)").dim()
-    );
-    println!();
-    println!(
-        "{}",
-        style("We never collect your conversations, code, tool arguments, error messages,").dim()
-    );
-    println!(
-        "{}",
-        style("or any personal data. You can change this anytime with 'goose configure'.").dim()
-    );
-    println!();
-
-    let enabled = cliclack::confirm("Share anonymous usage data to help improve goose?")
-        .initial_value(true)
-        .interact()?;
-
-    config.set_param(TELEMETRY_ENABLED_KEY, enabled)?;
-
-    if enabled {
-        let _ = cliclack::log::success("Thank you for helping improve goose!");
-    } else {
-        let _ = cliclack::log::info("Telemetry disabled. You can enable it anytime in settings.");
-    }
-
-    Ok(enabled)
-}
-
 async fn handle_first_time_setup(config: &Config) -> anyhow::Result<()> {
     println!();
     println!("{}", style("Welcome to goose! Let's get you set up.").dim());
@@ -122,46 +57,35 @@ async fn handle_first_time_setup(config: &Config) -> anyhow::Result<()> {
     );
     println!();
 
-    #[cfg(feature = "telemetry")]
-    configure_telemetry_consent_dialog()?;
-
     println!();
     cliclack::intro(style(" goose-configure ").on_cyan().black())?;
 
+    let acp_detected = cli_on_path("claude") || cli_on_path("codex");
+    let acp_label = if acp_detected {
+        "Claude Code / Codex via ACP (Recommended)"
+    } else {
+        "Agents via ACP (Claude Code / Codex / any agent)"
+    };
+    let acp_hint = if acp_detected {
+        "Detected a vendor CLI — drive it on your existing subscription; runs `goose herd` checks"
+    } else {
+        "Drive a vendor agent CLI on your subscription; runs `goose herd` checks"
+    };
+
     let setup_method = cliclack::select("How would you like to set up your provider?")
-        .item(
-            "openrouter",
-            "OpenRouter Login (Recommended)",
-            "Sign in with OpenRouter to automatically configure models",
-        )
-        .item(
-            "tetrate",
-            "Tetrate Agent Router Service Login",
-            "Sign in with Tetrate Agent Router Service to automatically configure models",
-        )
+        .item("acp", acp_label, acp_hint)
         .item(
             "manual",
-            "Manual Configuration",
-            "Choose a provider and enter credentials manually",
+            "API provider",
+            "Choose a provider and enter API credentials manually",
         )
         .interact()?;
 
     match setup_method {
-        "openrouter" => {
-            if let Err(e) = handle_openrouter_auth().await {
-                let _ = config.clear();
+        "acp" => {
+            if let Err(e) = crate::commands::herd::handle_herd().await {
                 println!(
-                    "\n  {} OpenRouter authentication failed: {} \n  Please try again or use manual configuration",
-                    style("Error").red().italic(),
-                    e,
-                );
-            }
-        }
-        "tetrate" => {
-            if let Err(e) = handle_tetrate_auth().await {
-                let _ = config.clear();
-                println!(
-                    "\n  {} Tetrate Agent Router Service authentication failed: {} \n  Please try again or use manual configuration",
+                    "\n  {} ACP setup check failed: {} \n  You can rerun `goose herd`, or choose manual configuration.",
                     style("Error").red().italic(),
                     e,
                 );
@@ -171,6 +95,11 @@ async fn handle_first_time_setup(config: &Config) -> anyhow::Result<()> {
         _ => unreachable!(),
     }
     Ok(())
+}
+
+/// Whether a vendor CLI (e.g. `claude`, `codex`) resolves on the user's PATH.
+fn cli_on_path(name: &str) -> bool {
+    SearchPaths::builder().resolve(name).is_ok()
 }
 
 async fn handle_manual_provider_setup(config: &Config) {
@@ -1001,16 +930,6 @@ fn collect_headers() -> anyhow::Result<HashMap<String, String>> {
 fn configure_builtin_extension() -> anyhow::Result<()> {
     let extensions = vec![
         (
-            "autovisualiser",
-            "Auto Visualiser",
-            "Data visualisation and UI generation tools",
-        ),
-        (
-            "computercontroller",
-            "Computer Controller",
-            "controls for webscraping, file caching, and automations",
-        ),
-        (
             "developer",
             "Developer Tools",
             "Code editing and shell access",
@@ -1019,11 +938,6 @@ fn configure_builtin_extension() -> anyhow::Result<()> {
             "memory",
             "Memory",
             "Tools to save and retrieve durable memories",
-        ),
-        (
-            "tutorial",
-            "Tutorial",
-            "Access interactive tutorials and guides",
         ),
     ];
 
@@ -1250,20 +1164,11 @@ pub fn remove_extension_dialog() -> anyhow::Result<()> {
 }
 
 pub async fn configure_settings_dialog() -> anyhow::Result<()> {
-    #[allow(unused_mut)]
-    let mut setting_select = cliclack::select("What setting would you like to configure?").item(
+    let setting_select = cliclack::select("What setting would you like to configure?").item(
         "goose_mode",
         "goose mode",
         "Configure goose mode",
     );
-    #[cfg(feature = "telemetry")]
-    {
-        setting_select = setting_select.item(
-            "telemetry",
-            "Telemetry",
-            "Enable or disable anonymous usage data collection",
-        );
-    }
     let setting_type = setting_select
         .item(
             "tool_permission",
@@ -1302,10 +1207,6 @@ pub async fn configure_settings_dialog() -> anyhow::Result<()> {
     match setting_type {
         "goose_mode" => {
             configure_goose_mode_dialog()?;
-        }
-        #[cfg(feature = "telemetry")]
-        "telemetry" => {
-            configure_telemetry_dialog()?;
         }
         "tool_permission" => {
             configure_tool_permissions_dialog().await.and(Ok(()))?;
@@ -1377,40 +1278,6 @@ pub fn configure_goose_mode_dialog() -> anyhow::Result<()> {
         GooseMode::Chat => "Set to Chat Mode - no tools or modifications enabled",
     };
     cliclack::outro(msg)?;
-    Ok(())
-}
-
-#[cfg(feature = "telemetry")]
-pub fn configure_telemetry_dialog() -> anyhow::Result<()> {
-    let config = Config::global();
-
-    if std::env::var("GOOSE_TELEMETRY_OFF").is_ok() {
-        let _ = cliclack::log::info(
-            "Notice: GOOSE_TELEMETRY_OFF environment variable is set and will override the configuration here.",
-        );
-    }
-
-    let current_choice = get_telemetry_choice();
-    let current_status = match current_choice {
-        Some(true) => "Enabled",
-        Some(false) => "Disabled",
-        None => "Not set",
-    };
-
-    let _ = cliclack::log::info(format!("Current telemetry status: {}", current_status));
-
-    let enabled = cliclack::confirm("Share anonymous usage data to help improve goose?")
-        .initial_value(current_choice.unwrap_or(true))
-        .interact()?;
-
-    config.set_param(TELEMETRY_ENABLED_KEY, enabled)?;
-
-    if enabled {
-        cliclack::outro("Telemetry enabled - thank you for helping improve goose!")?;
-    } else {
-        cliclack::outro("Telemetry disabled")?;
-    }
-
     Ok(())
 }
 
@@ -1770,165 +1637,6 @@ pub fn configure_max_turns_dialog() -> anyhow::Result<()> {
         "Set maximum turns to {} - goose will ask for input after {} consecutive actions",
         max_turns, max_turns
     ))?;
-
-    Ok(())
-}
-
-/// Handle OpenRouter authentication
-pub async fn handle_openrouter_auth() -> anyhow::Result<()> {
-    use goose::config::{configure_openrouter, signup_openrouter::OpenRouterAuth};
-    use goose::conversation::message::Message;
-    use goose::providers::create;
-
-    // Use the OpenRouter authentication flow
-    let mut auth_flow = OpenRouterAuth::new()?;
-    let api_key = auth_flow.complete_flow().await?;
-    println!("\nAuthentication complete!");
-
-    // Get config instance
-    let config = Config::global();
-
-    // Use the existing configure_openrouter function to set everything up
-    println!("\nConfiguring OpenRouter...");
-    configure_openrouter(config, api_key)?;
-
-    println!("✓ OpenRouter configuration complete");
-    println!("✓ Models configured successfully");
-
-    // Test configuration - get the model that was configured
-    println!("\nTesting configuration...");
-    let configured_model: String = config.get_goose_model()?;
-    let model_config =
-        match goose::model_config::model_config_from_user_config("openrouter", &configured_model) {
-            Ok(config) => config,
-            Err(e) => {
-                eprintln!("⚠️  Invalid model configuration: {}", e);
-                eprintln!("Your settings have been saved. Please check your model configuration.");
-                return Ok(());
-            }
-        };
-
-    match create("openrouter", Vec::new()).await {
-        Ok(provider) => {
-            let test_result = provider
-                .complete(
-                    &model_config,
-                    "You are goose, an AI assistant.",
-                    &[Message::user().with_text("Say 'Configuration test successful!'")],
-                    &[],
-                )
-                .await;
-
-            match test_result {
-                Ok(_) => {
-                    println!("✓ Configuration test passed!");
-
-                    // Enable the developer extension by default if not already enabled
-                    let entries = get_all_extensions();
-                    let has_developer = entries
-                        .iter()
-                        .any(|e| e.config.name() == "developer" && e.enabled);
-
-                    if !has_developer {
-                        set_extension(ExtensionEntry {
-                            enabled: true,
-                            config: ExtensionConfig::Platform {
-                                name: "developer".to_string(),
-                                description: "Developer extension".to_string(),
-                                display_name: Some(goose::config::DEFAULT_DISPLAY_NAME.to_string()),
-                                bundled: Some(true),
-                                available_tools: Vec::new(),
-                            },
-                        });
-                        println!("✓ Developer extension enabled");
-                    }
-
-                    cliclack::outro("OpenRouter setup complete! You can now use goose.")?;
-                }
-                Err(e) => {
-                    eprintln!("⚠️  Configuration test failed: {}", e);
-                    eprintln!(
-                        "Your settings have been saved, but there may be an issue with the connection."
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("⚠️  Failed to create provider for testing: {}", e);
-            eprintln!("Your settings have been saved. Please check your configuration.");
-        }
-    }
-    Ok(())
-}
-
-pub async fn handle_tetrate_auth() -> anyhow::Result<()> {
-    let mut auth_flow = TetrateAuth::new()?;
-    let api_key = auth_flow.complete_flow().await?;
-
-    println!("\nAuthentication complete!");
-
-    let config = Config::global();
-
-    println!("\nConfiguring Tetrate Agent Router Service...");
-    configure_tetrate(config, api_key)?;
-
-    println!("✓ Tetrate Agent Router Service configuration complete");
-    println!("✓ Models configured successfully");
-
-    // Test configuration
-    println!("\nTesting configuration...");
-    let configured_model: String = config.get_goose_model()?;
-    if let Err(e) = goose::model_config::model_config_from_user_config("tetrate", &configured_model)
-    {
-        eprintln!("⚠️  Invalid model configuration: {}", e);
-        eprintln!("Your settings have been saved. Please check your model configuration.");
-        return Ok(());
-    }
-
-    match create("tetrate", Vec::new()).await {
-        Ok(provider) => {
-            let test_result = provider.fetch_supported_models().await;
-
-            match test_result {
-                Ok(_) => {
-                    println!("✓ Configuration test passed!");
-
-                    let entries = get_all_extensions();
-                    let has_developer = entries
-                        .iter()
-                        .any(|e| e.config.name() == "developer" && e.enabled);
-
-                    if !has_developer {
-                        set_extension(ExtensionEntry {
-                            enabled: true,
-                            config: ExtensionConfig::Platform {
-                                name: "developer".to_string(),
-                                description: "Developer extension".to_string(),
-                                display_name: Some(goose::config::DEFAULT_DISPLAY_NAME.to_string()),
-                                bundled: Some(true),
-                                available_tools: Vec::new(),
-                            },
-                        });
-                        println!("✓ Developer extension enabled");
-                    }
-
-                    cliclack::outro(
-                        "Tetrate Agent Router Service setup complete! You can now use goose.",
-                    )?;
-                }
-                Err(e) => {
-                    eprintln!("⚠️  Configuration test failed: {}", e);
-                    eprintln!(
-                        "Your settings have been saved, but there may be an issue with the connection."
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("⚠️  Failed to create provider for testing: {}", e);
-            eprintln!("Your settings have been saved. Please check your configuration.");
-        }
-    }
 
     Ok(())
 }

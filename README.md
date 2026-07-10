@@ -12,37 +12,43 @@
 
 *An unedited `/orch` run (idle time compressed): Claude plans, GPT-5.6 implements, the machine gates run, and the reviewer rejects cycle 1 before approving cycle 2.*
 
-**When to reach for gooseherd:**
+gooseherd is a CLI-first multi-model orchestration harness (a fork of
+[goose](https://github.com/aaif-goose/goose)): an expensive frontier model plans
+and reviews, a cheaper model implements, and machine gates verify — over
+ACP-driven vendor CLIs (claude-acp, codex-acp, any agent via one config entry)
+and native OpenAI/Anthropic-compatible APIs. Coding-agent subscriptions don't
+mix — Claude Code drives Anthropic models, Codex drives OpenAI models — and
+gooseherd is the layer that makes them work *together* on one task, with a paper
+trail.
 
-- You want your expensive subscription limits spent on planning and review,
-  while a cheaper model does the implementation.
-- You want to compare models blind on your repo's actual tasks, not on
-  benchmarks — `/arena` runs them head-to-head and a ledger keeps score.
-- You don't want the agent that wrote the code approving its own work —
-  mechanical gates run before an independent reviewer sees the diff.
+## 30-second quickstart
 
-gooseherd is a fork of [goose](https://github.com/aaif-goose/goose) that turns it
-into a multi-model orchestrator: a frontier model plans and reviews, a cheaper
-model does the implementation, and every step is measured so you can see who
-actually did what.
+```sh
+# 1. Install the release binary to ~/.local/bin/goose
+curl -fsSL https://raw.githubusercontent.com/codingmydna/gooseherd/main/scripts/install.sh | bash
 
-The starting observation is simple. Coding-agent subscriptions don't mix —
-Claude Code drives Anthropic models, Codex drives OpenAI models, and each one
-is excellent inside its own harness. goose already speaks to both of them over
-ACP. What was missing was a layer that makes them work *together* on one task,
-with a paper trail.
+# 2. Check your setup (logins, adapters, catalog) and write the recommended role config
+goose herd
 
-For the loop patterns behind these commands, see
-[Loop engineering with gooseherd](docs/loops.md).
+# 3. Start a session and orchestrate
+goose session
+```
 
-## What it adds on top of goose
+```
+/orch add input validation to the /login handler and cover it with tests
+```
 
-**`/orch <task>`** — a plan → implement → review loop across different models.
-The planner (say, Claude via your Claude Code subscription) explores the repo
-read-only and writes a plan with acceptance criteria. The implementer (say,
-GPT via your Codex subscription, or a local model) executes it with full tool
-access. The reviewer checks the diff against the plan and either approves or
-sends it back, up to N cycles.
+`goose herd` verifies that `claude` and `codex` are installed and logged in,
+installs/points you at the ACP adapters, and offers to write a split-role config
+(planner/reviewer on your Claude subscription, implementer on Codex). If you
+only have API keys, those work too — assign any provider to any role.
+
+## What it does
+
+**`/orch <task>` — plan → implement → review across models.** The planner
+explores the repo read-only and writes a plan with acceptance criteria. The
+implementer executes it with full tool access. The reviewer checks the diff
+against the plan and either approves or sends it back, up to `GOOSE_ORCH_MAX_CYCLES`.
 
 ```
 ― phase: plan · claude-acp/default ―
@@ -54,12 +60,29 @@ VERDICT: APPROVED
   ⎿ review done · model default · in 2 / out 224 · 6.7s · APPROVED
 ```
 
-### Your repo learns which model wins
+Each run isolates itself in a git worktree (`.goose/worktrees/orch-<run_id>`,
+env files symlinked), so parallel runs on one repo don't contaminate each
+other's evidence. On approval the run auto-commits to `orch/<run_id>` and prints
+the merge command (`--merge` merges for you).
 
-Every run leaves evidence, and the evidence compounds.
+**Machine gates run before the reviewer.** Configured quality gates run after
+each implement phase; mechanical failures bounce straight back to the
+implementer without spending reviewer tokens. A repo-root `.goose-gates.yaml`
+takes priority, safe `package.json`/`go.mod` gates are derived next, and
+`GOOSE_ORCH_GATES` is the global fallback. (See
+[reference](docs/reference.md#goose-gatesyaml) for the spec.)
 
-**`/arena`** — run the same task on several models at once, each in its own
-detached git worktree, then have the reviewer blind-judge the diffs:
+**Exemplar hill-climbing.** Approved plans are archived; similar past plans are
+injected as few-shot exemplars for future planners, so the expensive model's
+planning shape survives into cheaper ones. The Fable 5 playbook and plan/review
+exemplars are injected only into roles whose serving model is not a frontier
+model — tune with `GOOSE_ORCH_PLAYBOOK` / `GOOSE_PLAN_EXEMPLARS_INJECT` /
+`GOOSE_REVIEW_EXEMPLARS_INJECT` (`auto|always|never`).
+
+**`/arena` — a blind, per-repo model tournament.** Run the same task on several
+models at once, each in its own detached worktree, then have the reviewer
+blind-judge the diffs (bare-letter labels, shuffled order, mapping revealed
+after the verdict):
 
 ```
 arena results
@@ -69,131 +92,60 @@ arena results
 RANKING: B-claude-acp > A-codex-acp
 ```
 
-Worktrees are kept afterwards so you can inspect every attempt yourself.
+Every phase — orch and arena — is appended to a run ledger
+(`orch_ledger.jsonl`): configured model vs. the model the provider actually
+reported, tokens, durations, and verdicts. `/stats` reads it back as an
+approval-rate and mean-cycles table per model, with exemplar injection on vs
+off.
 
-**A run ledger and `/stats`** — every orchestration phase is appended to
-`orch_ledger.jsonl`: configured model vs. the model the provider actually
-reported, tokens, durations, verdicts, and the session's advertised context
-limit (a useful fingerprint for catching silent model downgrades —
-`GOOSE_<ROLE>_EXPECT_MODEL` warns when the reported model doesn't match).
+**`/loop` and `/goal` — unattended runs.** `/loop <interval> <prompt>` re-runs a
+prompt on a cadence; `/goal <goal>` retries with evaluator feedback until the
+goal is met. Both have headless forms (`goose loop -t … --every …`,
+`goose goal -t … --max N --check "<cmd>"`). See
+[Loop engineering with gooseherd](docs/loops.md).
 
-**Exemplar hill-climbing** — approved plans are archived and similar past
-plans are injected as few-shot exemplars for future planners
-(`GOOSE_PLAN_EXEMPLARS`), so the expensive model's planning shape survives
-into cheaper ones. Fable 5's playbook and plan/review exemplars are injected
-into planner/reviewer roles whose serving model is not Fable; use
-`GOOSE_ORCH_PLAYBOOK=auto|always|never`,
-`GOOSE_PLAN_EXEMPLARS_INJECT=auto|always|never`, or
-`GOOSE_REVIEW_EXEMPLARS_INJECT=auto|always|never` to override.
+## Coming from Claude Code or Codex CLI
 
-**A full run lifecycle around the loop** — each `/orch` run isolates itself in
-a git worktree (`.goose/worktrees/orch-<run_id>`, env files symlinked), so
-parallel runs on one repo don't contaminate each other's evidence. Configured
-quality gates run *before* the reviewer is called — `.goose-gates.yaml` takes
-priority, safe `package.json`/`go.mod` gates are derived next, and
-`GOOSE_ORCH_GATES` remains the global fallback. Mechanical failures bounce
-straight back to the implementer without spending reviewer tokens. On approval
-the run auto-commits to its branch and prints the merge command (`--merge`
-merges for you).
-An allowlist permission policy (`GOOSE_ORCH_IMPLEMENT_POLICY: allowlist`)
-confines the implementer to the workspace and an approved command list — for
-running orchestration on repos you actually care about.
+Most of what your hands already know keeps working. The mapping:
 
-**Bring any ACP agent** — besides the built-in claude/codex/copilot/amp/pi
-adapters, any ACP-speaking CLI plugs in via config:
-
-```yaml
-GOOSE_ACP_AGENTS:
-  gemini: gemini --acp
-  opencode: opencode acp
-  kimi: kimi acp
-```
-
-Each entry becomes a provider (`gemini-acp`, …) assignable to any role — handy
-for cheap or free implementer models.
-
-Entries may also use a map form with `command`, optional `env`, and optional
-`env_remove`. `${VAR}` references in `env` are resolved from your shell or goose
-secret store when the agent starts, so tokens do not need to live in shared
-config:
-
-```yaml
-GOOSE_ACP_AGENTS:
-  glm:
-    command: claude-agent-acp
-    env:
-      ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
-      ANTHROPIC_AUTH_TOKEN: ${ZAI_API_KEY}
-```
-
-**Plan-Explore permission policy** — the planner and reviewer run as full
-agents but cannot write. Instead of goose's all-or-nothing modes, permission
-requests are judged by ACP tool kind: reads, searches, and parallel subagent
-exploration are approved; edits, deletes, and moves are rejected. This works
-for any ACP agent, with the agent's own restrictions (Claude Code plan mode,
-Codex read-only sandbox) kept as a second barrier.
-
-**Quality-of-life commands** — `/status` (roles, connection type, effort,
-usage), `/usage`, `/roles` (change role assignments without leaving the
-session), `/model provider/model` (switch the live session and persist it),
-`/btw` (ask a side question in the background without touching the
-session history), `goose worktree new/list/prune` (parallel-session worktrees
-with env symlinks), `/terminal-setup` (make Shift+Enter insert a newline in
-terminals that swallow the modifier), a copy-pasteable resume command on exit,
-slash-command typing hints, per-role reasoning effort, and Claude-Code-style
-rendering: diff coloring, edit previews, a bordered input box with a status
-line, todo checklists (`☐/◐/✔`), role-colored response bullets during
-orchestration (planner cyan, implementer yellow, reviewer magenta), a live
-spinner with elapsed time and running tools, and mid-turn steering — type
-while a turn is running and it's injected at the next tool boundary.
-
-## How it compares
-
-| Project | Approach |
+| You're used to | Here |
 |---|---|
-| [zeroshot](https://github.com/the-open-engine/zeroshot) | Plan/implement/verify loop on top of subscription CLIs, with blind validators. No goose extension ecosystem, arena, or exemplar learning. |
-| [Qwen Code's Agent Arena](https://qwenlm.github.io/qwen-code-docs/en/users/features/arena/) | Built-in one-shot multi-model arena — same task, isolated worktrees, pick a winner. Results are not accumulated or fed back into future runs. |
-| [upstream goose](https://github.com/aaif-goose/goose) | Model-driven orchestration is on the roadmap. No deterministic harness loop, fixed roles, or machine gates today. |
-| gooseherd | Fixed-role loop (plan → implement → review) with machine gates, plus a persistent per-repo arena ledger and exemplar hill-climbing. |
+| `claude` / `codex` | `goose session` (alias `goose s`) |
+| Importing your history | `goose session import <transcript>` reads Claude Code / Codex / Pi `.jsonl` |
+| `claude --resume <id>` | `goose session --resume --session-id <id>` (printed on every exit) |
+| `claude --continue` | `goose session -r` |
+| Plan mode / read-only exploration | automatic for the planner and reviewer roles in `/orch` |
+| `/compact`, `/clear`, `/model` | same commands |
+| `/loop`, `/goal` | same commands; headless `goose loop` / `goose goal` |
+| Shift+Tab mode cycling | Shift+Tab cycles role presets (`/preset save <name>` first) |
+| `/cost`, `/context` | `/usage`, `/status`, `/stats` |
+| Side questions without derailing the session | `/btw <question>` |
+| `/terminal-setup` for Shift+Enter | same command |
+| TodoWrite checklist rendering | automatic (`☐/◐/✔`) |
+| `!command` shell passthrough | same — output joins the context |
+| `/init` writing CLAUDE.md | `/init` writes AGENTS.md |
+| `#note` quick memory | `/remember <note>` → `.goosehints` |
+| CLAUDE.md / AGENTS.md project memory | `AGENTS.md` and `.goosehints` are read as project memory |
+| Hooks (PreToolUse/PostToolUse/Stop/…) | same CC-compatible events, configured in `config.yaml` |
+| Typing mid-turn to steer | opt-in — set `GOOSE_LIVE_INPUT: true`; text is injected at the next tool boundary |
 
-## Setup
+Your existing vendor logins are reused as-is — if `claude` and `codex` work in
+your terminal, gooseherd's ACP providers work too, because the actual vendor CLI
+runs under the hood.
 
-### Install (recommended)
+## Model lineup
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/codingmydna/gooseherd/main/scripts/install.sh | bash
-```
-
-Installs the latest release binary to `~/.local/bin/goose`.
-`GOOSE_BIN_DIR`, `GOOSE_VERSION`, and `GOOSE_REPO` override the defaults.
-
-### Manual download
-
-Grab the tar.gz for your platform from the
-[releases page](https://github.com/codingmydna/gooseherd/releases), verify the
-`.sha256`, and copy `goose` somewhere on your `PATH`.
-
-### Build from source
-
-```sh
-cargo build --release -p goose-cli
-cp target/release/goose ~/.local/bin/goose
-```
-
-Whichever install path you choose, install the ACP adapters for the
-subscriptions you want to drive:
+**Subscriptions, over ACP.** Install the adapter for each subscription you want
+to drive, then log in once with the vendor's own CLI — gooseherd inherits those
+sessions and never needs API keys for them:
 
 ```sh
 npm install -g @agentclientprotocol/claude-agent-acp   # Claude Code subscription
-npm install -g @agentclientprotocol/codex-acp          # ChatGPT/Codex subscription
+npm install -g @agentclientprotocol/codex-acp          # ChatGPT / Codex subscription
 ```
 
-Log in once with each vendor's own CLI (`claude`, `codex login`) — gooseherd
-inherits those sessions and never needs API keys for them. API-key and local
-providers (ollama, openrouter, …) work exactly as in upstream goose and can be
-assigned to any role.
-
-A minimal `~/.config/goose/config.yaml` for the split-role setup:
+Built-in ACP presets: `claude-acp`, `codex-acp`, `copilot-acp`, `amp-acp`,
+`pi-acp`. A minimal split-role `~/.config/goose/config.yaml`:
 
 ```yaml
 GOOSE_PROVIDER: claude-acp
@@ -207,103 +159,66 @@ GOOSE_IMPLEMENTER_MODEL: gpt-5.5
 GOOSE_ORCH_MAX_CYCLES: 3
 ```
 
-Then, inside `goose session`:
+**Cheap API models, as declarative providers.** OpenAI/Anthropic-compatible
+endpoints (deepseek, groq, zai, openrouter, …) ship as bundled provider
+definitions — set the API key and assign them to a role. Add your own by
+dropping a JSON definition in `~/.config/goose/custom_providers/<id>.json`.
+Cheap implementers are what most people come here for.
 
-```
-/orch add input validation to the /login handler and cover it with tests
-```
-
-The task text is a contract the cheaper implementer follows literally, so its
-shape matters. gooseherd has a house style for writing them — a 6-part anatomy
-(goal, why, code pointers, numbered requirements, completion criteria, planner
-footer) and 5 principles, distilled from the model that bootstrapped this fork:
-[Writing good `/orch` tasks — the Fable 5 style](docs/writing-orch-tasks.md).
-
-## Coming from Claude Code or Codex CLI
-
-Most of what your hands already know keeps working. The mapping:
-
-| You're used to | Here |
-|---|---|
-| `claude` / `codex` | `goose session` |
-| `claude --resume <id>` | `goose session --resume --session-id <id>` (printed on every exit) |
-| `claude --continue` | `goose session -r` |
-| Plan mode / read-only exploration | automatic for the planner and reviewer roles in `/orch` |
-| `/compact`, `/clear`, `/model` | same commands |
-| `/loop <interval> <prompt>` | same command; headless: `goose loop -t "<prompt>" --every <interval>` |
-| `/goal <goal>` | same command; headless: `goose goal -t "<goal>" --max N --check "<cmd>"` |
-| `/schedule` | roadmap; see [loop engineering](docs/loops.md) and use cron with `goose loop --max 1` / `goose goal` meanwhile |
-| Shift+Tab mode cycling | Shift+Tab cycles role presets (`/preset save <name>` first) |
-| `/cost`, `/context` | `/usage`, `/status`, `/stats` |
-| Side questions without derailing the session | `/btw <question>` |
-| Typing mid-turn to steer | same — injected at the next tool boundary |
-| `/terminal-setup` for Shift+Enter | same command |
-| TodoWrite checklist rendering | automatic (`☐/◐/✔`) |
-| Background agents committing to a branch | `/orch` auto-worktree + auto-commit on approval |
-| `!command` shell passthrough | same — `!command`, output joins the context |
-| `/init` writing CLAUDE.md | `/init` writes AGENTS.md |
-| `#note` quick memory | `/remember <note>` → .goosehints |
-| CLAUDE.md / AGENTS.md project memory | AGENTS.md and .goosehints work as before (upstream goose behavior) |
-
-Your existing vendor logins are reused as-is — if `claude` and `codex` work in
-your terminal, gooseherd's ACP providers work too. Skills and plugins you
-installed for those CLIs also load, because the actual vendor CLI is what runs
-under the hood.
-
-Run `goose herd` for a first-time checkup that verifies logins and adapters
-and offers to write the recommended role config.
-
-### Using GLM 5.2 / any Anthropic-compatible endpoint
-
-GLM 5.2 (Zhipu / Z.ai) exposes an Anthropic-compatible endpoint, so it can run
-through the `claude-agent-acp` adapter as a generic ACP provider:
+**The adapter catalog.** Any ACP-speaking CLI plugs in through one config entry:
 
 ```yaml
 GOOSE_ACP_AGENTS:
-  glm:
-    command: claude-agent-acp
-    env:
-      ANTHROPIC_BASE_URL: https://api.z.ai/api/anthropic
-      ANTHROPIC_AUTH_TOKEN: ${ZAI_API_KEY}
-
-GOOSE_IMPLEMENTER_PROVIDER: glm-acp
-GOOSE_IMPLEMENTER_MODEL: <z.ai model id>
+  gemini: gemini --acp
+  opencode: opencode acp
 ```
 
-Set `ZAI_API_KEY` in your shell (`export ZAI_API_KEY=...`) or store it with
-`goose configure`; keep the config value as `${ZAI_API_KEY}`. Use `glm-acp` for
-the planner, implementer, reviewer, or a saved role preset just like any other
-provider. If you prefer not to use the ACP adapter, point the existing `openai`
-provider at Z.ai's OpenAI-compatible endpoint with `OPENAI_BASE_URL` and
-`OPENAI_API_KEY`.
+Each entry becomes a provider (`gemini-acp`, …) assignable to any role. The
+built-in [`adapters/`](adapters/) catalog turns this into a one-liner —
+`goose herd` shows install status and `goose herd add <name>` writes the config.
+Adding a new agent is a one-file pull request: see [ADAPTERS.md](ADAPTERS.md).
 
-## Troubleshooting
+## How it compares
 
-- macOS says it cannot verify the developer — the binary is not yet signed or
-  notarized; for a manually downloaded binary, run
-  `xattr -d com.apple.quarantine ~/.local/bin/goose`.
-- `could not resolve command 'claude-agent-acp'` — the adapter isn't
-  installed: `npm install -g @agentclientprotocol/claude-agent-acp` (and make
-  sure `claude` itself is logged in). Same pattern for `codex-acp`.
-- An /arena contestant times out with no changes — check its log at
-  `.goose-arena/<label>.log`; vendor-CLI plugins that prompt interactively are
-  the usual suspect in headless runs.
-- The planner "can't do anything" — its session is read-only by design; it
-  can read, search, and spawn read-only subagents, but edits and shell are
-  denied (`GOOSE_PLAN_ALLOW_EXEC: true` relaxes shell).
+| Project | Approach |
+|---|---|
+| [zeroshot](https://github.com/the-open-engine/zeroshot) | Plan/implement/verify loop on top of subscription CLIs, with blind validators. No goose extension ecosystem, arena, or exemplar learning. |
+| [Qwen Code's Agent Arena](https://qwenlm.github.io/qwen-code-docs/en/users/features/arena/) | Built-in one-shot multi-model arena — same task, isolated worktrees, pick a winner. Results are not accumulated or fed back into future runs. |
+| [upstream goose](https://github.com/aaif-goose/goose) | Model-driven orchestration is on the roadmap. No deterministic harness loop, fixed roles, or machine gates today. |
+| gooseherd | Fixed-role loop (plan → implement → review) with machine gates, plus a persistent per-repo arena ledger and exemplar hill-climbing. |
 
-## Caveats
+## Security model
 
-This is a young fork, developed and tested on macOS. The orchestration loop,
-arena, ledger, and permission policy all work end-to-end, but expect rough
-edges — particularly around terminal rendering and headless runs of vendor
-CLIs that ship their own plugins. Issues and PRs are welcome; so is telling me
-the whole idea is wrong, if you can show your ledger.
+The planner and reviewer run as full agents but cannot write: permission
+requests are judged by ACP tool kind, so reads, searches, and read-only subagent
+exploration are approved while edits, deletes, and moves are rejected (the
+agent's own restrictions — Claude Code plan mode, Codex read-only sandbox — stay
+as a second barrier). Headless orchestration and arena default the implementer
+to an allowlist policy that confines it to the workspace and an approved command
+list and rejects shell-chaining metacharacters. Machine gates run with
+credential environment variables scrubbed and a timeout. Runtime mode overrides
+are held in memory, never written back to `config.yaml`, so a crash cannot leave
+a permissive downgrade behind. Full details and the disclosure process are in
+[SECURITY.md](SECURITY.md).
+
+## Reference
+
+- [docs/reference.md](docs/reference.md) — every `GOOSE_*` knob, exit codes, the gates spec
+- [ADAPTERS.md](ADAPTERS.md) — contribute an ACP agent (one-file PR)
+- [docs/loops.md](docs/loops.md) — `/loop` and `/goal` patterns
+- [docs/writing-orch-tasks.md](docs/writing-orch-tasks.md) — the `/orch` task house style
+- [docs/overhaul-2026-07.md](docs/overhaul-2026-07.md) — architecture and design decisions
+
+Build from source instead of the installer:
+
+```sh
+cargo build --release -p goose-cli
+cp target/release/goose ~/.local/bin/goose
+```
 
 ## Credits and license
 
 Built on [goose](https://github.com/aaif-goose/goose) by Block and the AAIF
-community (upstream README: [README.upstream.md](README.upstream.md)).
-Apache-2.0, same as upstream. Not affiliated with Block, AAIF, Anthropic, or
-OpenAI. Model subscriptions are governed by their vendors' terms — this
-project only drives the vendors' own CLIs.
+community. Apache-2.0, same as upstream. Not affiliated with Block, AAIF,
+Anthropic, or OpenAI. Model subscriptions are governed by their vendors' terms —
+this project only drives the vendors' own CLIs.

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::session::{exemplars, ledger, orch_ask, output, review_exemplars};
 
-use super::roles::RoleConfig;
+use super::roles::{playbook_injected, RoleConfig};
 
 const PHASE_IDLE_TIMEOUT_KEY: &str = "GOOSE_ORCH_PHASE_IDLE_TIMEOUT_SECS";
 const MIN_PLAN_CHARS_KEY: &str = "GOOSE_ORCH_MIN_PLAN_CHARS";
@@ -25,12 +25,17 @@ pub(super) const EVIDENCE_CHAR_LIMIT: usize = 30_000;
 
 const PLAN_SYSTEM_PROMPT: &str = r#"You are the planning lead in a two-model workflow. A separate implementer model will execute your plan with file-editing and shell tools. Your session is read-only: you can explore the working directory but cannot modify anything.
 
-Produce a concrete, step-by-step implementation plan for the given task:
-- Explore freely: read files, search, and delegate read-only subagent explorations (in parallel when useful). File modifications will be denied by policy; shell commands are denied unless the session allows them — do not retry denied calls.
-- List the files to create or modify and what changes each needs.
-- Define acceptance criteria and how the implementer should verify the result (commands to run, expected output).
-- Keep the plan focused; do not attempt to implement the changes yourself.
-- Even if some exploration is blocked, always deliver your best plan from what you could read.
+Produce a concrete, step-by-step implementation plan for the given task. Explore freely first: read files, search, and delegate read-only subagent explorations (in parallel when useful). File modifications will be denied by policy; shell commands are denied unless the session allows them — do not retry denied calls. Even if some exploration is blocked, always deliver your best plan from what you could read. Do not implement the changes yourself.
+
+Structure the plan with exactly these markdown sections, in this order:
+## Files
+The files to create or modify, each with the change it needs.
+## Steps
+The ordered implementation steps.
+## Acceptance criteria
+Each criterion a concrete, checkable statement of done.
+## Verification
+The commands the implementer should run and the expected outcome of each.
 
 Output only the plan."#;
 
@@ -55,11 +60,9 @@ Review rubric:
 - Keep no-fix-needed observations separate from blocking defects.
 - If REVISE, use a numbered list where each defect includes location, mechanism, reproduction/evidence, and fix direction.
 
-Your reply MUST start with exactly one of these lines:
+Write your analysis first — for REVISE, a numbered list of concrete, actionable defects (file, problem, required fix); only demand changes for real problems, do not invent nitpicks. Then END your reply with exactly one of these two lines, and use the token `VERDICT:` nowhere else in the reply:
 VERDICT: APPROVED
-VERDICT: REVISE
-
-If REVISE, follow with a numbered list of concrete, actionable defects (file, problem, required fix). Only demand changes for real problems; do not invent nitpicks."#;
+VERDICT: REVISE"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanRoundAction {
@@ -101,12 +104,248 @@ pub(super) fn plan_quality_action(
     }
 }
 
-pub(super) fn parse_verdict_approved(review: &str) -> bool {
-    review
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanSection {
+    Files,
+    Steps,
+    AcceptanceCriteria,
+    Verification,
+}
+
+impl PlanSection {
+    const ALL: [PlanSection; 4] = [
+        PlanSection::Files,
+        PlanSection::Steps,
+        PlanSection::AcceptanceCriteria,
+        PlanSection::Verification,
+    ];
+
+    fn keyword(self) -> &'static str {
+        match self {
+            PlanSection::Files => "files",
+            PlanSection::Steps => "steps",
+            PlanSection::AcceptanceCriteria => "acceptance criteria",
+            PlanSection::Verification => "verification",
+        }
+    }
+
+    pub(super) fn header(self) -> &'static str {
+        match self {
+            PlanSection::Files => "## Files",
+            PlanSection::Steps => "## Steps",
+            PlanSection::AcceptanceCriteria => "## Acceptance criteria",
+            PlanSection::Verification => "## Verification",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanStructureAction {
+    Accept,
+    Reprompt,
+    ProceedWithWarning,
+}
+
+/// Required plan sections absent from `plan`. Tolerant: headers match
+/// case-insensitively, both `## ` and `### ` are accepted, extra sections are
+/// allowed, and a header matches a section when its text begins with the
+/// section name (so `## Verification commands` satisfies Verification).
+pub(super) fn validate_plan_structure(plan: &str) -> Vec<PlanSection> {
+    let headers: Vec<String> = plan.lines().filter_map(normalized_plan_header).collect();
+    PlanSection::ALL
+        .into_iter()
+        .filter(|section| {
+            !headers
+                .iter()
+                .any(|header| header.starts_with(section.keyword()))
+        })
+        .collect()
+}
+
+fn normalized_plan_header(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("##") {
+        return None;
+    }
+    let text = trimmed.trim_start_matches('#').trim();
+    (!text.is_empty()).then(|| text.to_ascii_lowercase())
+}
+
+pub(super) fn plan_structure_action(
+    missing: &[PlanSection],
+    structure_retries: u32,
+) -> PlanStructureAction {
+    if missing.is_empty() {
+        PlanStructureAction::Accept
+    } else if structure_retries == 0 {
+        PlanStructureAction::Reprompt
+    } else {
+        PlanStructureAction::ProceedWithWarning
+    }
+}
+
+pub(super) fn missing_sections_label(missing: &[PlanSection]) -> String {
+    missing
+        .iter()
+        .map(|section| section.header())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub(super) fn plan_structure_reprompt(missing: &[PlanSection]) -> String {
+    format!(
+        "Your plan is missing required section(s): {}. Re-emit the COMPLETE plan (not a patch) with every required section present: ## Files, ## Steps, ## Acceptance criteria, ## Verification. Do not ask questions.",
+        missing_sections_label(missing)
+    )
+}
+
+/// Extract the individual acceptance-criterion lines from a structured plan's
+/// `## Acceptance criteria` section (the B1 plan schema). Each returned string is
+/// a trimmed criterion with any leading list marker (`-`, `*`, `+`, `1.`, `2)`)
+/// stripped, in document order. Empty when the plan has no such section.
+pub(super) fn extract_acceptance_criteria(plan: &str) -> Vec<String> {
+    let mut criteria = Vec::new();
+    let mut in_section = false;
+    for line in plan.lines() {
+        if let Some(header) = normalized_plan_header(line) {
+            in_section = header.starts_with(PlanSection::AcceptanceCriteria.keyword());
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let item = strip_list_marker(line.trim());
+        if !item.is_empty() {
+            criteria.push(item.to_string());
+        }
+    }
+    criteria
+}
+
+fn strip_list_marker(line: &str) -> &str {
+    let line = line.trim();
+    for marker in ['-', '*', '+'] {
+        if let Some(rest) = line.strip_prefix(marker) {
+            return rest.trim_start();
+        }
+    }
+    let digits: String = line.chars().take_while(char::is_ascii_digit).collect();
+    if !digits.is_empty() {
+        if let Some(rest) = line
+            .get(digits.len()..)
+            .and_then(|rest| rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')))
+        {
+            return rest.trim_start();
+        }
+    }
+    line
+}
+
+/// Whether an implementer report carries a self-verification section. Tolerant:
+/// matches a `## Self-verification` header case-insensitively, accepts `##`/`###`,
+/// treats hyphen/underscore as a space (`Self verification`), and allows trailing
+/// text on the header line.
+pub(super) fn has_self_verification(report: &str) -> bool {
+    report
         .lines()
-        .find_map(|l| l.split_once("VERDICT:"))
-        .map(|(_, after)| after.contains("APPROVED"))
-        .unwrap_or(false)
+        .filter_map(normalized_plan_header)
+        .any(|header| {
+            header
+                .replace(['-', '_'], " ")
+                .starts_with("self verification")
+        })
+}
+
+fn acceptance_criteria_block(plan: &str) -> String {
+    let criteria = extract_acceptance_criteria(plan);
+    if criteria.is_empty() {
+        return "The plan lists no explicit acceptance criteria; enumerate the task's own success conditions and map each to evidence.".to_string();
+    }
+    let mut block = String::from("Acceptance criteria:\n");
+    for (index, criterion) in criteria.iter().enumerate() {
+        block.push_str(&format!("{}. {}\n", index + 1, criterion));
+    }
+    block.trim_end().to_string()
+}
+
+/// The `## Self-verification` demand appended to the implementer instruction: end
+/// the report with that section, mapping each acceptance criterion to concrete
+/// evidence (command + observed output, or `file:line`).
+pub(super) fn self_verification_demand(plan: &str) -> String {
+    format!(
+        "\n\nWhen you finish, END your report with a `## Self-verification` section. For EACH acceptance criterion below add one bullet mapping the criterion to concrete evidence: the exact verification command you ran and its observed output, or a `file:line` reference. Do not claim a criterion passes without evidence.\n\n{}",
+        acceptance_criteria_block(plan)
+    )
+}
+
+/// The one bounded reprompt sent to an implementer whose report lacked the
+/// `## Self-verification` section: emit only that section for the criteria.
+pub(super) fn self_verification_reprompt(plan: &str) -> String {
+    format!(
+        "Your report is missing the required `## Self-verification` section. Emit ONLY that section now — a `## Self-verification` header followed by one bullet per acceptance criterion, each mapping the criterion to concrete evidence (the exact command you ran and its observed output, or a `file:line`). Do not repeat the rest of your report.\n\n{}",
+        acceptance_criteria_block(plan)
+    )
+}
+
+/// The self-verification checklist appended to the review request. Presents the
+/// implementer's mapping as claims the reviewer must confirm against the evidence,
+/// and tells the reviewer to distrust any criterion it cannot independently verify.
+pub(super) fn self_verification_review_block(plan: &str, report: &str) -> String {
+    let criteria = extract_acceptance_criteria(plan);
+    let mut block = String::from("## Self-verification checklist\n");
+    if has_self_verification(report) {
+        block.push_str(
+            "The implementer's report ends with a `## Self-verification` section (above). Verify each claim against the git evidence and gate output — open files and re-run checks where you can. Treat any criterion whose evidence you cannot independently confirm as NOT met, and missing or vague evidence as a blocking defect.",
+        );
+    } else {
+        block.push_str(
+            "WARNING: the implementer did NOT provide a `## Self-verification` section despite being asked. Do not take the report's success claims at face value — independently verify every acceptance criterion below against the evidence, and block if you cannot confirm one.",
+        );
+    }
+    if !criteria.is_empty() {
+        block.push_str("\n\nAcceptance criteria to confirm:\n");
+        for (index, criterion) in criteria.iter().enumerate() {
+            block.push_str(&format!("{}. {}\n", index + 1, criterion));
+        }
+    }
+    block.trim_end().to_string()
+}
+
+/// Ledger row noting whether the implementer report carried the self-verification
+/// section, and whether a reprompt was needed. Only appended when the initial
+/// report lacked the section, so /stats can measure compliance.
+pub(super) fn record_self_verification(
+    meta: &PhaseMeta<'_>,
+    cycle: u32,
+    role_cfg: &RoleConfig,
+    recovered: bool,
+) {
+    ledger::append(&ledger::PhaseRecord {
+        ts_ms: ledger::now_ms(),
+        session_id: meta.session_id.to_string(),
+        run_id: meta.run_id.to_string(),
+        phase: "self-verify".to_string(),
+        cycle,
+        role: "implementer".to_string(),
+        provider: role_cfg.provider_name.clone(),
+        config_model: role_cfg.model.clone(),
+        reported_model: None,
+        context_limit: None,
+        input_tokens: None,
+        output_tokens: None,
+        duration_ms: 0,
+        verdict: Some(if recovered { "RECOVERED" } else { "MISSING" }.to_string()),
+        permission_policy: None,
+        permission_denials: None,
+        task_preview: safe_truncate(meta.task, 120),
+        plan_exemplars_injected: None,
+        plan_exemplar_run_ids: None,
+        review_exemplars_injected: None,
+        review_exemplar_run_ids: None,
+        playbook_injected: None,
+        arena_rank: None,
+        arena_winner: None,
+    });
 }
 
 /// Appends an assistant text chunk to the collected role text. Streamed text
@@ -151,7 +390,7 @@ pub(super) fn planner_prompt(ask_enabled: bool) -> String {
     }
 }
 
-pub(super) fn orch_phase_idle_timeout() -> Duration {
+pub(crate) fn orch_phase_idle_timeout() -> Duration {
     let secs = Config::global()
         .get_param::<u64>(PHASE_IDLE_TIMEOUT_KEY)
         .ok()
@@ -216,6 +455,7 @@ pub(super) fn warn_truncated(what: &str, full_len: usize, run_id: &str) {
     );
 }
 
+#[derive(Debug)]
 pub(super) struct RoleCompletion {
     pub(super) text: String,
     pub(super) usage: Option<ProviderUsage>,
@@ -262,29 +502,6 @@ pub(super) async fn stream_role_completion(
         session_id,
         debug,
         None,
-    )
-    .await?;
-    Ok((completion.text, completion.usage))
-}
-
-#[cfg(test)]
-async fn stream_role_completion_with_idle_timeout(
-    provider: &Arc<dyn Provider>,
-    model_config: &goose_providers::model::ModelConfig,
-    system: &str,
-    messages: &[Message],
-    session_id: &str,
-    debug: bool,
-    idle_timeout: Option<Duration>,
-) -> Result<(String, Option<ProviderUsage>)> {
-    let completion = stream_role_completion_status(
-        provider,
-        model_config,
-        system,
-        messages,
-        session_id,
-        debug,
-        idle_timeout,
     )
     .await?;
     Ok((completion.text, completion.usage))
@@ -427,6 +644,7 @@ pub(super) fn archive_pending_reviews(
     run_id: &str,
     task: &str,
     reviewer_role: &RoleConfig,
+    repo_root: Option<&str>,
 ) {
     for review in pending_reviews {
         review_exemplars::archive_review(&review_exemplars::ArchiveReviewRequest {
@@ -438,6 +656,7 @@ pub(super) fn archive_pending_reviews(
             reviewer_provider: &reviewer_role.provider_name,
             reviewer_model: &reviewer_role.model,
             reviewer_context_limit: review.reviewer_context_limit,
+            repo_root,
             reviewed_at_ms: review.reviewed_at_ms,
         });
     }
@@ -457,6 +676,7 @@ pub(super) fn record_phase(
     policy: Option<&PhasePolicySummary>,
     plan_exemplar_injection: Option<&exemplars::ExemplarInjection>,
     review_exemplar_injection: Option<&exemplars::ExemplarInjection>,
+    playbook_delivered: Option<bool>,
 ) {
     let reported_model = usage.map(|u| u.model.clone());
     let (input_tokens, output_tokens) = usage
@@ -548,6 +768,13 @@ pub(super) fn record_phase(
         review_exemplars_injected: review_exemplar_injection.map(|injection| injection.injected),
         review_exemplar_run_ids: review_exemplar_injection
             .map(|injection| injection.selected_run_ids.clone()),
+        // Honest per-path delivery: ACP implementers never receive the playbook
+        // (it is not folded into their user instruction), so the caller passes
+        // the real value; plan/review roles fold it via the system prompt and
+        // fall back to the role-derived default.
+        playbook_injected: Some(playbook_delivered.unwrap_or_else(|| playbook_injected(role_cfg))),
+        arena_rank: None,
+        arena_winner: None,
     });
 }
 
@@ -617,6 +844,9 @@ pub(super) fn record_question_round(
         plan_exemplar_run_ids: None,
         review_exemplars_injected: None,
         review_exemplar_run_ids: None,
+        playbook_injected: None,
+        arena_rank: None,
+        arena_winner: None,
     });
 }
 

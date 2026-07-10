@@ -1,0 +1,33 @@
+name: New agent request
+description: Ask for (or offer) support for an ACP agent in the catalog
+title: "[agent] <agent name>"
+labels: ["adapter", "good first issue"]
+body:
+  - type: input
+    id: agent
+    attributes:
+      label: Agent
+      description: Name and homepage of the CLI/agent
+      placeholder: "Qwen Code — https://github.com/QwenLM/qwen-code"
+    validations:
+      required: true
+  - type: input
+    id: acp
+    attributes:
+      label: How does it speak ACP?
+      description: The command that starts it in ACP mode, or the adapter that wraps it
+      placeholder: "qwen --acp / @agentclientprotocol/xyz-acp"
+  - type: dropdown
+    id: offer
+    attributes:
+      label: Are you offering to add it?
+      options:
+        - "Yes — I'll open the one-file PR (see ADAPTERS.md)"
+        - "No — requesting someone else picks it up"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Auth model, free tier, pricing, anything a catalog entry should mention

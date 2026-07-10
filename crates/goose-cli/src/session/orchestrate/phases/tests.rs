@@ -81,7 +81,7 @@ async fn stream_role_completion_returns_partial_text_after_idle_timeout() {
     });
     let request = goose::conversation::message::Message::user().with_text("plan this");
 
-    let (text, usage) = super::stream_role_completion_with_idle_timeout(
+    let completion = super::stream_role_completion_status(
         &provider,
         &goose_providers::model::ModelConfig::new("test-model"),
         "",
@@ -93,8 +93,8 @@ async fn stream_role_completion_returns_partial_text_after_idle_timeout() {
     .await
     .unwrap();
 
-    assert_eq!(text, "partial plan");
-    assert!(usage.is_none());
+    assert_eq!(completion.text, "partial plan");
+    assert!(completion.usage.is_none());
 }
 
 #[tokio::test]
@@ -103,7 +103,7 @@ async fn stream_role_completion_errors_when_idle_timeout_has_no_text() {
         Arc::new(SilentProvider { first_text: None });
     let request = goose::conversation::message::Message::user().with_text("plan this");
 
-    let err = super::stream_role_completion_with_idle_timeout(
+    let err = super::stream_role_completion_status(
         &provider,
         &goose_providers::model::ModelConfig::new("test-model"),
         "",
@@ -183,6 +183,7 @@ fn archive_pending_reviews_flushes_all_review_cycles() {
         "run-1",
         "Add review exemplar archive and injection",
         &reviewer_role,
+        Some("/repos/mine"),
     );
 
     let state_dir = root.path().join("state").join("review_exemplars");
@@ -242,6 +243,73 @@ fn short_headless_plan_retries_once_then_aborts() {
     );
 }
 
+const WELL_FORMED_PLAN: &str = "## Files\nsrc/lib.rs\n## Steps\n1. do it\n## Acceptance criteria\n- it works\n## Verification\ncargo test";
+
+#[test]
+fn validate_plan_structure_accepts_all_required_sections() {
+    assert!(super::validate_plan_structure(WELL_FORMED_PLAN).is_empty());
+}
+
+#[test]
+fn validate_plan_structure_reports_each_missing_section() {
+    let plan = "## Files\nsrc/lib.rs\n## Steps\n1. do it\n## Verification\ncargo test";
+    assert_eq!(
+        super::validate_plan_structure(plan),
+        vec![super::PlanSection::AcceptanceCriteria]
+    );
+
+    let empty = super::validate_plan_structure("just prose, no headers");
+    assert_eq!(
+        empty,
+        vec![
+            super::PlanSection::Files,
+            super::PlanSection::Steps,
+            super::PlanSection::AcceptanceCriteria,
+            super::PlanSection::Verification,
+        ]
+    );
+}
+
+#[test]
+fn validate_plan_structure_is_case_insensitive_and_accepts_h3_and_suffixes() {
+    let plan = "### files to touch\nsrc/lib.rs\n### STEPS\n1. go\n### Acceptance Criteria (each checkable)\n- ok\n### Verification commands\ncargo test";
+    assert!(super::validate_plan_structure(plan).is_empty());
+}
+
+#[test]
+fn plan_structure_action_reprompts_once_then_proceeds() {
+    assert_eq!(
+        super::plan_structure_action(&[], 0),
+        super::PlanStructureAction::Accept
+    );
+    assert_eq!(
+        super::plan_structure_action(&[super::PlanSection::Files], 0),
+        super::PlanStructureAction::Reprompt
+    );
+    assert_eq!(
+        super::plan_structure_action(&[super::PlanSection::Files], 1),
+        super::PlanStructureAction::ProceedWithWarning
+    );
+}
+
+#[test]
+fn structure_gate_and_char_floor_are_independent() {
+    // A structurally-valid plan under the floor still triggers the char retry.
+    assert!(super::validate_plan_structure(WELL_FORMED_PLAN).is_empty());
+    assert_eq!(
+        super::plan_quality_action(WELL_FORMED_PLAN, 3000, 0),
+        super::PlanQualityAction::Retry
+    );
+    // A structurally-complete plan over the floor passes the char floor and the
+    // structure gate both.
+    let long_plan = format!("{WELL_FORMED_PLAN}\n{}", "detail ".repeat(600));
+    assert_eq!(
+        super::plan_quality_action(&long_plan, 3000, 0),
+        super::PlanQualityAction::Accept
+    );
+    assert!(super::validate_plan_structure(&long_plan).is_empty());
+}
+
 #[test]
 fn orch_min_plan_chars_reads_env_override() {
     let _guard = env_lock::lock_env([("GOOSE_ORCH_MIN_PLAN_CHARS", Some("1200".to_string()))]);
@@ -277,6 +345,61 @@ fn planner_prompt_omits_question_protocol_when_disabled() {
 }
 
 #[test]
+fn extract_acceptance_criteria_pulls_section_items_and_strips_markers() {
+    let plan = "## Files\nsrc/lib.rs\n## Acceptance criteria\n- criterion one\n2. criterion two\n* criterion three\n## Verification\ncargo test";
+    assert_eq!(
+        super::extract_acceptance_criteria(plan),
+        vec![
+            "criterion one".to_string(),
+            "criterion two".to_string(),
+            "criterion three".to_string(),
+        ]
+    );
+    assert!(super::extract_acceptance_criteria("## Files\nonly files").is_empty());
+}
+
+#[test]
+fn has_self_verification_matches_tolerant_headers() {
+    assert!(super::has_self_verification(
+        "report body\n\n## Self-verification\n- crit: `cargo test` green"
+    ));
+    assert!(super::has_self_verification(
+        "### self verification (criterion -> evidence)\n- ok"
+    ));
+    assert!(!super::has_self_verification(
+        "I verified everything myself, trust me."
+    ));
+}
+
+#[test]
+fn self_verification_demand_lists_criteria_verbatim() {
+    let plan = "## Acceptance criteria\n- gate passes\n- tests added\n## Verification\ncargo test";
+    let demand = super::self_verification_demand(plan);
+    assert!(demand.contains("## Self-verification"));
+    assert!(demand.contains("1. gate passes"));
+    assert!(demand.contains("2. tests added"));
+}
+
+#[test]
+fn self_verification_demand_handles_criterialess_plan() {
+    let demand = super::self_verification_demand("## Files\njust files");
+    assert!(demand.contains("no explicit acceptance criteria"));
+}
+
+#[test]
+fn self_verification_review_block_flags_missing_section() {
+    let plan = "## Acceptance criteria\n- gate passes\n## Verification\ncargo test";
+    let present =
+        super::self_verification_review_block(plan, "## Self-verification\n- gate: green");
+    assert!(present.contains("ends with a `## Self-verification` section"));
+    assert!(present.contains("1. gate passes"));
+
+    let missing = super::self_verification_review_block(plan, "no such section here");
+    assert!(missing.contains("did NOT provide"));
+    assert!(missing.contains("1. gate passes"));
+}
+
+#[test]
 fn review_prompt_contains_reinforced_rubric() {
     assert!(super::REVIEW_SYSTEM_PROMPT.contains("Independent re-verification"));
     assert!(super::REVIEW_SYSTEM_PROMPT.contains("acceptance criteria"));
@@ -286,37 +409,6 @@ fn review_prompt_contains_reinforced_rubric() {
     assert!(super::REVIEW_SYSTEM_PROMPT.contains("mechanism"));
     assert!(super::REVIEW_SYSTEM_PROMPT.contains("reproduction"));
     assert!(super::REVIEW_SYSTEM_PROMPT.contains("fix direction"));
-}
-
-#[test]
-fn parse_verdict_finds_line_start_verdict() {
-    assert!(super::parse_verdict_approved(
-        "VERDICT: APPROVED\n\nAll checks passed."
-    ));
-    assert!(!super::parse_verdict_approved(
-        "VERDICT: REVISE\n1. Fix foo."
-    ));
-    assert!(!super::parse_verdict_approved("no verdict at all"));
-}
-
-#[test]
-fn parse_verdict_survives_glued_preamble() {
-    // Streamed assistant messages used to be concatenated without a
-    // separator, so the verdict could end up mid-line after a preamble.
-    assert!(super::parse_verdict_approved(
-        "I'll verify the file state first.VERDICT: APPROVED\n\nDetails follow."
-    ));
-    assert!(!super::parse_verdict_approved(
-        "Checking the diff now.VERDICT: REVISE\n1. Fix foo."
-    ));
-}
-
-#[test]
-fn parse_verdict_ignores_text_before_marker_on_same_line() {
-    // "APPROVED" appearing before the marker must not count.
-    assert!(!super::parse_verdict_approved(
-        "The plan said APPROVED is expected.VERDICT: REVISE\n1. Fix foo."
-    ));
 }
 
 #[test]

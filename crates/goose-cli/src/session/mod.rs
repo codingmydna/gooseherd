@@ -1,5 +1,6 @@
 mod arena;
 mod builder;
+mod commands_registry;
 mod completion;
 pub mod editor;
 mod elicitation;
@@ -21,13 +22,13 @@ mod task_execution_display;
 mod terminal_setup;
 mod thinking;
 mod ux;
+mod verdict;
 mod worktree;
 
 use crate::session::task_execution_display::{
     format_task_execution_notification, TASK_EXECUTION_NOTIFICATION_TYPE,
 };
 use goose::conversation::Conversation;
-use std::env;
 use std::io::Write;
 use std::str::FromStr;
 use tokio::signal::ctrl_c;
@@ -42,7 +43,6 @@ use goose::agents::SUBAGENT_TOOL_REQUEST_TYPE;
 use goose::permission::permission_confirmation::PrincipalType;
 use goose::permission::Permission;
 use goose::permission::PermissionConfirmation;
-use goose::providers::base::Provider;
 use goose::providers::base::ProviderUsage;
 use goose::session::{ContextWindowState, ExtensionState};
 use goose::utils::safe_truncate;
@@ -77,8 +77,6 @@ use std::time::Instant;
 use tokio;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-
-const GOOSE_PLANNER_CONTEXT_LIMIT: &str = "GOOSE_PLANNER_CONTEXT_LIMIT";
 
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonOutput {
@@ -130,11 +128,6 @@ enum NotificationData {
         total: Option<f64>,
         message: Option<String>,
     },
-}
-
-pub enum RunMode {
-    Normal,
-    Plan,
 }
 
 struct HistoryManager {
@@ -190,7 +183,6 @@ pub struct CliSession {
     session_id: String,
     completion_cache: Arc<std::sync::RwLock<CompletionCache>>,
     debug: bool,
-    run_mode: RunMode,
     scheduled_job_id: Option<String>,
     max_turns: Option<u32>,
     edit_mode: Option<EditMode>,
@@ -247,46 +239,6 @@ impl CompletionCache {
     }
 }
 
-pub enum PlannerResponseType {
-    Plan,
-    ClarifyingQuestions,
-}
-
-/// Decide if the planner's response is a plan or a clarifying question
-///
-/// This function is called after the planner has generated a response
-/// to the user's message. The response is either a plan or a clarifying
-/// question.
-pub async fn classify_planner_response(
-    session_id: &str,
-    message_text: String,
-    provider: Arc<dyn Provider>,
-    model_config: goose_providers::model::ModelConfig,
-) -> Result<PlannerResponseType> {
-    let prompt = format!(
-        "The text below is the output from an AI model which can either provide a plan or list of clarifying questions. Based on the text below, decide if the output is a \"plan\" or \"clarifying questions\".\n---\n{message_text}"
-    );
-
-    let message = Message::user().with_text(&prompt);
-    let (result, _usage) = goose::session_context::with_session_id(
-        Some(session_id.to_string()),
-        provider.complete(
-            &model_config,
-            "Reply only with the classification label: \"plan\" or \"clarifying questions\"",
-            &[message],
-            &[],
-        ),
-    )
-    .await?;
-
-    let predicted = result.as_concat_text();
-    if predicted.to_lowercase().contains("plan") {
-        Ok(PlannerResponseType::Plan)
-    } else {
-        Ok(PlannerResponseType::ClarifyingQuestions)
-    }
-}
-
 impl CliSession {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -314,7 +266,6 @@ impl CliSession {
             session_id,
             completion_cache: Arc::new(std::sync::RwLock::new(CompletionCache::new())),
             debug,
-            run_mode: RunMode::Normal,
             scheduled_job_id,
             max_turns,
             edit_mode,
@@ -549,14 +500,7 @@ impl CliSession {
                 console::style("●").red(),
                 console::style(format!("session closed · {}", &self.session_id)).dim()
             );
-            println!(
-                "  {}",
-                console::style(format!(
-                    "resume with: goose session --resume --session-id {}",
-                    &self.session_id
-                ))
-                .cyan()
-            );
+            println!("  {}", console::style("resume with: goose s -r").cyan());
         }
 
         result
@@ -699,13 +643,6 @@ impl CliSession {
             InputResult::Model(model) => {
                 history.save(editor);
                 self.handle_model(model.as_deref()).await?;
-            }
-            InputResult::Plan(options) => {
-                self.handle_plan_mode(options).await?;
-            }
-            InputResult::EndPlan => {
-                self.run_mode = RunMode::Normal;
-                output::render_exit_plan_mode();
             }
             InputResult::Orchestrate(task) => {
                 history.save(editor);
@@ -896,43 +833,22 @@ impl CliSession {
         history: &HistoryManager,
         editor: &mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     ) -> Result<()> {
-        match self.run_mode {
-            RunMode::Normal => {
-                history.save(editor);
-                self.push_message(Message::user().with_text(content));
+        history.save(editor);
+        self.push_message(Message::user().with_text(content));
 
-                if let Err(e) = crate::project_tracker::update_project_tracker(
-                    Some(content),
-                    Some(&self.session_id),
-                ) {
-                    eprintln!(
-                        "Warning: Failed to update project tracker with instruction: {}",
-                        e
-                    );
-                }
+        let _provider = self.agent.provider().await?;
 
-                let _provider = self.agent.provider().await?;
+        println!();
+        output::run_status_hook("thinking");
+        output::show_thinking();
+        let start_time = Instant::now();
+        self.process_agent_response(true, CancellationToken::default())
+            .await?;
+        output::hide_thinking();
 
-                println!();
-                output::run_status_hook("thinking");
-                output::show_thinking();
-                let start_time = Instant::now();
-                self.process_agent_response(true, CancellationToken::default())
-                    .await?;
-                output::hide_thinking();
-
-                let elapsed = start_time.elapsed();
-                let elapsed_str = format_elapsed_time(elapsed);
-                println!("{}", console::style(format!("  ⏱ {}", elapsed_str)).dim());
-            }
-            RunMode::Plan => {
-                let mut plan_messages = self.messages.clone();
-                plan_messages.push(Message::user().with_text(content));
-                let (reasoner, reasoner_model_config) = get_reasoner().await?;
-                self.plan_with_reasoner_model(plan_messages, reasoner, reasoner_model_config)
-                    .await?;
-            }
-        }
+        let elapsed = start_time.elapsed();
+        let elapsed_str = format_elapsed_time(elapsed);
+        println!("{}", console::style(format!("  ⏱ {}", elapsed_str)).dim());
         Ok(())
     }
 
@@ -1486,22 +1402,6 @@ impl CliSession {
         }
     }
 
-    async fn handle_plan_mode(&mut self, options: input::PlanCommandOptions) -> Result<()> {
-        self.run_mode = RunMode::Plan;
-        output::render_enter_plan_mode();
-
-        if options.message_text.is_empty() {
-            return Ok(());
-        }
-
-        let mut plan_messages = self.messages.clone();
-        plan_messages.push(Message::user().with_text(&options.message_text));
-
-        let (reasoner, reasoner_model_config) = get_reasoner().await?;
-        self.plan_with_reasoner_model(plan_messages, reasoner, reasoner_model_config)
-            .await
-    }
-
     async fn handle_clear(&mut self) -> Result<()> {
         if let Err(e) = self
             .agent
@@ -1661,94 +1561,6 @@ impl CliSession {
         Ok(())
     }
 
-    async fn plan_with_reasoner_model(
-        &mut self,
-        plan_messages: Conversation,
-        reasoner: Arc<dyn Provider>,
-        model_config: goose_providers::model::ModelConfig,
-    ) -> Result<(), anyhow::Error> {
-        let plan_prompt = self.agent.get_plan_prompt(&self.session_id).await?;
-        let (plan_response, _usage) = {
-            let _thinking_turn = output::begin_thinking_turn();
-            output::show_thinking();
-            let result = goose::session_context::with_session_id(
-                Some(self.session_id.clone()),
-                reasoner.complete(&model_config, &plan_prompt, plan_messages.messages(), &[]),
-            )
-            .await;
-            output::hide_thinking();
-            result?
-        };
-        output::render_message(&plan_response, self.debug);
-        let planner_response_type = classify_planner_response(
-            &self.session_id,
-            plan_response.as_concat_text(),
-            self.agent.provider().await?,
-            self.agent
-                .model_config_for_session(&self.session_id)
-                .await?,
-        )
-        .await?;
-
-        match planner_response_type {
-            PlannerResponseType::Plan => {
-                println!();
-                let should_act = match cliclack::confirm(
-                    "Do you want to clear message history & act on this plan?",
-                )
-                .initial_value(true)
-                .interact()
-                {
-                    Ok(choice) => choice,
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::Interrupted {
-                            false // If interrupted, set should_act to false
-                        } else {
-                            return Err(e.into());
-                        }
-                    }
-                };
-                if should_act {
-                    output::render_act_on_plan();
-                    self.run_mode = RunMode::Normal;
-                    // set goose mode: auto if that isn't already the case
-                    let config = Config::global();
-                    let curr_goose_mode = config.get_goose_mode().unwrap_or_default();
-                    if curr_goose_mode != GooseMode::Auto {
-                        config.set_goose_mode(GooseMode::Auto).unwrap();
-                    }
-
-                    // clear the messages before acting on the plan
-                    self.messages.clear();
-                    // add the plan response as a user message
-                    let plan_message = Message::user().with_text(plan_response.as_concat_text());
-                    self.push_message(plan_message);
-                    // act on the plan
-                    output::show_thinking();
-                    self.process_agent_response(true, CancellationToken::default())
-                        .await?;
-                    output::hide_thinking();
-
-                    // Reset run & goose mode
-                    if curr_goose_mode != GooseMode::Auto {
-                        config.set_goose_mode(curr_goose_mode)?;
-                    }
-                } else {
-                    // add the plan response (assistant message) & carry the conversation forward
-                    // in the next round, the user might wanna slightly modify the plan
-                    self.push_message(plan_response);
-                }
-            }
-            PlannerResponseType::ClarifyingQuestions => {
-                // add the plan response (assistant message) & carry the conversation forward
-                // in the next round, the user will answer the clarifying questions
-                self.push_message(plan_response);
-            }
-        }
-
-        Ok(())
-    }
-
     /// Process a single message and exit
     pub async fn headless(&mut self, prompt: String) -> Result<()> {
         let message = Message::user().with_text(&prompt);
@@ -1824,16 +1636,22 @@ impl CliSession {
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
 
-        // Live stdin while the turn streams: slash commands and steering text.
+        // Live stdin while the turn streams: slash commands, steering text, and
+        // a bare Esc to interrupt. On by default on an interactive tty (unix);
+        // GOOSE_LIVE_INPUT=false opts out.
         let mut live_stdin = if interactive
-            && Config::global()
-                .get_param::<bool>("GOOSE_LIVE_INPUT")
-                .unwrap_or(false)
-        {
+            && live_input::should_enable_live_input(
+                std::io::stdout().is_terminal(),
+                std::io::stdin().is_terminal(),
+                Config::global().get_param::<bool>("GOOSE_LIVE_INPUT").ok(),
+            ) {
             live_input::LiveStdin::enable()
         } else {
             None
         };
+        if live_stdin.is_some() {
+            output::arm_live_input_hint();
+        }
         let mut live_tick = tokio::time::interval(std::time::Duration::from_millis(150));
         live_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut status_tick = tokio::time::interval(output::thinking_status_refresh_interval());
@@ -2029,8 +1847,16 @@ impl CliSession {
                 }
                 _ = live_tick.tick(), if live_stdin.is_some() => {
                     if let Some(ls) = live_stdin.as_mut() {
-                        while let Some(line) = ls.poll_line() {
-                            self.handle_live_command(&line).await;
+                        for event in ls.poll_events() {
+                            match event {
+                                live_input::LiveInputEvent::Steer(line) => {
+                                    self.handle_live_command(&line).await;
+                                }
+                                live_input::LiveInputEvent::Interrupt => {
+                                    cancel_token_clone.cancel();
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -2043,6 +1869,7 @@ impl CliSession {
             }
         }
         drop(live_stdin);
+        output::finish_live_input_hint();
 
         let leftover_steers = self.take_uninjected_steers();
         if !leftover_steers.is_empty() {
@@ -2116,6 +1943,7 @@ impl CliSession {
             if self.stats {
                 print_run_stats(run_started, first_token_at, last_usage.as_ref());
             }
+            output::ring_bell_if(run_started.elapsed());
         }
 
         Ok(())
@@ -3045,51 +2873,6 @@ fn handle_agent_error(e: &anyhow::Error, is_stream_json_mode: bool) {
     if !is_stream_json_mode {
         eprintln!("Error: {}", error_msg);
     }
-}
-
-async fn get_reasoner(
-) -> Result<(Arc<dyn Provider>, goose_providers::model::ModelConfig), anyhow::Error> {
-    use goose::providers::create;
-
-    let config = Config::global();
-
-    // Try planner-specific provider first, fall back to default provider
-    let provider = if let Ok(provider) = config.get_param::<String>("GOOSE_PLANNER_PROVIDER") {
-        provider
-    } else {
-        println!("WARNING: GOOSE_PLANNER_PROVIDER not found. Using default provider...");
-        config
-            .get_goose_provider()
-            .expect("No provider configured. Run 'goose configure' first")
-    };
-
-    // Try planner-specific model first, fall back to default model
-    let model = if let Ok(model) = config.get_param::<String>("GOOSE_PLANNER_MODEL") {
-        model
-    } else {
-        println!("WARNING: GOOSE_PLANNER_MODEL not found. Using default model...");
-        config
-            .get_goose_model()
-            .expect("No model configured. Run 'goose configure' first")
-    };
-
-    let planner_context_limit = match env::var(GOOSE_PLANNER_CONTEXT_LIMIT)
-        .ok()
-        .map(|v| v.parse::<usize>())
-    {
-        Some(Ok(n)) if n >= 4096 => Some(n),
-        Some(Ok(_)) => anyhow::bail!("{} must be at least 4096", GOOSE_PLANNER_CONTEXT_LIMIT),
-        Some(Err(e)) => anyhow::bail!("{}: {}", GOOSE_PLANNER_CONTEXT_LIMIT, e),
-        None => None,
-    };
-
-    let model_config =
-        goose::model_config::model_config_from_user_config(&provider, model.as_str())?
-            .with_context_limit(planner_context_limit);
-    let extensions = goose::config::extensions::get_enabled_extensions_with_config(config);
-    let reasoner = create(&provider, extensions).await?;
-
-    Ok((reasoner, model_config))
 }
 
 /// Format elapsed time duration

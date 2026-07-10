@@ -21,7 +21,6 @@ As the budget gets low, become more direct: reduce exploration, batch necessary 
 make reasonable assumptions, and focus on finishing the user's task.
 
 
-
 # Extensions
 
 Extensions provide additional tools and context from different data sources and applications.
@@ -67,11 +66,6 @@ and large codebase. Returns one of three views:
 
 For large codebases, delegate analysis to a subagent and retain only the summary.
 
-## apps
-
-apps supports resources.
-### Instructions
-Use this extension to create, manage, and iterate on custom HTML/CSS/JavaScript apps.
 ## chatrecall
 
 ### Instructions

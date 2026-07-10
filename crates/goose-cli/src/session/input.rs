@@ -3,13 +3,12 @@ use super::goal;
 use super::looping::{self, ParsedLoopCommand};
 use super::{CompletionCache, HintStatus};
 use anyhow::Result;
-use goose::config::{Config, GooseMode};
+use goose::config::Config;
 use rustyline::Editor;
 use shlex;
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::sync::Arc;
-use strum::VariantNames;
 
 const MIN_INPUT_BOX_WIDTH: usize = 20;
 
@@ -26,8 +25,6 @@ pub enum InputResult {
     PromptCommand(PromptCommandOptions),
     GooseMode(String),
     Model(Option<String>),
-    Plan(PlanCommandOptions),
-    EndPlan,
     Orchestrate(String),
     Status,
     UsageInfo,
@@ -59,11 +56,6 @@ pub struct PromptCommandOptions {
     pub name: String,
     pub info: bool,
     pub arguments: HashMap<String, String>,
-}
-
-#[derive(Debug)]
-pub struct PlanCommandOptions {
-    pub message_text: String,
 }
 
 struct CtrlCHandler {
@@ -319,11 +311,53 @@ pub fn get_input(
         return Ok(InputResult::Message(trimmed.to_string()));
     }
 
+    // A leading '/' only denotes a command when the first token is
+    // command-shaped. An absolute path like "/Users/kimjs/x.rs please look"
+    // must reach the model as a normal message, not be eaten by the
+    // nearest-command typo handler.
+    let first_token = input.split_whitespace().next().unwrap_or_default();
+    if !is_command_token(first_token) {
+        return Ok(InputResult::Message(input.trim().to_string()));
+    }
+
     // Handle slash commands
     match handle_slash_command(&input) {
         Some(result) => Ok(result),
-        None => Ok(InputResult::Message(input.trim().to_string())),
+        None => {
+            let token = first_token;
+            match super::commands_registry::nearest_command(token) {
+                Some(suggestion) => {
+                    println!(
+                        "{}",
+                        console::style(format!(
+                            "Unknown command {token} — did you mean {suggestion}?"
+                        ))
+                        .yellow()
+                    );
+                    Ok(InputResult::Retry)
+                }
+                None => Ok(InputResult::Message(input.trim().to_string())),
+            }
+        }
     }
+}
+
+/// Whether `token` is shaped like a slash command: a single leading '/', then a
+/// letter or '?', then only lowercase letters, digits, or hyphens (the regex
+/// `^/[a-z?][a-z0-9-]*$`). Absolute paths ("/Users/x", "/etc/hosts.txt") and
+/// anything with a dot or a second slash are not commands.
+fn is_command_token(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix('/') else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first != '?' && !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn handle_slash_command(input: &str) -> Option<InputResult> {
@@ -338,8 +372,6 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_MODE: &str = "/mode ";
     const CMD_MODEL: &str = "/model";
     const CMD_MODEL_WITH_SPACE: &str = "/model ";
-    const CMD_PLAN: &str = "/plan";
-    const CMD_ENDPLAN: &str = "/endplan";
     const CMD_ORCH: &str = "/orch";
     const CMD_GOAL: &str = "/goal";
     const CMD_LOOP: &str = "/loop";
@@ -426,10 +458,6 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
                 Some(InputResult::Model(Some(model)))
             }
         }
-        s if s.starts_with(CMD_PLAN) => {
-            parse_plan_command(s.get(CMD_PLAN.len()..).unwrap_or("").trim().to_string())
-        }
-        s if s == CMD_ENDPLAN => Some(InputResult::EndPlan),
         s if s == CMD_ORCH || s.starts_with(&format!("{CMD_ORCH} ")) => Some(
             InputResult::Orchestrate(s.get(CMD_ORCH.len()..).unwrap_or("").trim().to_string()),
         ),
@@ -592,66 +620,22 @@ fn parse_prompt_command(args: &str) -> Option<InputResult> {
     Some(InputResult::PromptCommand(options))
 }
 
-fn parse_plan_command(input: String) -> Option<InputResult> {
-    let options = PlanCommandOptions {
-        message_text: input.trim().to_string(),
-    };
-
-    Some(InputResult::Plan(options))
-}
-
 fn print_help() {
     let newline_key = get_newline_key().to_ascii_uppercase();
-    let modes = GooseMode::VARIANTS.join(", ");
+    println!("{}\n", super::commands_registry::help_text());
     println!(
-        "Available commands:
-/exit or /quit - Exit the session
-/t - Toggle Light/Dark/Ansi theme
-/t <name> - Set theme directly (light, dark, ansi)
-/r - Toggle full tool output display (show complete tool parameters without truncation)
-/extension <command> - Add a stdio extension (format: ENV1=val1 command args...)
-/builtin <names> - Add builtin extensions by name (comma-separated)
-/prompts [--extension <name>] - List all available prompts, optionally filtered by extension
-/prompt <n> [--info] [key=value...] - Get prompt info or execute a prompt
-/mode <name> - Set the goose mode to use ({modes})
-/model [provider/]model - Without args, open a provider/model picker; with args, switch this session and save it as default
-/effort [target] <level> - Without args, pick reasoning effort for session/planner/implementer/reviewer; bare level sets session effort
-/plan <message_text> -  Enters 'plan' mode with optional message. Create a plan based on the current messages and asks user if they want to act on it.
-/orch <task> - Run the task through a plan/implement/review loop: planner model plans, implementer model executes, reviewer model reviews until approved (GOOSE_PLANNER_*, GOOSE_IMPLEMENTER_*, GOOSE_REVIEWER_* config)
-/goal <goal> [--max N] [--check \"cmd\"] - Retry a normal turn until a deterministic check or evaluator says GOAL_MET
-/status - Show session status: provider/model/effort/connection type, orchestration roles, subagent config, token usage
-/usage - Show token usage and cost for this session
-/stats - Orch/goal run statistics: per-role/model tokens, durations, verdicts, reported-model verification
-/arena [lineup=provider/model,...] <task> - Run the same task on each contestant in isolated git worktrees, then blind-judge the diffs (GOOSE_ARENA_LINEUP, GOOSE_ARENA_TIMEOUT_SECS)
-/worktree <name> - Create a named git worktree under .goose/worktrees and print how to enter it
-/btw <question> - Ask a side question (answered by the planner model) without adding it to the session history
-/roles [role=provider/model ...] - Show or change /orch role assignments in-session (also effort=<level>, cycles=<n>)
-/preset [save <name> | <name> | delete <name>] - Save/apply/delete role presets; bare /preset opens a picker. Shift+Tab cycles presets at the prompt
-/init - Analyze this repository and write (or improve) AGENTS.md
-/remember <note> - Append a note to this project's .goosehints memory
-/terminal-setup - Install a terminal key binding so Shift+Enter can insert a newline
-!<command> - Run a shell command directly; its output is added to the conversation context
-                        If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.
-                        To warm up goose before using '/plan', we recommend setting '/mode approve' & putting appropriate context into goose.
-                        The model is used based on $GOOSE_PLANNER_PROVIDER and $GOOSE_PLANNER_MODEL environment variables.
-                        If no model is set, the default model is used.
-/endplan - Exit plan mode and return to 'normal' goose mode.
-/recipe [filepath] - Generate a recipe from the current conversation and save it to the specified filepath (must end with .yaml).
-                       If no filepath is provided, it will be saved to ./recipe.yaml.
-/compact - Compact the current conversation to reduce context length while preserving key information.
-/status - Show session status: model, provider, mode, and token usage.
-/edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
-               Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
-/skills - List available skills or enable skills by name (usage: /skills [<name>...])
-/? or /help - Display this help message
-/clear - Clears the current chat history
+        "Keybindings:
+  Enter                 Submit
+  Ctrl+{newline_key}                Insert a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
+  Shift+Tab             Cycle role presets
+  Esc                   Interrupt the current turn
+  Ctrl+C                Clear the line, or exit on an empty line
+  Shift+Enter           Insert a newline (run /terminal-setup first)
+  Up / Down             Navigate command history
 
-Navigation:
-Ctrl+C - Clear current line if text is entered, otherwise exit the session
-Shift+Enter - Add a newline after your terminal sends a distinct key sequence; run /terminal-setup if it submits instead
-Option+Enter - Add a newline using the ESC+Enter sequence
-Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
-Up/Down arrows - Navigate through command history"
+  !<command>            Run a shell command; its output joins the conversation
+
+hooks: GOOSE_STATUS_HOOK"
     );
 }
 
@@ -683,6 +667,53 @@ fn print_editor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::commands_registry::COMMANDS;
+
+    #[test]
+    fn every_registry_command_and_alias_has_a_dispatch_arm() {
+        for command in COMMANDS {
+            let sample = if command.needs_args {
+                format!("{} x", command.name)
+            } else {
+                command.name.to_string()
+            };
+            assert!(
+                handle_slash_command(&sample).is_some(),
+                "registry command {} has no dispatch arm",
+                command.name
+            );
+            for alias in command.aliases {
+                assert!(
+                    handle_slash_command(alias).is_some(),
+                    "registry alias {alias} has no dispatch arm",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_command_token_accepts_commands_rejects_paths() {
+        // Command-shaped tokens (typos included) stay in the command path.
+        assert!(is_command_token("/stats"));
+        assert!(is_command_token("/stauts"));
+        assert!(is_command_token("/model"));
+        assert!(is_command_token("/?"));
+        assert!(is_command_token("/loop-once"));
+        // Absolute paths with a second slash, an uppercase segment, or a dot are
+        // normal messages, not commands.
+        assert!(!is_command_token("/Users/kimjs/x.rs"));
+        assert!(!is_command_token("/etc/hosts"));
+        assert!(!is_command_token("/var.log"));
+        assert!(!is_command_token("/"));
+        assert!(!is_command_token("plain"));
+    }
+
+    #[test]
+    fn unknown_slash_command_falls_through_to_unregistered() {
+        // Nothing outside the registry should dispatch, so typo suggestions and
+        // message passthrough can take over.
+        assert!(handle_slash_command("/definitelynotacommand").is_none());
+    }
 
     #[test]
     fn boxed_prompt_draws_top_border_and_prompt() {
@@ -943,24 +974,6 @@ mod tests {
             // Invalid arguments are ignored but logged
         } else {
             panic!("Expected PromptCommand");
-        }
-    }
-
-    #[test]
-    fn test_plan_mode() {
-        // Test plan mode with no text
-        let result = handle_slash_command("/plan");
-        assert!(result.is_some());
-
-        // Test plan mode with text
-        let result = handle_slash_command("/plan hello world");
-        assert!(result.is_some());
-        let options = result.unwrap();
-        match options {
-            InputResult::Plan(options) => {
-                assert_eq!(options.message_text, "hello world");
-            }
-            _ => panic!("Expected Plan"),
         }
     }
 

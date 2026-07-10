@@ -34,6 +34,21 @@ fn section(title: &str) {
     println!("{}", style(title).cyan().bold());
 }
 
+fn fmt_uplift_bucket(bucket: &ledger::UpliftBucket) -> String {
+    if bucket.runs == 0 {
+        return style("—").dim().to_string();
+    }
+    let mut line = format!(
+        "{} runs · {:.0}% approved",
+        bucket.runs,
+        bucket.approval_rate().unwrap_or(0.0) * 100.0
+    );
+    if let Some(cycles) = bucket.mean_cycles_to_approval() {
+        line.push_str(&format!(" · {:.1} cyc→approve", cycles));
+    }
+    line
+}
+
 /// Claude Code's own default model (from ~/.claude/settings.json), used to
 /// annotate what claude-acp's "default" alias actually resolves to.
 fn claude_default_model() -> Option<String> {
@@ -444,19 +459,19 @@ impl CliSession {
 
         let session_id = self.session_id.clone();
         tokio::spawn(async move {
-            let config = Config::global();
-            let prev_mode = config.get_goose_mode().unwrap_or_default();
-            let _ = config.set_goose_mode(GooseMode::Chat);
             let built = match std::env::current_dir() {
                 Ok(current_dir) => build_role_provider(&role, &current_dir).await,
                 Err(error) => Err(error.into()),
             };
-            let _ = config.set_goose_mode(prev_mode);
 
             let result = async {
                 let (provider, model_config) = built?;
+                // Read-only side question: switch this freshly built provider to
+                // Chat mode directly, rather than toggling the process-global
+                // GOOSE_MODE override that a concurrent /btw or /orch relies on.
+                let _ = provider.update_mode(&session_id, GooseMode::Chat).await;
                 let (message, _usage) = goose::session_context::with_session_id(
-                    Some(session_id),
+                    Some(session_id.clone()),
                     provider.complete(
                         &model_config,
                         "You answer side questions concisely.",
@@ -555,6 +570,34 @@ impl CliSession {
                 ));
             }
             kv(key, &line);
+        }
+
+        let uplift = ledger::aggregate_uplift(&records);
+        if !uplift.is_empty() {
+            println!();
+            section("uplift · approval rate & cycles by implementer model (exemplar/playbook on vs off)");
+            for stats in &uplift {
+                kv(
+                    &stats.model,
+                    &format!(
+                        "with uplift: {}   ·   no uplift: {}",
+                        fmt_uplift_bucket(&stats.with_uplift),
+                        fmt_uplift_bucket(&stats.without_uplift)
+                    ),
+                );
+            }
+        }
+
+        let arena_wins = ledger::aggregate_arena_wins(&records);
+        if !arena_wins.is_empty() {
+            println!();
+            section("arena · wins by model");
+            for (model, wins) in &arena_wins {
+                kv(
+                    model,
+                    &format!("{} win{}", wins, if *wins == 1 { "" } else { "s" }),
+                );
+            }
         }
 
         if let Some(last) = records.last() {

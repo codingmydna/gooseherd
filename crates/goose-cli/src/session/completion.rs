@@ -10,66 +10,18 @@ use std::path::Path;
 use std::sync::Arc;
 use strum::VariantNames;
 
+use super::commands_registry;
 use super::{CompletionCache, HintStatus};
 
-/// Slash commands with one-line descriptions, used for both Tab completion
-/// and the inline typing hint.
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/exit", "Exit the session"),
-    ("/quit", "Exit the session"),
-    ("/help", "Show available commands"),
-    ("/?", "Show available commands"),
-    ("/t", "Toggle or set theme (light/dark/ansi)"),
-    ("/extension", "Add a stdio extension"),
-    ("/builtin", "Add builtin extensions by name"),
-    ("/prompts", "List available prompts"),
-    ("/prompt", "Get prompt info or run a prompt"),
-    ("/mode", "Set goose mode (auto/approve/smart_approve/chat)"),
-    (
-        "/model",
-        "Pick or switch provider/model (e.g. /model codex-acp/gpt-5.5)",
-    ),
-    (
-        "/effort",
-        "Pick or set reasoning effort (low/medium/high/xhigh)",
-    ),
-    ("/recipe", "Generate a recipe from this session"),
-    ("/skills", "List or load skills"),
-    ("/status", "Session status: model, roles, subagents, usage"),
-    ("/usage", "Token usage and cost for this session"),
-    ("/stats", "Orch/goal run statistics and model verification"),
-    (
-        "/arena",
-        "Same task, N models, isolated worktrees, blind judge",
-    ),
-    ("/worktree", "Create a named git worktree"),
-    ("/orch", "Plan → implement → review loop across models"),
-    (
-        "/goal",
-        "Retry until a check or evaluator confirms the goal",
-    ),
-    (
-        "/loop",
-        "Repeat a prompt on an interval until stopped or done",
-    ),
-    ("/roles", "Show or change orchestration roles/effort"),
-    ("/preset", "Save/apply role presets; Shift+Tab cycles"),
-    ("/init", "Analyze the repo and write AGENTS.md"),
-    ("/remember", "Append a note to .goosehints project memory"),
-    ("/btw", "Side question in the background, history untouched"),
-    ("/plan", "Enter plan mode"),
-    ("/endplan", "Exit plan mode"),
-    ("/compact", "Compact the conversation to free context"),
-    ("/clear", "Clear the conversation history"),
-    ("/r", "Toggle full tool output"),
-    ("/edit", "Compose the message in your editor"),
-    (
-        "/terminal-setup",
-        "Configure Shift+Enter newline for this terminal",
-    ),
-];
-
 const FILE_MENTION_LIMIT: usize = 50;
+
+/// One-line description for an exact command or alias, from the registry.
+fn command_desc(token: &str) -> Option<&'static str> {
+    commands_registry::completion_pairs()
+        .into_iter()
+        .find(|(name, _)| *name == token)
+        .map(|(_, desc)| desc)
+}
 
 fn at_mention_token(line: &str) -> Option<(usize, &str)> {
     let token_start = line
@@ -145,27 +97,27 @@ fn file_mention_candidates(root: &Path, token: &str) -> Vec<Pair> {
 
 fn slash_command_candidates(token: &str, limit: usize) -> Vec<(&'static str, &'static str)> {
     let query = token.trim_start_matches('/');
+    let pairs = commands_registry::completion_pairs();
     let mut seen = std::collections::HashSet::new();
-    let prefix_matches = SLASH_COMMANDS
-        .iter()
-        .filter(move |(command, _)| command.starts_with(token));
-    let partial_matches = SLASH_COMMANDS.iter().filter(move |(command, _)| {
-        !command.starts_with(token)
+    let mut result = Vec::new();
+
+    for (command, description) in pairs.iter().copied() {
+        if command.starts_with(token) && seen.insert(command) {
+            result.push((command, description));
+        }
+    }
+    for (command, description) in pairs.iter().copied() {
+        if !command.starts_with(token)
             && !query.is_empty()
             && command.trim_start_matches('/').contains(query)
-    });
+            && seen.insert(command)
+        {
+            result.push((command, description));
+        }
+    }
 
-    prefix_matches
-        .chain(partial_matches)
-        .filter_map(|(command, description)| {
-            if seen.insert(*command) {
-                Some((*command, *description))
-            } else {
-                None
-            }
-        })
-        .take(limit)
-        .collect()
+    result.truncate(limit);
+    result
 }
 
 fn slash_command_hint(line: &str) -> Option<String> {
@@ -185,12 +137,15 @@ fn slash_command_hint(line: &str) -> Option<String> {
                     .to_string(),
             );
         }
-        return match SLASH_COMMANDS.iter().find(|(c, _)| *c == token) {
-            Some((_, desc)) => Some(format!("   ✓ {}", desc)),
+        return match command_desc(token) {
+            Some(desc) => Some(format!("   ✓ {}", desc)),
             None => Some("   ✗ unknown command".to_string()),
         };
     }
-    if let Some((_, desc)) = SLASH_COMMANDS.iter().find(|(c, _)| *c == token) {
+    if let Some(desc) = command_desc(token) {
+        if commands_registry::requires_args(token) {
+            return Some(format!("   ✓ {} — needs an argument", desc));
+        }
         return Some(format!("   ✓ {}", desc));
     }
     let matches = slash_command_candidates(token, 5);
@@ -444,7 +399,7 @@ impl GooseCompleter {
     /// Complete slash commands
     fn complete_slash_commands(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
         // Find commands that match the prefix
-        let matching_commands: Vec<Pair> = SLASH_COMMANDS
+        let matching_commands: Vec<Pair> = commands_registry::completion_pairs()
             .iter()
             .filter(|(cmd, _)| cmd.starts_with(line))
             .map(|(cmd, _)| Pair {
@@ -1050,7 +1005,7 @@ mod tests {
                 .iter()
                 .map(|candidate| candidate.replacement.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/mode ", "/model "]
+            vec!["/model ", "/mode "]
         );
     }
 

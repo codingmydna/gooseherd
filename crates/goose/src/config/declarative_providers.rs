@@ -2,9 +2,6 @@ use crate::config::paths::Paths;
 use crate::config::Config;
 use crate::providers::anthropic_def::AnthropicProviderDef;
 use crate::providers::base::{ModelInfo, ProviderType};
-use crate::providers::huggingface::HuggingFaceProvider;
-use crate::providers::huggingface_auth;
-use crate::providers::inventory::declarative_inventory_identity;
 use crate::providers::ollama_def::OllamaProviderDef;
 use crate::providers::openai_def::OpenAiProviderDef;
 use anyhow::Result;
@@ -404,204 +401,46 @@ pub fn register_declarative_provider(
     match config.engine {
         ProviderEngine::OpenAI => {
             let captured = config.clone();
-            let identity_config = config.clone();
-            if HuggingFaceProvider::matches_declarative_config(&config) {
-                let inventory_configured_config = config.clone();
-                registry
-                    .register_with_name_and_inventory_configured::<HuggingFaceProvider, _, _, _>(
-                        &config,
-                        provider_type,
-                        config.dynamic_models.unwrap_or(false),
-                        move |tls_config| {
-                            let mut cfg = captured.clone();
-                            resolve_config(&mut cfg)?;
-                            HuggingFaceProvider::from_custom_config(cfg, tls_config)
-                        },
-                        move || {
-                            let mut cfg = identity_config.clone();
-                            resolve_config(&mut cfg)?;
-                            declarative_inventory_identity(&cfg)
-                        },
-                        move || {
-                            let mut cfg = inventory_configured_config.clone();
-                            if resolve_config(&mut cfg).is_err() {
-                                return false;
-                            }
-                            huggingface_declarative_inventory_configured(&cfg)
-                        },
-                    );
-            } else {
-                registry.register_with_name::<OpenAiProviderDef, _, _>(
-                    &config,
-                    provider_type,
-                    config.dynamic_models.unwrap_or(false),
-                    move |tls_config| {
-                        let mut cfg = captured.clone();
-                        resolve_config(&mut cfg)?;
-                        crate::providers::openai_def::from_custom_config(cfg, tls_config)
-                    },
-                    move || {
-                        let mut cfg = identity_config.clone();
-                        resolve_config(&mut cfg)?;
-                        declarative_inventory_identity(&cfg)
-                    },
-                );
-            }
+            registry.register_with_name::<OpenAiProviderDef, _>(
+                &config,
+                provider_type,
+                move |tls_config| {
+                    let mut cfg = captured.clone();
+                    resolve_config(&mut cfg)?;
+                    crate::providers::openai_def::from_custom_config(cfg, tls_config)
+                },
+            );
         }
         ProviderEngine::Ollama => {
             let captured = config.clone();
-            let identity_config = config.clone();
-            registry.register_with_name::<OllamaProviderDef, _, _>(
+            registry.register_with_name::<OllamaProviderDef, _>(
                 &config,
                 provider_type,
-                config.dynamic_models.unwrap_or(false),
                 move |tls_config| {
                     let mut cfg = captured.clone();
                     resolve_config(&mut cfg)?;
                     crate::providers::ollama_def::from_custom_config(cfg, tls_config)
                 },
-                move || {
-                    let mut cfg = identity_config.clone();
-                    resolve_config(&mut cfg)?;
-                    declarative_inventory_identity(&cfg)
-                },
             );
         }
         ProviderEngine::Anthropic => {
             let captured = config.clone();
-            let identity_config = config.clone();
-            registry.register_with_name::<AnthropicProviderDef, _, _>(
+            registry.register_with_name::<AnthropicProviderDef, _>(
                 &config,
                 provider_type,
-                config.dynamic_models.unwrap_or(false),
                 move |tls_config| {
                     let mut cfg = captured.clone();
                     resolve_config(&mut cfg)?;
                     crate::providers::anthropic_def::from_custom_config(cfg, tls_config)
                 },
-                move || {
-                    let mut cfg = identity_config.clone();
-                    resolve_config(&mut cfg)?;
-                    declarative_inventory_identity(&cfg)
-                },
             );
         }
     }
 }
 
-fn huggingface_declarative_inventory_configured(config: &DeclarativeProviderConfig) -> bool {
-    huggingface_declarative_inventory_configured_from_sources(
-        config,
-        |key| Config::global().get_secret::<String>(key).is_ok(),
-        || huggingface_auth::has_configured_token().unwrap_or(false),
-    )
-}
-
-fn huggingface_declarative_inventory_configured_from_sources(
-    config: &DeclarativeProviderConfig,
-    provider_secret_configured: impl FnOnce(&str) -> bool,
-    global_huggingface_configured: impl FnOnce() -> bool,
-) -> bool {
-    if !config.requires_auth {
-        return true;
-    }
-
-    if !config.api_key_env.is_empty() {
-        return provider_secret_configured(&config.api_key_env);
-    }
-
-    global_huggingface_configured()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_huggingface_config() -> DeclarativeProviderConfig {
-        DeclarativeProviderConfig {
-            name: "custom_hf".to_string(),
-            engine: ProviderEngine::OpenAI,
-            display_name: "Custom HF".to_string(),
-            description: None,
-            api_key_env: String::new(),
-            base_url: "https://router.huggingface.co/v1".to_string(),
-            models: vec![ModelInfo {
-                name: "test/model".to_string(),
-                resolved_model: None,
-                context_limit: 128_000,
-                input_token_cost: None,
-                output_token_cost: None,
-                currency: None,
-                supports_cache_control: None,
-                reasoning: false,
-            }],
-            headers: None,
-            timeout_seconds: None,
-            supports_streaming: Some(true),
-            requires_auth: true,
-            catalog_provider_id: Some("huggingface".to_string()),
-            base_path: None,
-            env_vars: None,
-            dynamic_models: Some(false),
-            skip_canonical_filtering: false,
-            model_doc_link: None,
-            setup_steps: Vec::new(),
-            fast_model: None,
-            preserves_thinking: true,
-        }
-    }
-
-    #[test]
-    fn huggingface_inventory_allows_unauthenticated_custom_provider() {
-        let mut config = test_huggingface_config();
-        config.requires_auth = false;
-
-        assert!(huggingface_declarative_inventory_configured_from_sources(
-            &config,
-            |_| false,
-            || false,
-        ));
-    }
-
-    #[test]
-    fn huggingface_inventory_accepts_provider_specific_key() {
-        let mut config = test_huggingface_config();
-        config.api_key_env = "CUSTOM_HF_TOKEN".to_string();
-
-        assert!(huggingface_declarative_inventory_configured_from_sources(
-            &config,
-            |key| key == "CUSTOM_HF_TOKEN",
-            || false,
-        ));
-    }
-
-    #[test]
-    fn huggingface_inventory_does_not_fallback_when_explicit_key_is_missing() {
-        let mut config = test_huggingface_config();
-        config.api_key_env = "CUSTOM_HF_TOKEN".to_string();
-
-        assert!(!huggingface_declarative_inventory_configured_from_sources(
-            &config,
-            |_| false,
-            || true,
-        ));
-    }
-
-    #[test]
-    fn huggingface_inventory_uses_global_token_without_provider_key() {
-        let config = test_huggingface_config();
-
-        assert!(huggingface_declarative_inventory_configured_from_sources(
-            &config,
-            |_| false,
-            || true,
-        ));
-        assert!(!huggingface_declarative_inventory_configured_from_sources(
-            &config,
-            |_| true,
-            || false,
-        ));
-    }
 
     #[test]
     fn test_bundled_providers_wire_into_registry_metadata() {

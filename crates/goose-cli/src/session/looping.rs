@@ -113,7 +113,7 @@ enum WaitInputEvent {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum WaitInputClass {
+pub(crate) enum WaitInputClass {
     BareEsc,
     EscapeSequence { len: usize, complete: bool },
     Ordinary,
@@ -267,7 +267,7 @@ fn format_interval(duration: Duration) -> String {
     }
 }
 
-fn classify_wait_input(bytes: &[u8]) -> WaitInputClass {
+pub(crate) fn classify_wait_input(bytes: &[u8]) -> WaitInputClass {
     if bytes.first() != Some(&0x1b) {
         return WaitInputClass::Ordinary;
     }
@@ -282,10 +282,17 @@ fn classify_wait_input(bytes: &[u8]) -> WaitInputClass {
         };
     }
 
-    WaitInputClass::BareEsc
+    // ESC followed by any non-CSI byte is an Alt/Meta chord (Alt+key,
+    // Alt+Backspace, Shift+Enter delivered as ESC+CR) or an ESC embedded in a
+    // paste — swallow the ESC and that byte rather than treating the ESC as an
+    // interrupt. A truly lone ESC only reaches here as a 1-byte buffer above.
+    WaitInputClass::EscapeSequence {
+        len: 2,
+        complete: true,
+    }
 }
 
-fn escape_sequence_tail_len(bytes: &[u8]) -> (usize, bool) {
+pub(crate) fn escape_sequence_tail_len(bytes: &[u8]) -> (usize, bool) {
     for (index, &byte) in bytes.iter().enumerate() {
         if (0x30..=0x3f).contains(&byte) || (0x20..=0x2f).contains(&byte) {
             continue;
@@ -615,7 +622,7 @@ impl CliSession {
             .unwrap_or_default()
     }
 
-    fn last_assistant_text(&self) -> Option<String> {
+    pub(super) fn last_assistant_text(&self) -> Option<String> {
         self.messages
             .iter()
             .rev()
@@ -669,6 +676,9 @@ impl CliSession {
             plan_exemplar_run_ids: None,
             review_exemplars_injected: None,
             review_exemplar_run_ids: None,
+            playbook_injected: None,
+            arena_rank: None,
+            arena_winner: None,
         });
     }
 
@@ -906,6 +916,21 @@ mod tests {
             }
         );
         assert_eq!(classify_wait_input(b"x"), WaitInputClass::Ordinary);
+        // ESC + a non-CSI byte is an Alt/Meta chord, swallowed (not an interrupt).
+        assert_eq!(
+            classify_wait_input(&[0x1b, b'x']),
+            WaitInputClass::EscapeSequence {
+                len: 2,
+                complete: true
+            }
+        );
+        assert_eq!(
+            classify_wait_input(&[0x1b, 0x7f]),
+            WaitInputClass::EscapeSequence {
+                len: 2,
+                complete: true
+            }
+        );
     }
 
     #[test]

@@ -13,7 +13,6 @@ use uuid::Uuid;
 use super::container::Container;
 use super::final_output_tool::FinalOutputTool;
 use super::mcp_client::GooseMcpHostInfo;
-use super::platform_tools;
 use super::tool_confirmation_router::ToolConfirmationRouter;
 use super::tool_execution::{ToolCallResult, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 use crate::action_required_manager::ElicitationOutcome;
@@ -23,7 +22,6 @@ use crate::agents::extension_manager::{
 };
 use crate::agents::final_output_tool::{FINAL_OUTPUT_CONTINUATION_MESSAGE, FINAL_OUTPUT_TOOL_NAME};
 use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
-use crate::agents::platform_tools::PLATFORM_MANAGE_SCHEDULE_TOOL_NAME;
 use crate::agents::prompt_manager::PromptManager;
 use crate::agents::retry::{RetryManager, RetryResult};
 use crate::agents::types::{FrontendTool, SessionConfig, SharedProvider, ToolResultReceiver};
@@ -44,10 +42,6 @@ use crate::permission::permission_judge::PermissionCheckResult;
 use crate::permission::PermissionConfirmation;
 use crate::providers::base::{PermissionRouting, Provider};
 use crate::recipe::{Author, Recipe, Response, Settings};
-use crate::scheduler_trait::SchedulerTrait;
-use crate::security::adversary_inspector::AdversaryInspector;
-use crate::security::egress_inspector::EgressInspector;
-use crate::security::security_inspector::SecurityInspector;
 use crate::session::extension_data::{EnabledExtensionsState, ExtensionState};
 use crate::session::{Session, SessionManager, SessionNameUpdate};
 use crate::tool_inspection::ToolInspectionManager;
@@ -175,7 +169,6 @@ impl fmt::Display for GoosePlatform {
 pub struct AgentConfig {
     pub session_manager: Arc<SessionManager>,
     pub permission_manager: Arc<PermissionManager>,
-    pub scheduler_service: Option<Arc<dyn SchedulerTrait>>,
     pub goose_mode: GooseMode,
     pub disable_session_naming: bool,
     pub goose_platform: GoosePlatform,
@@ -188,7 +181,6 @@ impl AgentConfig {
     pub fn new(
         session_manager: Arc<SessionManager>,
         permission_manager: Arc<PermissionManager>,
-        scheduler_service: Option<Arc<dyn SchedulerTrait>>,
         goose_mode: GooseMode,
         disable_session_naming: bool,
         goose_platform: GoosePlatform,
@@ -196,7 +188,6 @@ impl AgentConfig {
         Self {
             session_manager,
             permission_manager,
-            scheduler_service,
             goose_mode,
             disable_session_naming,
             goose_platform,
@@ -321,7 +312,6 @@ impl Agent {
         Self::with_config(AgentConfig::new(
             Arc::new(SessionManager::instance()),
             PermissionManager::instance(),
-            None,
             config.get_goose_mode().unwrap_or_default(),
             config.get_goose_disable_session_naming().unwrap_or(false),
             GoosePlatform::GooseCli,
@@ -624,16 +614,6 @@ impl Agent {
         session_manager: Arc<SessionManager>,
     ) -> ToolInspectionManager {
         let mut tool_inspection_manager = ToolInspectionManager::new();
-
-        // Add security inspector (highest priority - runs first)
-        tool_inspection_manager.add_inspector(Box::new(SecurityInspector::new()));
-        tool_inspection_manager.add_inspector(Box::new(EgressInspector::new()));
-
-        // Add adversary inspector (LLM-based review, enabled by ~/.config/goose/adversary.md)
-        tool_inspection_manager.add_inspector(Box::new(AdversaryInspector::new(
-            provider.clone(),
-            session_manager.clone(),
-        )));
 
         // Add permission inspector (medium-high priority)
         tool_inspection_manager.add_inspector(Box::new(PermissionInspector::new(
@@ -1091,26 +1071,6 @@ impl Agent {
         )
         .await;
 
-        if tool_call.name == PLATFORM_MANAGE_SCHEDULE_TOOL_NAME {
-            let arguments = tool_call
-                .arguments
-                .clone()
-                .map(Value::Object)
-                .unwrap_or(Value::Object(serde_json::Map::new()));
-            let result = self
-                .handle_schedule_management(arguments, request_id.clone())
-                .await;
-            let wrapped_result = result.map(CallToolResult::success);
-            return (
-                request_id,
-                Ok(self.with_post_tool_hook(
-                    ToolCallResult::from(wrapped_result),
-                    &tool_call,
-                    session,
-                )),
-            );
-        }
-
         if tool_call.name == FINAL_OUTPUT_TOOL_NAME {
             return if let Some(final_output_tool) = self.final_output_tool.lock().await.as_mut() {
                 let result = final_output_tool.execute_tool_call(tool_call.clone()).await;
@@ -1153,11 +1113,6 @@ impl Agent {
                 )
                 .await;
             result.unwrap_or_else(|e| {
-                #[cfg(feature = "telemetry")]
-                crate::posthog::emit_error(
-                    "tool_execution_failed",
-                    &format!("{}: {}", tool_call.name, e),
-                );
                 let error_data = e.downcast::<ErrorData>().unwrap_or_else(|e| {
                     ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
                 });
@@ -1433,12 +1388,6 @@ impl Agent {
             self.frontend_tools_for_extension(extension_name.as_deref())
                 .await,
         );
-
-        if (extension_name.is_none() || extension_name.as_deref() == Some("platform"))
-            && self.config.scheduler_service.is_some()
-        {
-            prefixed_tools.push(platform_tools::manage_schedule_tool());
-        }
 
         if extension_name.is_none() {
             if let Some(final_output_tool) = self.final_output_tool.lock().await.as_ref() {
@@ -2382,10 +2331,7 @@ impl Agent {
                             }
                         }
                         #[allow(unused_variables)]
-                        Err(ref provider_err @ ProviderError::ContextLengthExceeded(_)) => {
-                            #[cfg(feature = "telemetry")]
-                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
-                            compaction_attempts += 1;
+                        Err(ref provider_err @ ProviderError::ContextLengthExceeded(_)) => {                            compaction_attempts += 1;
 
                             if compaction_attempts >= 2 {
                                 error!("Context limit exceeded after compaction - prompt too large");
@@ -2429,8 +2375,6 @@ impl Agent {
                                     break;
                                 }
                                 Err(e) => {
-                                    #[cfg(feature = "telemetry")]
-                                    crate::posthog::emit_error("compaction_failed", &e.to_string());
                                     error!("Compaction failed: {}", e);
                                     yield AgentEvent::Message(
                                         Message::assistant().with_text(
@@ -2441,10 +2385,7 @@ impl Agent {
                                 }
                             }
                         }
-                        Err(ref provider_err @ ProviderError::CreditsExhausted { details: _, ref top_up_url }) => {
-                            #[cfg(feature = "telemetry")]
-                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
-                            error!("Error: {}", provider_err);
+                        Err(ref provider_err @ ProviderError::CreditsExhausted { details: _, ref top_up_url }) => {                            error!("Error: {}", provider_err);
 
                             let user_msg = if top_up_url.is_some() {
                                 "Please add credits to your account, then resend your message to continue.".to_string()
@@ -2465,10 +2406,7 @@ impl Agent {
                             );
                             break;
                         }
-                        Err(ref provider_err @ ProviderError::Refusal { ref details, ref category }) => {
-                            #[cfg(feature = "telemetry")]
-                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
-                            error!("Error: {}", provider_err);
+                        Err(ref provider_err @ ProviderError::Refusal { ref details, ref category }) => {                            error!("Error: {}", provider_err);
 
                             let category = category.as_deref().map(|c| format!("\n\nCategory: {c}")).unwrap_or_default();
                             yield AgentEvent::Message(Message::assistant().with_text(format!(
@@ -2480,10 +2418,7 @@ impl Agent {
                             exit_chat = true;
                             break;
                         }
-                        Err(ref provider_err @ ProviderError::NetworkError(_)) => {
-                            #[cfg(feature = "telemetry")]
-                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
-                            error!("Error: {}", provider_err);
+                        Err(ref provider_err @ ProviderError::NetworkError(_)) => {                            error!("Error: {}", provider_err);
                             yield AgentEvent::Message(
                                 Message::assistant().with_text(
                                     format!("{provider_err}\n\nPlease resend your message to try again.")
@@ -2491,10 +2426,7 @@ impl Agent {
                             );
                             break;
                         }
-                        Err(ref provider_err) => {
-                            #[cfg(feature = "telemetry")]
-                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
-                            error!("Error: {}", provider_err);
+                        Err(ref provider_err) => {                            error!("Error: {}", provider_err);
                             yield AgentEvent::Message(
                                 Message::assistant().with_text(
                                     format!("Ran into this error: {provider_err}.\n\nPlease retry if you think this is a transient or recoverable error.")
@@ -3693,7 +3625,6 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         let config = AgentConfig::new(
             session_manager.clone(),
             permission_manager,
-            None,
             GooseMode::Auto,
             true,
             GoosePlatform::GooseCli,
@@ -3926,14 +3857,6 @@ echo start >> "$PLUGIN_ROOT/hook.log"
         assert!(
             inspector_names.contains(&"permission"),
             "Tool inspection manager should contain permission inspector"
-        );
-        assert!(
-            inspector_names.contains(&"security"),
-            "Tool inspection manager should contain security inspector"
-        );
-        assert!(
-            inspector_names.contains(&"adversary"),
-            "Tool inspection manager should contain adversary inspector"
         );
 
         Ok(())

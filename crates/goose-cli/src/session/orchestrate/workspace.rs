@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use super::phases::EVIDENCE_CHAR_LIMIT;
 
-pub(super) struct Evidence {
-    pub(super) text: String,
+pub(crate) struct Evidence {
+    pub(crate) text: String,
     pub(super) full: String,
     pub(super) truncated: bool,
 }
@@ -47,6 +47,12 @@ impl OrchWorkspace {
     pub(super) fn is_worktree(&self) -> bool {
         self.branch.is_some()
     }
+
+    /// Whether ignored `.env*` files were symlinked into the worktree. Reflects
+    /// the actual result, which the `GOOSE_ORCH_LINK_ENV` knob gates.
+    pub(super) fn env_linked(&self) -> bool {
+        !self.env_links.is_empty()
+    }
 }
 
 pub(super) fn setup_orch_workspace(original_dir: &Path, run_id: &str) -> OrchWorkspace {
@@ -75,7 +81,15 @@ fn setup_orch_workspace_with_force(
 
     let name = format!("orch-{run_id}");
     let branch = format!("orch/{run_id}");
-    match worktree::create_named_worktree(original_dir, &name, Some(&branch)) {
+    let link_env = Config::global()
+        .get_param::<bool>("GOOSE_ORCH_LINK_ENV")
+        .unwrap_or(true);
+    match worktree::create_named_worktree_with_env_linking(
+        original_dir,
+        &name,
+        Some(&branch),
+        link_env,
+    ) {
         Ok(created) => OrchWorkspace::worktree(original_dir.to_path_buf(), repo_root, created),
         Err(error) => OrchWorkspace::in_place(
             original_dir.to_path_buf(),
@@ -138,7 +152,9 @@ pub(super) fn render_workspace_banner(workspace: &OrchWorkspace, auto_merge: boo
     }
 }
 
-pub(super) fn git_evidence(dir: &Path) -> Evidence {
+const UNTRACKED_FILE_CHAR_LIMIT: usize = 4_000;
+
+pub(crate) fn git_evidence(dir: &Path) -> Evidence {
     let mut evidence = String::new();
     for args in [
         &["status", "--short"][..],
@@ -158,7 +174,8 @@ pub(super) fn git_evidence(dir: &Path) -> Evidence {
             }
         }
     }
-    if evidence.is_empty() {
+    evidence.push_str(&untracked_file_contents(dir));
+    if evidence.trim().is_empty() {
         let text =
             "No git changes detected (not a git repository, or working tree clean).".to_string();
         return Evidence {
@@ -174,6 +191,57 @@ pub(super) fn git_evidence(dir: &Path) -> Evidence {
         full: evidence,
         truncated,
     }
+}
+
+/// Contents of untracked (new) files, so the reviewer sees files that never
+/// appear in `git diff HEAD`. Each file is capped, with a header noting the full
+/// length when truncated. Mirrors the arena's evidence assembly.
+fn untracked_file_contents(dir: &Path) -> String {
+    let Ok(out) = std::process::Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(dir)
+        .output()
+    else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+
+    let mut rendered = String::new();
+    for file in String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+    {
+        let Ok(content) = std::fs::read_to_string(dir.join(file)) else {
+            continue;
+        };
+        let full_chars = content.chars().count();
+        let capped = safe_truncate(&content, UNTRACKED_FILE_CHAR_LIMIT);
+        let header = if full_chars > UNTRACKED_FILE_CHAR_LIMIT {
+            format!("+++ new file: {file} (truncated, {full_chars} chars total)")
+        } else {
+            format!("+++ new file: {file}")
+        };
+        rendered.push_str(&format!("\n{header}\n{capped}\n"));
+    }
+    rendered
+}
+
+/// A concise `git diff --stat` for the review request, or empty when it yields
+/// nothing (clean tree or non-git directory).
+pub(crate) fn git_diff_stat(dir: &Path) -> String {
+    let Ok(out) = std::process::Command::new("git")
+        .args(["diff", "--stat", "HEAD"])
+        .current_dir(dir)
+        .output()
+    else {
+        return String::new();
+    };
+    if !out.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn changed_paths_for_commit(dir: &Path) -> Vec<String> {
@@ -420,12 +488,8 @@ fn path_scope(path: &str) -> Option<String> {
         Some("cli".to_string())
     } else if path.starts_with("crates/goose-mcp/") {
         Some("mcp".to_string())
-    } else if path.starts_with("crates/goose-server/") {
-        Some("server".to_string())
     } else if path.starts_with("crates/goose/") {
         Some("goose".to_string())
-    } else if path.starts_with("ui/desktop/") {
-        Some("ui".to_string())
     } else {
         path.split('/').next().map(ToString::to_string)
     }
@@ -571,6 +635,9 @@ mod tests {
 
     #[test]
     fn setup_orch_workspace_creates_named_worktree_branch_and_env_link() {
+        // Serialize against tests that toggle GOOSE_ORCH_LINK_ENV; default (unset)
+        // links env files.
+        let _guard = env_lock::lock_env([("GOOSE_ORCH_LINK_ENV", None::<&str>)]);
         let repo = init_repo();
         let repo_root = crate::worktree::find_repo_root(repo.path()).expect("repo root");
 
@@ -587,6 +654,21 @@ mod tests {
             crate::worktree::current_branch(&workspace.impl_dir).expect("branch"),
             "orch/abc123"
         );
+    }
+
+    #[test]
+    fn setup_orch_workspace_skips_env_link_when_knob_disabled() {
+        let _guard = env_lock::lock_env([("GOOSE_ORCH_LINK_ENV", Some("false"))]);
+        let repo = init_repo();
+
+        let workspace = super::setup_orch_workspace(repo.path(), "no-env-link");
+
+        assert!(workspace.is_worktree());
+        assert!(
+            !workspace.env_linked(),
+            "GOOSE_ORCH_LINK_ENV=false must keep .env out of the worktree"
+        );
+        assert!(!workspace.impl_dir.join(".env").exists());
     }
 
     #[test]
@@ -648,9 +730,9 @@ mod tests {
         assert_eq!(
             subject(
                 "\n\nAdd a very long orchestration lifecycle summary that should be truncated before it turns into an unwieldy commit subject.",
-                &["ui/desktop/src/main.ts"]
+                &["docs/reference.md"]
             ),
-            "feat(ui): add a very long orchestration lifecycle summary that should be..."
+            "feat(docs): add a very long orchestration lifecycle summary that should be..."
         );
     }
 
@@ -775,6 +857,27 @@ Do not classify this as docs just because the body mentions docs/loops.md.
         assert!(log
             .lines()
             .any(|line| line == "feat(pending.txt): add mixed approval changes"));
+    }
+
+    #[test]
+    fn git_evidence_includes_untracked_file_contents() {
+        let repo = init_repo();
+        fs::write(repo.path().join("brand_new.rs"), "fn added() {}\n").expect("write new file");
+
+        let evidence = super::git_evidence(repo.path());
+
+        assert!(evidence.text.contains("+++ new file: brand_new.rs"));
+        assert!(evidence.text.contains("fn added() {}"));
+    }
+
+    #[test]
+    fn git_diff_stat_reports_tracked_changes() {
+        let repo = init_repo();
+        fs::write(repo.path().join("README.md"), "hello\nworld\n").expect("modify tracked");
+
+        let stat = super::git_diff_stat(repo.path());
+
+        assert!(stat.contains("README.md"), "{stat}");
     }
 
     #[test]

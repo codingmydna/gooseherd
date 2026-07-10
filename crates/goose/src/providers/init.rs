@@ -1,52 +1,25 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-#[cfg(feature = "aws-providers")]
-use super::bedrock::BedrockProvider;
-#[cfg(feature = "local-inference")]
-use super::local_inference::LocalInferenceProvider;
-#[cfg(feature = "aws-providers")]
-use super::sagemaker_tgi::SageMakerTgiProvider;
 use super::{
     amp_acp::AmpAcpProvider,
-    avian::AvianProvider,
-    azure::AzureProvider,
     base::{Provider, ProviderMetadata},
-    chatgpt_codex::ChatGptCodexProvider,
     claude_acp::ClaudeAcpProvider,
-    claude_code::ClaudeCodeProvider,
-    codex::CodexProvider,
     codex_acp::CodexAcpProvider,
     copilot_acp::CopilotAcpProvider,
-    cursor_agent::CursorAgentProvider,
-    gcpvertexai::GcpVertexAIProvider,
-    gemini_cli::GeminiCliProvider,
-    gemini_oauth::GeminiOAuthProvider,
     generic_acp,
-    githubcopilot::GithubCopilotProvider,
-    google::GoogleProvider,
-    huggingface::HuggingFaceProvider,
-    kimicode::KimiCodeProvider,
-    litellm::LiteLLMProvider,
-    nanogpt::NanoGptProvider,
     openrouter::OpenRouterProvider,
     pi_acp::PiAcpProvider,
     provider_registry::ProviderRegistry,
-    snowflake::SnowflakeProvider,
-    tetrate::TetrateProvider,
-    xai::XaiProvider,
-    xai_oauth::XaiOAuthProvider,
 };
 use crate::config::ExtensionConfig;
 use crate::providers::anthropic_def::AnthropicProviderDef;
 use crate::providers::base::ProviderType;
-use crate::providers::databricks_def::{self, DatabricksProviderDef};
-use crate::providers::databricks_v2_def::{self, DatabricksV2ProviderDef};
 use crate::providers::ollama_def::OllamaProviderDef;
 use crate::providers::openai_def::OpenAiProviderDef;
 use crate::{
     config::declarative_providers::register_declarative_providers,
-    providers::provider_registry::ProviderEntry,
+    providers::provider_registry::{removed_provider_error, ProviderEntry},
 };
 use anyhow::Result;
 use tokio::sync::OnceCell;
@@ -58,120 +31,16 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
         crate::config::tls::provider_tls_config_from_config(crate::config::Config::global())
             .expect("failed to load provider TLS config");
     let mut registry = ProviderRegistry::new(tls_config).with_providers(|registry| {
-        use super::inventory::registrations;
-
-        registry.register_with_inventory::<AmpAcpProvider>(
-            false,
-            Some(registrations::amp_acp_inventory()),
-        );
-        registry.register_with_inventory::<AnthropicProviderDef>(
-            true,
-            Some(registrations::anthropic_inventory()),
-        );
-        registry.register::<AvianProvider>(false);
-        registry.register::<AzureProvider>(false);
-        #[cfg(feature = "aws-providers")]
-        registry.register::<BedrockProvider>(false);
-        #[cfg(feature = "local-inference")]
-        registry.register::<LocalInferenceProvider>(false);
-        registry.register_with_inventory::<ChatGptCodexProvider>(
-            true,
-            Some(registrations::chatgpt_codex_inventory()),
-        );
-        registry.register_with_inventory::<ClaudeAcpProvider>(
-            false,
-            Some(registrations::claude_acp_inventory()),
-        );
-        registry.register::<ClaudeCodeProvider>(true);
-        registry.register_with_inventory::<CodexAcpProvider>(
-            false,
-            Some(registrations::codex_acp_inventory()),
-        );
-        registry.register_with_inventory::<CopilotAcpProvider>(
-            false,
-            Some(registrations::copilot_acp_inventory()),
-        );
-        registry.register::<CodexProvider>(true);
-        registry.register::<CursorAgentProvider>(false);
-        registry.register_with_inventory::<DatabricksProviderDef>(
-            true,
-            Some(registrations::refresh_only()),
-        );
-        registry.register_with_inventory::<DatabricksV2ProviderDef>(
-            false,
-            Some(registrations::refresh_only()),
-        );
-        registry.register::<GcpVertexAIProvider>(false);
-        registry.register::<GeminiCliProvider>(false);
-        registry.register::<GeminiOAuthProvider>(true);
-        registry.register::<GithubCopilotProvider>(false);
-        registry.register_with_inventory::<GoogleProvider>(
-            true,
-            Some(registrations::google_inventory()),
-        );
-        registry.register_with_inventory::<HuggingFaceProvider>(
-            true,
-            Some(registrations::huggingface_inventory()),
-        );
-        registry.register::<KimiCodeProvider>(true);
-        registry.register::<LiteLLMProvider>(false);
-        registry.register::<NanoGptProvider>(true);
-        registry.register_with_inventory::<OllamaProviderDef>(
-            true,
-            Some(registrations::ollama_inventory()),
-        );
-        registry.register_with_inventory::<OpenAiProviderDef>(
-            true,
-            Some(registrations::openai_inventory()),
-        );
+        registry.register::<AmpAcpProvider>(false);
+        registry.register::<AnthropicProviderDef>(true);
+        registry.register::<ClaudeAcpProvider>(false);
+        registry.register::<CodexAcpProvider>(false);
+        registry.register::<CopilotAcpProvider>(false);
+        registry.register::<OllamaProviderDef>(true);
+        registry.register::<OpenAiProviderDef>(true);
         registry.register::<OpenRouterProvider>(true);
-        registry.register_with_inventory::<PiAcpProvider>(
-            false,
-            Some(registrations::pi_acp_inventory()),
-        );
-        #[cfg(feature = "aws-providers")]
-        registry.register::<SageMakerTgiProvider>(false);
-        registry.register::<SnowflakeProvider>(false);
-        registry.register::<TetrateProvider>(true);
-        registry.register::<XaiProvider>(false);
-        registry.register_with_inventory::<XaiOAuthProvider>(
-            true,
-            Some(registrations::xai_oauth_inventory()),
-        );
+        registry.register::<PiAcpProvider>(false);
     });
-    // Register cleanup functions for providers with cached state
-    registry.set_cleanup(
-        "github_copilot",
-        Arc::new(|| Box::pin(GithubCopilotProvider::cleanup())),
-    );
-    registry.set_cleanup(
-        "databricks",
-        Arc::new(|| Box::pin(databricks_def::cleanup())),
-    );
-    registry.set_cleanup(
-        "databricks_v2",
-        Arc::new(|| Box::pin(databricks_v2_def::cleanup())),
-    );
-    registry.set_cleanup(
-        "kimi_code",
-        Arc::new(|| Box::pin(KimiCodeProvider::cleanup())),
-    );
-    registry.set_cleanup(
-        "chatgpt_codex",
-        Arc::new(|| Box::pin(ChatGptCodexProvider::cleanup())),
-    );
-    registry.set_cleanup(
-        "gemini_oauth",
-        Arc::new(|| Box::pin(GeminiOAuthProvider::cleanup())),
-    );
-    registry.set_cleanup(
-        "xai_oauth",
-        Arc::new(|| Box::pin(XaiOAuthProvider::cleanup())),
-    );
-    registry.set_cleanup(
-        "huggingface",
-        Arc::new(|| Box::pin(HuggingFaceProvider::cleanup())),
-    );
 
     if let Err(e) = load_custom_providers_into_registry(&mut registry) {
         tracing::warn!("Failed to load custom providers: {}", e);
@@ -213,15 +82,10 @@ pub async fn refresh_custom_providers() -> Result<()> {
 
 pub async fn get_from_registry(name: &str) -> Result<ProviderEntry> {
     let guard = get_registry().await.read().unwrap();
-    guard
-        .entries
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("Unknown provider: {}", name))
-        .cloned()
-}
-
-pub async fn inventory_identity(name: &str) -> Result<super::inventory::InventoryIdentityInput> {
-    get_from_registry(name).await?.inventory_identity()
+    guard.entries.get(name).cloned().ok_or_else(|| {
+        removed_provider_error(name)
+            .unwrap_or_else(|| anyhow::anyhow!("Unknown provider: {}", name))
+    })
 }
 
 pub async fn create(name: &str, extensions: Vec<ExtensionConfig>) -> Result<Arc<dyn Provider>> {
@@ -262,34 +126,11 @@ pub async fn cleanup_provider(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn create_with_named_model(
-    provider_name: &str,
-    extensions: Vec<ExtensionConfig>,
-) -> Result<Arc<dyn Provider>> {
-    create(provider_name, extensions).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::paths::Paths;
     use std::fs;
-
-    #[tokio::test]
-    async fn test_huggingface_provider_registry_wiring() {
-        let huggingface = get_from_registry("huggingface")
-            .await
-            .expect("huggingface provider should be registered");
-        let meta = huggingface.metadata();
-
-        assert_eq!(huggingface.provider_type(), ProviderType::Preferred);
-        assert_eq!(meta.display_name, "Hugging Face");
-        assert_eq!(meta.default_model, "Qwen/Qwen3-Coder-480B-A35B-Instruct");
-        assert!(meta
-            .config_keys
-            .iter()
-            .any(|key| key.name == "HF_TOKEN" && key.secret));
-    }
 
     #[tokio::test]
     async fn test_openai_compatible_providers_config_keys() {
@@ -342,6 +183,37 @@ mod tests {
                 "OPENAI_API_KEY should be secret"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_core_providers_are_registered() {
+        let names: Vec<String> = providers().await.into_iter().map(|(m, _)| m.name).collect();
+        for expected in [
+            "anthropic",
+            "openai",
+            "ollama",
+            "openrouter",
+            "claude-acp",
+            "codex-acp",
+            "copilot-acp",
+            "amp-acp",
+            "pi-acp",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "core provider `{expected}` should be registered; got {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_removed_provider_returns_actionable_error() {
+        let err = get_from_registry("claude-code")
+            .await
+            .err()
+            .expect("claude-code was removed");
+        let msg = err.to_string();
+        assert!(msg.contains("claude-acp"), "got: {msg}");
     }
 
     #[tokio::test]

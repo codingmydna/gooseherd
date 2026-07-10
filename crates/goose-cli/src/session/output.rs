@@ -87,6 +87,8 @@ thread_local! {
     );
     static RESPONSE_BULLET_SHOWN: RefCell<bool> = const { RefCell::new(false) };
     static THINKING_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LIVE_INPUT_HINT: std::cell::Cell<LiveHintState> =
+        const { std::cell::Cell::new(LiveHintState::Idle) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +286,37 @@ pub fn set_thinking_context(context: Option<String>) {
 
 fn get_thinking_context() -> Option<String> {
     THINKING_CONTEXT.with(|c| c.borrow().clone())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveHintState {
+    Idle,
+    Showing,
+    Done,
+}
+
+/// Arm the one-time steering hint shown on the spinner while live input is
+/// active. Only takes effect the first time a turn runs with live input on;
+/// subsequent turns fall back to the plain interrupt hint.
+pub fn arm_live_input_hint() {
+    LIVE_INPUT_HINT.with(|state| {
+        if state.get() == LiveHintState::Idle {
+            state.set(LiveHintState::Showing);
+        }
+    });
+}
+
+/// Retire the one-time steering hint once its turn has finished.
+pub fn finish_live_input_hint() {
+    LIVE_INPUT_HINT.with(|state| {
+        if state.get() == LiveHintState::Showing {
+            state.set(LiveHintState::Done);
+        }
+    });
+}
+
+fn live_input_hint_active() -> bool {
+    LIVE_INPUT_HINT.with(|state| state.get() == LiveHintState::Showing)
 }
 
 pub struct ThinkingStatusLabelInput<'a> {
@@ -562,7 +595,11 @@ impl ThinkingIndicator {
             .map(|started| started.elapsed())
             .unwrap_or_default();
         let running_tools = running_tool_summaries();
-        let hint = "(Ctrl+C to interrupt)";
+        let hint = if live_input_hint_active() {
+            "type to steer · Esc interrupt · /status"
+        } else {
+            "(Ctrl+C to interrupt)"
+        };
         let terminal_width = thinking_status_width();
         let hint_width = measure_text_width("  ") + measure_text_width(hint);
         let status_width =
@@ -730,6 +767,26 @@ pub fn run_status_hook(status: &str) {
 
             let _ = result;
         });
+    }
+}
+
+/// Minimum turn duration before a completion bell is worth ringing — short
+/// turns are answered before the user's attention has wandered.
+const BELL_MIN_DURATION: Duration = Duration::from_secs(10);
+
+pub fn should_ring_bell(is_tty: bool, elapsed: Duration, enabled: bool) -> bool {
+    is_tty && enabled && elapsed >= BELL_MIN_DURATION
+}
+
+/// Ring the terminal bell (BEL to stderr) when a slow turn finishes, so the
+/// user gets pulled back. Gated on a TTY and the `GOOSE_BELL` knob.
+pub fn ring_bell_if(elapsed: Duration) {
+    let enabled = Config::global()
+        .get_param::<bool>("GOOSE_BELL")
+        .unwrap_or(true);
+    if should_ring_bell(std::io::stdout().is_terminal(), elapsed, enabled) {
+        eprint!("\x07");
+        let _ = std::io::stderr().flush();
     }
 }
 
@@ -948,30 +1005,7 @@ pub fn render_text_no_newlines(text: &str, color: Option<Color>, dim: bool) {
     print!("{}", styled_text);
 }
 
-pub fn render_enter_plan_mode() {
-    println!(
-        "\n{} {}\n",
-        style("Entering plan mode.").green().bold(),
-        style("You can provide instructions to create a plan and then act on it. To exit early, type /endplan")
-            .green()
-            .dim()
-    );
-}
-
 static LAST_TODO_RENDERED: Mutex<Option<String>> = Mutex::new(None);
-
-pub fn render_act_on_plan() {
-    println!(
-        "\n{}\n",
-        style("Exiting plan mode and acting on the above plan")
-            .green()
-            .bold(),
-    );
-}
-
-pub fn render_exit_plan_mode() {
-    println!("\n{}\n", style("Exiting plan mode.").green().bold());
-}
 
 pub fn goose_mode_message(text: &str) {
     println!("\n{}", style(text).yellow(),);
@@ -1078,7 +1112,6 @@ fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
             match call.name.to_string().as_str() {
                 name if is_shell_tool_name(name) => render_shell_request(call, debug),
                 name if is_file_tool_name(name) => render_text_editor_request(call, debug),
-                "execute_typescript" | "execute_code" => render_execute_code_request(call, debug),
                 "delegate" => render_delegate_request(call, debug),
                 "subagent" => render_delegate_request(call, debug),
                 "todo__write" | "todo__todo_write" => render_todo_request(call, debug),
@@ -1300,7 +1333,7 @@ fn print_tool_output(text: &str) {
         println!(
             "    {}",
             style(format!(
-                "... ({} lines hidden, /toggle to show all)",
+                "... ({} lines hidden, /r to show all)",
                 lines.len() - head - tail
             ))
             .dim()
@@ -1499,73 +1532,6 @@ fn render_shell_request(call: &CallToolRequestParams, debug: bool) {
     println!();
 }
 
-fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
-    let tool_graph = call
-        .arguments
-        .as_ref()
-        .and_then(|args| args.get("tool_graph"))
-        .and_then(Value::as_array)
-        .filter(|arr| !arr.is_empty());
-
-    let Some(tool_graph) = tool_graph else {
-        return render_default_request(call, debug);
-    };
-
-    let count = tool_graph.len();
-    let plural = if count == 1 { "" } else { "s" };
-    println!();
-    println!(
-        "  {} {} {} tool call{}",
-        style("▸").dim(),
-        style("execute").dim(),
-        style(count).dim(),
-        plural,
-    );
-
-    for (i, node) in tool_graph.iter().filter_map(Value::as_object).enumerate() {
-        let tool = node
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let desc = node
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let deps: Vec<_> = node
-            .get("depends_on")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_u64)
-            .map(|d| (d + 1).to_string())
-            .collect();
-        let deps_str = if deps.is_empty() {
-            String::new()
-        } else {
-            format!(" (uses {})", deps.join(", "))
-        };
-        println!(
-            "    {}. {} {}{}",
-            style(i + 1).dim(),
-            style(tool).dim(),
-            style(desc).dim(),
-            style(deps_str).dim()
-        );
-    }
-
-    let code = call
-        .arguments
-        .as_ref()
-        .and_then(|args| args.get("code"))
-        .and_then(Value::as_str)
-        .filter(|c| !c.is_empty());
-    if code.is_some_and(|_| debug) {
-        println!("{}", style(code.unwrap_or_default()).green());
-    }
-
-    println!();
-}
-
 fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
     print_tool_header(call);
 
@@ -1741,14 +1707,7 @@ fn split_tool_name(tool_name: &str) -> (String, String) {
         .split_first()
         .map(|(_, s)| s.iter().rev().copied().collect::<Vec<_>>().join("__"))
         .unwrap_or_default();
-    (tool.to_string(), extension_display_name(&extension))
-}
-
-fn extension_display_name(name: &str) -> String {
-    match name {
-        "code_execution" => "Code Mode".to_string(),
-        _ => name.to_string(),
-    }
+    (tool.to_string(), extension)
 }
 
 pub fn format_subagent_tool_call_message(subagent_id: &str, tool_name: &str) -> String {
@@ -1768,15 +1727,6 @@ pub fn render_subagent_tool_call(
     arguments: Option<&JsonObject>,
     debug: bool,
 ) {
-    if tool_name == "code_execution__execute_typescript" {
-        let tool_graph = arguments
-            .and_then(|args| args.get("tool_graph"))
-            .and_then(Value::as_array)
-            .filter(|arr| !arr.is_empty());
-        if let Some(tool_graph) = tool_graph {
-            return render_subagent_tool_graph(subagent_id, tool_graph);
-        }
-    }
     let tool_header = format!(
         "  {} {}",
         style("▸").dim(),
@@ -1785,53 +1735,6 @@ pub fn render_subagent_tool_call(
     println!();
     println!("{}", tool_header);
     print_params(&arguments.cloned(), 1, debug);
-    println!();
-}
-
-fn render_subagent_tool_graph(subagent_id: &str, tool_graph: &[Value]) {
-    let short_id = subagent_id.rsplit('_').next().unwrap_or(subagent_id);
-    let count = tool_graph.len();
-    let plural = if count == 1 { "" } else { "s" };
-    println!();
-    println!(
-        "  {} {} {} {} tool call{}",
-        style("▸").dim(),
-        style(format!("[subagent:{}]", short_id)).dim(),
-        style("execute_typescript").dim(),
-        style(count).dim(),
-        plural,
-    );
-
-    for (i, node) in tool_graph.iter().filter_map(Value::as_object).enumerate() {
-        let tool = node
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let desc = node
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let deps: Vec<_> = node
-            .get("depends_on")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_u64)
-            .map(|d| (d + 1).to_string())
-            .collect();
-        let deps_str = if deps.is_empty() {
-            String::new()
-        } else {
-            format!(" (uses {})", deps.join(", "))
-        };
-        println!(
-            "    {}. {} {}{}",
-            style(i + 1).dim(),
-            style(tool).dim(),
-            style(desc).dim(),
-            style(deps_str).dim()
-        );
-    }
     println!();
 }
 
@@ -2755,6 +2658,27 @@ mod tests {
         indicator.begin_fresh_turn();
 
         assert!(indicator.turn_started_at.unwrap() > stale_start);
+    }
+
+    #[test]
+    fn bell_rings_only_on_a_tty_when_enabled_and_slow() {
+        assert!(should_ring_bell(true, Duration::from_secs(15), true));
+        assert!(should_ring_bell(true, BELL_MIN_DURATION, true));
+        assert!(!should_ring_bell(false, Duration::from_secs(15), true));
+        assert!(!should_ring_bell(true, Duration::from_secs(15), false));
+        assert!(!should_ring_bell(true, Duration::from_secs(3), true));
+    }
+
+    #[test]
+    fn live_input_hint_shows_once_then_retires() {
+        assert!(!live_input_hint_active());
+        arm_live_input_hint();
+        assert!(live_input_hint_active());
+        finish_live_input_hint();
+        assert!(!live_input_hint_active());
+        // A second turn does not re-arm the one-time hint.
+        arm_live_input_hint();
+        assert!(!live_input_hint_active());
     }
 
     #[test]

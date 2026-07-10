@@ -11,19 +11,10 @@ pub static APP_STRATEGY: Lazy<AppStrategyArgs> = Lazy::new(|| AppStrategyArgs {
     app_name: "goose".to_string(),
 });
 
-pub mod autovisualiser;
-pub mod computercontroller;
 pub mod mcp_server_runner;
 mod memory;
-#[cfg(target_os = "macos")]
-pub mod peekaboo;
-pub mod subprocess;
-pub mod tutorial;
 
-pub use autovisualiser::AutoVisualiserRouter;
-pub use computercontroller::ComputerControllerServer;
 pub use memory::MemoryServer;
-pub use tutorial::TutorialServer;
 
 /// Type definition for a function that spawns and serves a builtin extension server
 pub type SpawnServerFn = fn(tokio::io::DuplexStream, tokio::io::DuplexStream);
@@ -54,11 +45,5 @@ macro_rules! builtin {
     }};
 }
 
-pub static BUILTIN_EXTENSIONS: Lazy<HashMap<&'static str, SpawnServerFn>> = Lazy::new(|| {
-    HashMap::from([
-        builtin!(autovisualiser, AutoVisualiserRouter),
-        builtin!(computercontroller, ComputerControllerServer),
-        builtin!(memory, MemoryServer),
-        builtin!(tutorial, TutorialServer),
-    ])
-});
+pub static BUILTIN_EXTENSIONS: Lazy<HashMap<&'static str, SpawnServerFn>> =
+    Lazy::new(|| HashMap::from([builtin!(memory, MemoryServer)]));

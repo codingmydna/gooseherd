@@ -1,17 +1,10 @@
 mod common;
-pub(crate) mod fs;
-mod mcp_app_proxy;
 mod provider;
-mod response_builder;
-pub mod server;
-pub mod server_factory;
-pub(crate) mod tools;
-pub mod transport;
 
 pub use common::{map_permission_response, PermissionDecision};
 pub use goose_sdk_types::{custom_notifications, custom_requests};
 pub use provider::{
-    extension_configs_to_mcp_servers, orch_implement_denial_count,
-    reset_orch_implement_denial_count, AcpProvider, AcpProviderConfig, ACP_CURRENT_MODEL,
-    ORCH_ALLOWED_COMMANDS_KEY, ORCH_IMPLEMENT_ACTIVE_KEY, ORCH_IMPLEMENT_POLICY_KEY,
+    extension_configs_to_mcp_servers, orch_allowed_commands_from_config, AcpProvider,
+    AcpProviderConfig, ACP_CURRENT_MODEL, ORCH_ALLOWED_COMMANDS_KEY, ORCH_IMPLEMENT_ACTIVE_KEY,
+    ORCH_IMPLEMENT_POLICY_KEY,
 };
