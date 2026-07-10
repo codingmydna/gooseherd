@@ -584,6 +584,17 @@ pub trait Provider: Send + Sync {
     ) -> bool {
         false
     }
+
+    /// Number of orchestration implement-policy denials this provider instance
+    /// recorded during the current run. Instance-scoped so concurrent sessions
+    /// never share a counter; providers without an implement policy return 0.
+    fn orch_implement_denial_count(&self) -> u64 {
+        0
+    }
+
+    /// Reset this instance's orch implement-policy denial counter, called at the
+    /// start of each implement cycle. No-op for providers without a counter.
+    fn reset_orch_implement_denial_count(&self) {}
 }
 
 #[cfg(test)]

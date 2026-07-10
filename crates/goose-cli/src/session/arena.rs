@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use crate::worktree;
 
-use super::orchestrate::{build_role_provider, resolve_judge_role, RoleConfig};
+use super::orchestrate::{
+    build_role_provider, resolve_gates, resolve_judge_role, seed_allowed_commands, RoleConfig,
+};
 use super::{exemplars, ledger, output, plan_exemplars, CliSession};
 
 const ARENA_DIR: &str = ".goose-arena";
@@ -35,6 +37,30 @@ struct Contestant {
     exit_ok: bool,
     diff: String,
     diff_stat: String,
+}
+
+/// Permission environment a contestant subprocess runs under. Arena is always
+/// headless, so it is safe-by-default: an ACP contestant gets the workspace
+/// allowlist unless the user explicitly set `GOOSE_ORCH_IMPLEMENT_POLICY=auto`.
+/// Native providers have no allowlist enforcement path and a headless approve
+/// prompt would hang, so they stay on `auto` inside their isolated worktree.
+fn contestant_security_env(
+    provider: &str,
+    explicit_policy: Option<&str>,
+    allowed_commands: &str,
+) -> Vec<(&'static str, String)> {
+    let is_acp = provider.ends_with("-acp");
+    let opted_out = explicit_policy.is_some_and(|policy| policy.eq_ignore_ascii_case("auto"));
+    if is_acp && !opted_out {
+        vec![
+            ("GOOSE_MODE", "approve".to_string()),
+            ("GOOSE_ORCH_IMPLEMENT_ACTIVE", "true".to_string()),
+            ("GOOSE_ORCH_IMPLEMENT_POLICY", "allowlist".to_string()),
+            ("GOOSE_ORCH_ALLOWED_COMMANDS", allowed_commands.to_string()),
+        ]
+    } else {
+        vec![("GOOSE_MODE", "auto".to_string())]
+    }
 }
 
 fn parse_lineup(spec: &str) -> Vec<(String, String)> {
@@ -183,6 +209,37 @@ impl CliSession {
         let arena_root = repo_root.join(ARENA_DIR);
         std::fs::create_dir_all(&arena_root)?;
 
+        // Safe-by-default posture for every contestant: seed a workspace command
+        // allowlist from the repo and reuse it for each ACP contestant.
+        let explicit_policy = config
+            .get_param::<String>("GOOSE_ORCH_IMPLEMENT_POLICY")
+            .ok();
+        let seed = config
+            .get_param::<String>("GOOSE_ORCH_ALLOWED_COMMANDS")
+            .unwrap_or_else(|_| {
+                let resolved = resolve_gates(&repo_root, None, Vec::new());
+                seed_allowed_commands(&repo_root, &resolved).join(",")
+            });
+        let any_acp = lineup
+            .iter()
+            .any(|(provider, _)| provider.ends_with("-acp"));
+        println!(
+            "  {}",
+            style(format!(
+                "security: contestants headless in isolated worktrees · implement policy={}",
+                if any_acp
+                    && !explicit_policy
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case("auto"))
+                {
+                    "allowlist (acp) / auto (native)"
+                } else {
+                    "auto"
+                }
+            ))
+            .dim()
+        );
+
         // Launch every contestant concurrently, each in its own worktree. The
         // worktree is named for the opaque label only, never the model, so the
         // path the judge might see cannot leak the contestant's identity.
@@ -209,19 +266,22 @@ impl CliSession {
             let worktree_c = worktree.clone();
             let label_c = label.clone();
             let log_path = arena_root.join(format!("{}.log", label));
+            let security_env =
+                contestant_security_env(&provider, explicit_policy.as_deref(), &seed);
             let handle = tokio::spawn(async move {
                 let started = Instant::now();
                 let (stdout_log, stderr_log) = log_stdio(&log_path);
-                let child = tokio::process::Command::new(&goose_bin)
+                let mut command = tokio::process::Command::new(&goose_bin);
+                command
                     .args(["run", "--no-session", "-t", &prompt])
                     .current_dir(&worktree_c)
                     .env("GOOSE_PROVIDER", &provider)
                     .env("GOOSE_MODEL", &model)
-                    .env("GOOSE_MODE", "auto")
-                    .env("GOOSE_ACP_PLAN_EXPLORE", "false")
-                    .stdout(stdout_log)
-                    .stderr(stderr_log)
-                    .spawn();
+                    .env("GOOSE_ACP_PLAN_EXPLORE", "false");
+                for (key, value) in &security_env {
+                    command.env(key, value);
+                }
+                let child = command.stdout(stdout_log).stderr(stderr_log).spawn();
                 let exit_ok = match child {
                     Ok(mut child) => {
                         match tokio::time::timeout(
@@ -334,10 +394,10 @@ impl CliSession {
             ));
         }
 
-        config.set_param("GOOSE_ACP_PLAN_EXPLORE", true)?;
+        config.set_runtime_override("GOOSE_ACP_PLAN_EXPLORE", true)?;
         let current_dir = std::env::current_dir()?;
         let judge_built = build_role_provider(&judge_role, &current_dir).await;
-        config.set_param("GOOSE_ACP_PLAN_EXPLORE", false)?;
+        config.clear_runtime_override("GOOSE_ACP_PLAN_EXPLORE");
         let (judge, judge_model) = judge_built?;
 
         output::set_thinking_context(Some(format!(
@@ -538,6 +598,44 @@ fn reveal_lineup(contestants: &[Contestant], ranking: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_map(
+        pairs: &[(&'static str, String)],
+    ) -> std::collections::HashMap<&'static str, String> {
+        pairs.iter().cloned().collect()
+    }
+
+    #[test]
+    fn contestant_security_env_defaults_acp_to_allowlist() {
+        let env = env_map(&contestant_security_env("codex-acp", None, "git,cargo"));
+        assert_eq!(env.get("GOOSE_MODE").map(String::as_str), Some("approve"));
+        assert_eq!(
+            env.get("GOOSE_ORCH_IMPLEMENT_POLICY").map(String::as_str),
+            Some("allowlist")
+        );
+        assert_eq!(
+            env.get("GOOSE_ORCH_IMPLEMENT_ACTIVE").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            env.get("GOOSE_ORCH_ALLOWED_COMMANDS").map(String::as_str),
+            Some("git,cargo")
+        );
+    }
+
+    #[test]
+    fn contestant_security_env_keeps_native_on_auto() {
+        let env = env_map(&contestant_security_env("openai", None, "git,cargo"));
+        assert_eq!(env.get("GOOSE_MODE").map(String::as_str), Some("auto"));
+        assert!(!env.contains_key("GOOSE_ORCH_IMPLEMENT_POLICY"));
+    }
+
+    #[test]
+    fn contestant_security_env_honors_explicit_auto_opt_out() {
+        let env = env_map(&contestant_security_env("codex-acp", Some("auto"), "git"));
+        assert_eq!(env.get("GOOSE_MODE").map(String::as_str), Some("auto"));
+        assert!(!env.contains_key("GOOSE_ORCH_IMPLEMENT_ACTIVE"));
+    }
 
     #[test]
     fn shuffle_is_deterministic_and_assigns_bare_letters() {

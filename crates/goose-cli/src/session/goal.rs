@@ -659,15 +659,11 @@ impl CliSession {
         }
 
         let role = evaluator_role.context("evaluator role missing")?;
-        let prev_plan_explore = Config::global()
-            .get_param::<bool>("GOOSE_ACP_PLAN_EXPLORE")
-            .ok();
-        Config::global().set_param("GOOSE_ACP_PLAN_EXPLORE", true)?;
+        // Give the evaluator read-only exploration via an in-memory override
+        // (never a config-file write), cleared as soon as it is constructed.
+        Config::global().set_runtime_override("GOOSE_ACP_PLAN_EXPLORE", true)?;
         let built = build_role_provider(role, working_dir).await;
-        match prev_plan_explore {
-            Some(value) => Config::global().set_param("GOOSE_ACP_PLAN_EXPLORE", value)?,
-            None => Config::global().set_param("GOOSE_ACP_PLAN_EXPLORE", false)?,
-        }
+        Config::global().clear_runtime_override("GOOSE_ACP_PLAN_EXPLORE");
         let (provider, model_config) = built.with_context(|| {
             format!(
                 "Failed to create evaluator provider {}/{}. Set {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or unset them to use the reviewer fallback (GOOSE_REVIEWER_PROVIDER / GOOSE_REVIEWER_MODEL).",

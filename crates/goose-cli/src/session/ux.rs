@@ -460,13 +460,14 @@ impl CliSession {
         let session_id = self.session_id.clone();
         tokio::spawn(async move {
             let config = Config::global();
-            let prev_mode = config.get_goose_mode().unwrap_or_default();
-            let _ = config.set_goose_mode(GooseMode::Chat);
+            // Read-only side-question provider: steer the mode in-memory only so
+            // this background task never persists (or races on) the on-disk mode.
+            let _ = config.set_runtime_override("GOOSE_MODE", GooseMode::Chat);
             let built = match std::env::current_dir() {
                 Ok(current_dir) => build_role_provider(&role, &current_dir).await,
                 Err(error) => Err(error.into()),
             };
-            let _ = config.set_goose_mode(prev_mode);
+            config.clear_runtime_override("GOOSE_MODE");
 
             let result = async {
                 let (provider, model_config) = built?;

@@ -47,6 +47,12 @@ impl OrchWorkspace {
     pub(super) fn is_worktree(&self) -> bool {
         self.branch.is_some()
     }
+
+    /// Whether ignored `.env*` files were symlinked into the worktree. Reflects
+    /// the actual result, which the `GOOSE_ORCH_LINK_ENV` knob gates.
+    pub(super) fn env_linked(&self) -> bool {
+        !self.env_links.is_empty()
+    }
 }
 
 pub(super) fn setup_orch_workspace(original_dir: &Path, run_id: &str) -> OrchWorkspace {
@@ -75,7 +81,15 @@ fn setup_orch_workspace_with_force(
 
     let name = format!("orch-{run_id}");
     let branch = format!("orch/{run_id}");
-    match worktree::create_named_worktree(original_dir, &name, Some(&branch)) {
+    let link_env = Config::global()
+        .get_param::<bool>("GOOSE_ORCH_LINK_ENV")
+        .unwrap_or(true);
+    match worktree::create_named_worktree_with_env_linking(
+        original_dir,
+        &name,
+        Some(&branch),
+        link_env,
+    ) {
         Ok(created) => OrchWorkspace::worktree(original_dir.to_path_buf(), repo_root, created),
         Err(error) => OrchWorkspace::in_place(
             original_dir.to_path_buf(),
@@ -621,6 +635,9 @@ mod tests {
 
     #[test]
     fn setup_orch_workspace_creates_named_worktree_branch_and_env_link() {
+        // Serialize against tests that toggle GOOSE_ORCH_LINK_ENV; default (unset)
+        // links env files.
+        let _guard = env_lock::lock_env([("GOOSE_ORCH_LINK_ENV", None::<&str>)]);
         let repo = init_repo();
         let repo_root = crate::worktree::find_repo_root(repo.path()).expect("repo root");
 
@@ -637,6 +654,21 @@ mod tests {
             crate::worktree::current_branch(&workspace.impl_dir).expect("branch"),
             "orch/abc123"
         );
+    }
+
+    #[test]
+    fn setup_orch_workspace_skips_env_link_when_knob_disabled() {
+        let _guard = env_lock::lock_env([("GOOSE_ORCH_LINK_ENV", Some("false"))]);
+        let repo = init_repo();
+
+        let workspace = super::setup_orch_workspace(repo.path(), "no-env-link");
+
+        assert!(workspace.is_worktree());
+        assert!(
+            !workspace.env_linked(),
+            "GOOSE_ORCH_LINK_ENV=false must keep .env out of the worktree"
+        );
+        assert!(!workspace.impl_dir.join(".env").exists());
     }
 
     #[test]

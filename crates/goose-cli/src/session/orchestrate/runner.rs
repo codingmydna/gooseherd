@@ -10,8 +10,9 @@ use tokio_util::sync::CancellationToken;
 use crate::session::{exemplars, ledger, output, plan_exemplars, review_exemplars, CliSession};
 
 use super::gates::{
-    gate_banner_line, gate_outputs_review_section, gate_passed_review_note, next_gate_step,
-    partition_gates, record_gate_phase, resolve_gates, run_gates, GateOutcome, GateRun, GateStep,
+    derived_gates_notice, gate_banner_line, gate_env_mode, gate_outputs_review_section,
+    gate_passed_review_note, next_gate_step, partition_gates, record_gate_phase, resolve_gates,
+    run_gates, seed_allowed_commands, GateEnvMode, GateOutcome, GateRun, GateStep,
 };
 use super::limits::handle_phase_error;
 use super::phases::{
@@ -56,12 +57,21 @@ impl CliSession {
         }
 
         let config = Config::global();
+        for key in config.heal_stale_orch_flags() {
+            println!(
+                "  {}",
+                console::style(format!(
+                    "cleared stale {key} left in config.yaml by an interrupted older run"
+                ))
+                .dim()
+            );
+        }
         let roles = resolve_all_roles()?;
         let default_role = roles.default;
         let planner_role = roles.planner;
         let reviewer_role = roles.reviewer;
         let implementer_role = roles.implementer;
-        let implement_policy = resolve_orch_implement_policy()?;
+        let implement_policy = resolve_orch_implement_policy(interactive)?;
         let implementer_is_acp = is_acp_provider(&implementer_role.provider_name);
         let max_cycles = max_cycles_override
             .filter(|n| *n >= 1)
@@ -101,7 +111,6 @@ impl CliSession {
             .dim()
         );
 
-        let prev_mode = config.get_goose_mode().unwrap_or_default();
         let outcome = self
             .run_orchestration(
                 &task,
@@ -118,13 +127,14 @@ impl CliSession {
         output::set_active_role(None);
         output::end_phase_progress();
         output::set_thinking_context(None);
-        if let Err(e) = config.set_param("GOOSE_ACP_PLAN_EXPLORE", false) {
-            output::render_error(&format!("Failed to reset plan-explore flag: {}", e));
-        }
-        if let Err(e) = config.set_param(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, false) {
-            output::render_error(&format!("Failed to reset implement policy flag: {}", e));
-        }
-        goose::acp::reset_orch_implement_denial_count();
+        // Drop the in-memory permission overrides installed for this run. There
+        // is no persisted state to undo (see set_runtime_override), so a crash
+        // above simply leaves nothing behind. The per-instance denial counter
+        // dies with the provider instance.
+        config.clear_runtime_override("GOOSE_ACP_PLAN_EXPLORE");
+        config.clear_runtime_override(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY);
+        config.clear_runtime_override(goose::acp::ORCH_ALLOWED_COMMANDS_KEY);
+        config.clear_runtime_override("GOOSE_MODE");
         if let Err(e) = self
             .agent
             .config
@@ -151,9 +161,6 @@ impl CliSession {
             {
                 output::render_error(&format!("Failed to restore session provider: {}", e));
             }
-        }
-        if let Err(e) = config.set_goose_mode(prev_mode) {
-            output::render_error(&format!("Failed to restore goose mode: {}", e));
         }
 
         outcome
@@ -187,6 +194,9 @@ impl CliSession {
             "  {}",
             console::style(gate_banner_line(&resolved_gates)).dim()
         );
+        if let Some(notice) = derived_gates_notice(&resolved_gates) {
+            println!("  {}", console::style(notice).dim());
+        }
         if let Some(warning) = &resolved_gates.warning {
             println!(
                 "  {} {}",
@@ -194,6 +204,20 @@ impl CliSession {
                 console::style(warning).yellow()
             );
         }
+        let implementer_is_acp = is_acp_provider(&implementer_role.provider_name);
+        println!(
+            "  {}",
+            console::style(format!(
+                "security: implement policy={} · gate env={} · .env linked={}",
+                implement_policy_label(implement_policy, implementer_is_acp),
+                match gate_env_mode() {
+                    GateEnvMode::Scrub => "scrub",
+                    GateEnvMode::Inherit => "inherit",
+                },
+                if workspace.env_linked() { "yes" } else { "no" }
+            ))
+            .dim()
+        );
         if workspace.is_worktree() {
             self.agent
                 .config
@@ -223,7 +247,7 @@ impl CliSession {
             .as_deref()
             .filter(|_| repo_pack::repo_pack_injects(planner_role));
 
-        config.set_param("GOOSE_ACP_PLAN_EXPLORE", true)?;
+        config.set_runtime_override("GOOSE_ACP_PLAN_EXPLORE", true)?;
 
         let session_id = self.session_id.clone();
         let meta = PhaseMeta {
@@ -290,9 +314,8 @@ impl CliSession {
                 }
             }
         };
-        config.set_param("GOOSE_ACP_PLAN_EXPLORE", false)?;
+        config.clear_runtime_override("GOOSE_ACP_PLAN_EXPLORE");
 
-        let implementer_is_acp = is_acp_provider(&implementer_role.provider_name);
         let acp_allowlist =
             implementer_is_acp && implement_policy == OrchImplementPolicy::Allowlist;
         let implementer_goose_mode = if acp_allowlist {
@@ -301,8 +324,27 @@ impl CliSession {
             GooseMode::Auto
         };
 
-        config.set_param(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, acp_allowlist)?;
-        config.set_goose_mode(implementer_goose_mode)?;
+        // Steer the implementer's permission mode/policy in-memory only, so a
+        // crash mid-run cannot leave the user's on-disk mode downgraded.
+        config.set_runtime_override(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, acp_allowlist)?;
+        config.set_runtime_override("GOOSE_MODE", implementer_goose_mode)?;
+        if acp_allowlist
+            && config
+                .get_param::<serde_json::Value>(goose::acp::ORCH_ALLOWED_COMMANDS_KEY)
+                .is_err()
+        {
+            let seed = seed_allowed_commands(&workspace.impl_dir, &resolved_gates);
+            println!(
+                "  {}",
+                console::style(format!(
+                    "seeded implement allowlist: {} (set {} to override)",
+                    seed.join(", "),
+                    goose::acp::ORCH_ALLOWED_COMMANDS_KEY
+                ))
+                .dim()
+            );
+            config.set_runtime_override(goose::acp::ORCH_ALLOWED_COMMANDS_KEY, seed)?;
+        }
         let impl_model_config = goose::model_config::model_config_from_user_config(
             &implementer_role.provider_name,
             implementer_role.model.as_str(),
@@ -327,7 +369,10 @@ impl CliSession {
                 Some(&repo_scope),
             );
         }
-        config.set_param(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, false)?;
+        // The freshly built implementer provider captured its policy at
+        // construction; the denial counter lives on that instance, so read it
+        // back from the session provider rather than any process global.
+        let implementer_provider = self.agent.provider().await.ok();
 
         let implementer_playbook = if implementer_is_acp {
             String::new()
@@ -418,14 +463,19 @@ impl CliSession {
                     Some((cycle, max_cycles)),
                     orch_progress_cadence(),
                 );
-                goose::acp::reset_orch_implement_denial_count();
+                if let Some(provider) = &implementer_provider {
+                    provider.reset_orch_implement_denial_count();
+                }
                 self.process_agent_response(interactive, CancellationToken::default())
                     .await?;
                 output::hide_thinking();
                 output::end_phase_progress();
                 let policy_summary = PhasePolicySummary {
                     name: implement_policy_label(implement_policy, implementer_is_acp),
-                    denials: goose::acp::orch_implement_denial_count(),
+                    denials: implementer_provider
+                        .as_ref()
+                        .map(|provider| provider.orch_implement_denial_count())
+                        .unwrap_or(0),
                 };
                 let usage_after = self
                     .get_session()
@@ -476,7 +526,7 @@ impl CliSession {
                     gates.len()
                 ));
                 let gate_started = Instant::now();
-                let outcome = run_gates(&workspace.impl_dir, &gates);
+                let outcome = run_gates(&workspace.impl_dir, &gates).await;
                 let (passed, detail) = match &outcome {
                     GateOutcome::Passed { runs } => {
                         last_gate_runs = runs.clone();

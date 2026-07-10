@@ -100,6 +100,18 @@ pub fn create_named_worktree(
     name: &str,
     branch: Option<&str>,
 ) -> Result<CreatedWorktree> {
+    create_named_worktree_with_env_linking(start, name, branch, true)
+}
+
+/// Like [`create_named_worktree`], but `link_env` controls whether ignored
+/// `.env*` files are symlinked into the new worktree. Orchestration passes the
+/// `GOOSE_ORCH_LINK_ENV` knob so a run can keep secrets out of the worktree.
+pub fn create_named_worktree_with_env_linking(
+    start: &Path,
+    name: &str,
+    branch: Option<&str>,
+    link_env: bool,
+) -> Result<CreatedWorktree> {
     let repo_root = find_repo_root(start)?;
     let name = validate_name(name)?;
     let branch = match branch {
@@ -126,7 +138,11 @@ pub fn create_named_worktree(
             path.as_os_str(),
         ],
     )?;
-    let env_links = symlink_ignored_env_files(&repo_root, &path)?;
+    let env_links = if link_env {
+        symlink_ignored_env_files(&repo_root, &path)?
+    } else {
+        Vec::new()
+    };
 
     Ok(CreatedWorktree {
         path,

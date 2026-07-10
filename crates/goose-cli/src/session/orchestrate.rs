@@ -10,7 +10,7 @@ mod roles;
 mod runner;
 mod workspace;
 
-pub(crate) use gates::{gate_banner_line, resolve_gates, GateSource};
+pub(crate) use gates::{gate_banner_line, resolve_gates, seed_allowed_commands, GateSource};
 pub(super) use roles::{build_role_provider, resolve_all_roles, resolve_judge_role, RoleConfig};
 pub(super) use workspace::git_evidence;
 
@@ -35,10 +35,22 @@ enum OrchImplementPolicy {
     Allowlist,
 }
 
-fn resolve_orch_implement_policy() -> Result<OrchImplementPolicy> {
-    let raw = Config::global()
-        .get_param::<String>(goose::acp::ORCH_IMPLEMENT_POLICY_KEY)
-        .unwrap_or_else(|_| "auto".to_string());
+/// Resolve the orchestration implement policy. An explicit
+/// `GOOSE_ORCH_IMPLEMENT_POLICY` is always honored. When unset, the default is
+/// safe-by-default: headless runs (no human watching approvals) get the
+/// workspace `allowlist`; interactive runs keep `auto`, since the user is
+/// present to approve.
+fn resolve_orch_implement_policy(interactive: bool) -> Result<OrchImplementPolicy> {
+    let raw = match Config::global().get_param::<String>(goose::acp::ORCH_IMPLEMENT_POLICY_KEY) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return Ok(if interactive {
+                OrchImplementPolicy::Auto
+            } else {
+                OrchImplementPolicy::Allowlist
+            });
+        }
+    };
     match raw.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok(OrchImplementPolicy::Auto),
         "allowlist" => Ok(OrchImplementPolicy::Allowlist),
@@ -46,5 +58,39 @@ fn resolve_orch_implement_policy() -> Result<OrchImplementPolicy> {
             "{} must be one of: auto, allowlist",
             goose::acp::ORCH_IMPLEMENT_POLICY_KEY
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn implement_policy_defaults_safe_by_headlessness_and_honors_explicit() {
+        let _guard = env_lock::lock_env([("GOOSE_ORCH_IMPLEMENT_POLICY", None::<&str>)]);
+
+        // Unset: headless is workspace-scoped, interactive stays permissive.
+        assert_eq!(
+            resolve_orch_implement_policy(false).unwrap(),
+            OrchImplementPolicy::Allowlist
+        );
+        assert_eq!(
+            resolve_orch_implement_policy(true).unwrap(),
+            OrchImplementPolicy::Auto
+        );
+
+        // Explicit value always wins, regardless of interactivity.
+        std::env::set_var("GOOSE_ORCH_IMPLEMENT_POLICY", "auto");
+        assert_eq!(
+            resolve_orch_implement_policy(false).unwrap(),
+            OrchImplementPolicy::Auto
+        );
+        std::env::set_var("GOOSE_ORCH_IMPLEMENT_POLICY", "allowlist");
+        assert_eq!(
+            resolve_orch_implement_policy(true).unwrap(),
+            OrchImplementPolicy::Allowlist
+        );
+        std::env::set_var("GOOSE_ORCH_IMPLEMENT_POLICY", "nonsense");
+        assert!(resolve_orch_implement_policy(false).is_err());
     }
 }

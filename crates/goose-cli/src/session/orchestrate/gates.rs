@@ -1,13 +1,19 @@
 use crate::session::ledger;
+use goose::config::Config;
 use goose::utils::safe_truncate;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use super::phases::PhaseMeta;
 
 const GATE_OUTPUT_TAIL_LIMIT: usize = 4_000;
 const LOCAL_GATES_FILE: &str = ".goose-gates.yaml";
+const GATE_TIMEOUT_KEY: &str = "GOOSE_ORCH_GATE_TIMEOUT_SECS";
+const GATE_ENV_KEY: &str = "GOOSE_ORCH_GATE_ENV";
+const DEFAULT_GATE_TIMEOUT_SECS: u64 = 900;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GateSource {
@@ -200,6 +206,49 @@ pub(crate) fn gate_banner_line(resolved: &ResolvedGates) -> String {
     }
 }
 
+/// One-line, override-pointing notice printed the first time a repo's gates are
+/// derived from a manifest (rather than an explicit `.goose-gates.yaml` or
+/// `GOOSE_ORCH_GATES`). Headless, so it's visibility only — no prompt.
+pub(crate) fn derived_gates_notice(resolved: &ResolvedGates) -> Option<String> {
+    match &resolved.source {
+        GateSource::Derived { manifest, .. } => Some(format!(
+            "gates derived from {manifest} — set GOOSE_ORCH_GATES or .goose-gates.yaml to override"
+        )),
+        _ => None,
+    }
+}
+
+/// Default command allowlist for a headless implement run: git plus the repo's
+/// detected build tools and the first token of each derivable gate command, so
+/// the implementer can build/test/commit while shell-chaining and unlisted
+/// programs stay denied. Reuses the same manifest detection as gate derivation.
+pub(crate) fn seed_allowed_commands(impl_dir: &Path, resolved: &ResolvedGates) -> Vec<String> {
+    let mut seed = vec!["git".to_string()];
+    if impl_dir.join("Cargo.toml").is_file() {
+        seed.push("cargo".to_string());
+    }
+    if impl_dir.join("package.json").is_file() {
+        let (manager, _) = detect_js_package_manager(impl_dir);
+        seed.push(manager.to_string());
+        seed.push("npx".to_string());
+        seed.push("node".to_string());
+    }
+    if impl_dir.join("go.mod").is_file() {
+        seed.push("go".to_string());
+    }
+    for gate in &resolved.gates {
+        if command_needs_shell(gate) {
+            continue;
+        }
+        if let Some(token) = gate.split_whitespace().next() {
+            seed.push(token.to_string());
+        }
+    }
+    seed.sort();
+    seed.dedup();
+    seed
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct GateRun {
     pub command: String,
@@ -306,14 +355,73 @@ fn gate_skip_reason(impl_dir: &Path, command: &str) -> Option<String> {
     None
 }
 
-pub(super) fn run_gates(impl_dir: &Path, gates: &[String]) -> GateOutcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GateEnvMode {
+    Scrub,
+    Inherit,
+}
+
+fn gate_timeout() -> Duration {
+    let secs = Config::global()
+        .get_param::<u64>(GATE_TIMEOUT_KEY)
+        .ok()
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_GATE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+pub(super) fn gate_env_mode() -> GateEnvMode {
+    match Config::global().get_param::<String>(GATE_ENV_KEY) {
+        Ok(raw) if raw.trim().eq_ignore_ascii_case("inherit") => GateEnvMode::Inherit,
+        _ => GateEnvMode::Scrub,
+    }
+}
+
+/// Environment variables that carry credentials. In scrub mode they are removed
+/// from a gate's environment so repo-derived commands can't exfiltrate secrets.
+pub(super) fn is_secret_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.ends_with("_API_KEY")
+        || upper.ends_with("_TOKEN")
+        || upper.ends_with("_SECRET")
+        || upper.ends_with("_SECRET_KEY")
+        || upper.ends_with("_ACCESS_KEY")
+        || upper.ends_with("_PASSWORD")
+        || upper.starts_with("ANTHROPIC_")
+        || upper.starts_with("OPENAI_")
+        || upper.starts_with("AWS_")
+        || matches!(
+            upper.as_str(),
+            "OPENAI_API_KEY"
+                | "ANTHROPIC_API_KEY"
+                | "GEMINI_API_KEY"
+                | "GOOGLE_API_KEY"
+                | "GROQ_API_KEY"
+                | "OPENROUTER_API_KEY"
+                | "DEEPSEEK_API_KEY"
+                | "GITHUB_TOKEN"
+                | "GH_TOKEN"
+                | "HF_TOKEN"
+                | "TAVILY_API_KEY"
+        )
+}
+
+pub(super) async fn run_gates(impl_dir: &Path, gates: &[String]) -> GateOutcome {
+    let timeout = gate_timeout();
+    let env_mode = gate_env_mode();
     let mut runs = Vec::new();
     for command in gates {
         if command.trim().is_empty() {
             continue;
         }
-        let output = match spawn_gate(impl_dir, command) {
-            Ok(output) => output,
+        let output = match spawn_gate(impl_dir, command, timeout, env_mode).await {
+            Ok(GateSpawn::Completed(output)) => output,
+            Ok(GateSpawn::TimedOut) => {
+                return GateOutcome::Failed {
+                    command: command.clone(),
+                    output_tail: format!("timed out after {}s", timeout.as_secs()),
+                };
+            }
             Err(error) => {
                 return GateOutcome::Failed {
                     command: command.clone(),
@@ -371,8 +479,18 @@ pub(super) fn gate_outputs_review_section(runs: &[GateRun], tail_lines: usize) -
     section.trim_end().to_string()
 }
 
-fn spawn_gate(impl_dir: &Path, command: &str) -> std::io::Result<std::process::Output> {
-    use std::process::Command;
+enum GateSpawn {
+    Completed(std::process::Output),
+    TimedOut,
+}
+
+async fn spawn_gate(
+    impl_dir: &Path,
+    command: &str,
+    timeout: Duration,
+    env_mode: GateEnvMode,
+) -> std::io::Result<GateSpawn> {
+    use tokio::process::Command;
 
     let mut cmd = if command_needs_shell(command) {
         let mut cmd = Command::new("sh");
@@ -388,7 +506,42 @@ fn spawn_gate(impl_dir: &Path, command: &str) -> std::io::Result<std::process::O
         cmd
     };
 
-    cmd.current_dir(impl_dir).output()
+    cmd.current_dir(impl_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if env_mode == GateEnvMode::Scrub {
+        cmd.env_clear();
+        for (key, value) in std::env::vars() {
+            if !is_secret_env_key(&key) {
+                cmd.env(key, value);
+            }
+        }
+    }
+
+    // Own process group so a timeout can kill the whole tree (a shell-form gate
+    // and its children), not just the direct child.
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
+
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(result) => Ok(GateSpawn::Completed(result?)),
+        Err(_elapsed) => {
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                // Negative pid signals the whole process group.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            let _ = pid;
+            Ok(GateSpawn::TimedOut)
+        }
+    }
 }
 
 fn command_needs_shell(command: &str) -> bool {
@@ -744,25 +897,25 @@ mod tests {
         assert!(partition.skipped[0].reason.contains("not installed"));
     }
 
-    #[test]
-    fn run_gates_passes_when_all_commands_succeed() {
+    #[tokio::test]
+    async fn run_gates_passes_when_all_commands_succeed() {
         let temp = tempfile::tempdir().expect("tempdir");
 
         assert!(matches!(
-            super::run_gates(temp.path(), &["true".to_string()]),
+            super::run_gates(temp.path(), &["true".to_string()]).await,
             super::GateOutcome::Passed { .. }
         ));
         assert!(matches!(
-            super::run_gates(temp.path(), &[]),
+            super::run_gates(temp.path(), &[]).await,
             super::GateOutcome::Passed { .. }
         ));
     }
 
-    #[test]
-    fn run_gates_captures_passing_output_for_review() {
+    #[tokio::test]
+    async fn run_gates_captures_passing_output_for_review() {
         let temp = tempfile::tempdir().expect("tempdir");
 
-        match super::run_gates(temp.path(), &["echo passing-gate-output".to_string()]) {
+        match super::run_gates(temp.path(), &["echo passing-gate-output".to_string()]).await {
             super::GateOutcome::Passed { runs } => {
                 assert_eq!(runs.len(), 1);
                 assert_eq!(runs[0].command, "echo passing-gate-output");
@@ -776,35 +929,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn run_gates_uses_impl_dir() {
+    #[tokio::test]
+    async fn run_gates_uses_impl_dir() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("sentinel"), "present\n").expect("write sentinel");
 
         assert!(matches!(
-            super::run_gates(temp.path(), &["test -f sentinel".to_string()]),
+            super::run_gates(temp.path(), &["test -f sentinel".to_string()]).await,
             super::GateOutcome::Passed { .. }
         ));
     }
 
-    #[test]
-    fn run_gates_stops_at_first_failing_command() {
+    #[tokio::test]
+    async fn run_gates_stops_at_first_failing_command() {
         let temp = tempfile::tempdir().expect("tempdir");
 
         match super::run_gates(
             temp.path(),
             &["true".to_string(), "false".to_string(), "true".to_string()],
-        ) {
+        )
+        .await
+        {
             super::GateOutcome::Failed { command, .. } => assert_eq!(command, "false"),
             super::GateOutcome::Passed { .. } => panic!("expected failing gate"),
         }
     }
 
-    #[test]
-    fn run_gates_captures_stderr_tail_via_shell() {
+    #[tokio::test]
+    async fn run_gates_captures_stderr_tail_via_shell() {
         let temp = tempfile::tempdir().expect("tempdir");
 
-        match super::run_gates(temp.path(), &["echo GATE_MARKER 1>&2; exit 1".to_string()]) {
+        match super::run_gates(temp.path(), &["echo GATE_MARKER 1>&2; exit 1".to_string()]).await {
             super::GateOutcome::Failed { output_tail, .. } => {
                 assert!(output_tail.contains("GATE_MARKER"), "{output_tail}");
             }
@@ -883,13 +1038,13 @@ mod tests {
         assert_eq!(gate_retries, 0);
     }
 
-    #[test]
-    fn gates_unset_is_noop() {
+    #[tokio::test]
+    async fn gates_unset_is_noop() {
         let temp = tempfile::tempdir().expect("tempdir");
         let gates = Vec::new();
 
         assert!(matches!(
-            super::run_gates(temp.path(), &gates),
+            super::run_gates(temp.path(), &gates).await,
             super::GateOutcome::Passed { .. }
         ));
         assert_eq!(super::gate_passed_review_note(&gates), "");
@@ -906,5 +1061,125 @@ mod tests {
             super::gate_passed_review_note(&gates),
             "\n\ngates passed: cargo fmt --check; cargo test -p goose-cli"
         );
+    }
+
+    #[tokio::test]
+    async fn run_gates_times_out_and_marks_failure() {
+        let _guard = env_lock::lock_env([
+            ("GOOSE_ORCH_GATE_TIMEOUT_SECS", Some("1")),
+            ("GOOSE_ORCH_GATE_ENV", Some("inherit")),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        match super::run_gates(temp.path(), &["sleep 30".to_string()]).await {
+            super::GateOutcome::Failed { output_tail, .. } => {
+                assert!(output_tail.contains("timed out"), "{output_tail}");
+            }
+            super::GateOutcome::Passed { .. } => panic!("expected timeout failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_gates_scrub_drops_secret_env_but_keeps_path() {
+        let _guard = env_lock::lock_env([
+            ("GOOSE_ORCH_GATE_ENV", Some("scrub")),
+            ("GOOSE_ORCH_GATE_TIMEOUT_SECS", Some("60")),
+            ("FOO_API_KEY", Some("supersecret")),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        match super::run_gates(
+            temp.path(),
+            &["printf 'KEY=[%s] PATH=[%s]' \"$FOO_API_KEY\" \"$PATH\"".to_string()],
+        )
+        .await
+        {
+            super::GateOutcome::Passed { runs } => {
+                let output = &runs[0].output_tail;
+                assert!(
+                    output.contains("KEY=[]"),
+                    "secret should be scrubbed: {output}"
+                );
+                assert!(!output.contains("supersecret"), "{output}");
+                assert!(!output.contains("PATH=[]"), "PATH should survive: {output}");
+            }
+            super::GateOutcome::Failed { output_tail, .. } => {
+                panic!("expected pass, got failure: {output_tail}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_gates_inherit_passes_secret_env_through() {
+        let _guard = env_lock::lock_env([
+            ("GOOSE_ORCH_GATE_ENV", Some("inherit")),
+            ("GOOSE_ORCH_GATE_TIMEOUT_SECS", Some("60")),
+            ("BAR_API_KEY", Some("inheritedsecret")),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        match super::run_gates(
+            temp.path(),
+            &["printf 'KEY=[%s]' \"$BAR_API_KEY\"".to_string()],
+        )
+        .await
+        {
+            super::GateOutcome::Passed { runs } => {
+                assert!(
+                    runs[0].output_tail.contains("inheritedsecret"),
+                    "{}",
+                    runs[0].output_tail
+                );
+            }
+            super::GateOutcome::Failed { output_tail, .. } => {
+                panic!("expected pass, got failure: {output_tail}")
+            }
+        }
+    }
+
+    #[test]
+    fn is_secret_env_key_matches_credential_patterns_only() {
+        assert!(super::is_secret_env_key("FOO_API_KEY"));
+        assert!(super::is_secret_env_key("GITHUB_TOKEN"));
+        assert!(super::is_secret_env_key("MY_SECRET"));
+        assert!(super::is_secret_env_key("ANTHROPIC_BASE_URL"));
+        assert!(super::is_secret_env_key("AWS_ACCESS_KEY_ID"));
+        assert!(!super::is_secret_env_key("PATH"));
+        assert!(!super::is_secret_env_key("HOME"));
+        assert!(!super::is_secret_env_key("CARGO_HOME"));
+        assert!(!super::is_secret_env_key("CI"));
+    }
+
+    #[test]
+    fn seed_allowed_commands_includes_git_and_detected_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("Cargo.toml"), "[package]\n").expect("manifest");
+
+        let resolved =
+            super::resolve_gates(temp.path(), None, vec!["cargo test -p goose".to_string()]);
+        let seed = super::seed_allowed_commands(temp.path(), &resolved);
+
+        assert!(seed.contains(&"git".to_string()));
+        assert!(seed.contains(&"cargo".to_string()));
+        // Sorted and de-duplicated.
+        let mut sorted = seed.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(seed, sorted);
+    }
+
+    #[test]
+    fn derived_gates_notice_only_for_derived_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_package_json(temp.path(), r#"{"test":"vitest"}"#);
+        let derived = super::resolve_gates(temp.path(), None, Vec::new());
+        assert!(super::derived_gates_notice(&derived)
+            .expect("derived notice")
+            .contains("package.json"));
+
+        let cargo = tempfile::tempdir().expect("tempdir");
+        fs::write(cargo.path().join("Cargo.toml"), "[workspace]\n").expect("manifest");
+        let global = super::resolve_gates(cargo.path(), None, vec!["cargo test".to_string()]);
+        assert!(super::derived_gates_notice(&global).is_none());
     }
 }
