@@ -48,7 +48,6 @@ use goose::session::{ContextWindowState, ExtensionState};
 use goose::utils::safe_truncate;
 pub(crate) use looping::{parse_interval as parse_loop_interval, LoopCommand, LOOP_USAGE};
 pub use orchestrate::OrchOutcome;
-pub(crate) use orchestrate::{partition_gates, resolve_gates, GateOrigin};
 
 use anyhow::{Context, Result};
 use completion::GooseCompleter;
