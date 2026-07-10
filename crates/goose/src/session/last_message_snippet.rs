@@ -1,3 +1,8 @@
+// Retained for the interactive session resume picker; its only former production
+// caller (the ACP session-list surface) was removed, so it is currently exercised
+// only by tests.
+#![allow(dead_code)]
+
 use crate::conversation::message::Message;
 use crate::session::session_manager::Session;
 use anyhow::Result;

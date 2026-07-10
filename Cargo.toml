@@ -23,7 +23,6 @@ string_slice = "warn"
 rmcp = { version = "1.4", default-features = false, features = ["schemars", "auth"] }
 agent-client-protocol-schema = { version = "1.1", default-features = false, features = ["unstable"] }
 agent-client-protocol = { version = "1.0", default-features = false }
-agent-client-protocol-http = { version = "1.0", default-features = false, features = ["server", "unstable_cancel_request"] }
 arboard = { version = "3", default-features = false }
 anyhow = { version = "1.0.102", default-features = false, features = ["std"] }
 async-stream = { version = "0.3.6", default-features = false }
@@ -63,7 +62,6 @@ thiserror = { version = "2.0.18", default-features = false }
 tokio = { version = "1.48", default-features = false }
 tokio-stream = { version = "0.1.16", default-features = false }
 tokio-util = { version = "0.7.12", default-features = false }
-tower-http = { version = "0.7.0", default-features = false }
 tracing = { version = "0.1.43", default-features = false, features = ["std"] }
 tracing-appender = { version = "0.2.1", default-features = false }
 tracing-futures = { version = "0.2.4", default-features = false, features = ["futures-03", "std", "std-future"] }

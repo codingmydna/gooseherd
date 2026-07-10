@@ -2,13 +2,11 @@ use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell as ClapShell};
 use clap_complete_nushell::Nushell as ClapNushell;
-use goose::agents::GoosePlatform;
 use goose::builtin_extension::register_builtin_extensions;
 use goose::config::{Config, GooseMode};
 #[cfg(feature = "telemetry")]
 use goose::posthog::get_telemetry_choice;
 use goose::recipe::Recipe;
-use goose::source_roots::SourceRoot;
 use goose_mcp::mcp_server_runner::{serve, McpCommand};
 use goose_mcp::{AutoVisualiserRouter, ComputerControllerServer, MemoryServer, TutorialServer};
 
@@ -18,16 +16,11 @@ use crate::commands::configure::handle_configure;
 use crate::commands::info::handle_info;
 use crate::commands::plugin::{handle_plugin_install, handle_plugin_update};
 use crate::commands::project::{handle_project_default, handle_projects_interactive};
-use crate::commands::recipe::{handle_deeplink, handle_list, handle_open, handle_validate};
+use crate::commands::recipe::{handle_list, handle_validate};
 use crate::commands::term::{
     handle_term_info, handle_term_init, handle_term_log, handle_term_run, Shell,
 };
 
-use crate::commands::schedule::{
-    handle_schedule_add, handle_schedule_cron_help, handle_schedule_list, handle_schedule_remove,
-    handle_schedule_run_now, handle_schedule_services_status, handle_schedule_services_stop,
-    handle_schedule_sessions,
-};
 use crate::commands::session::{handle_session_list, handle_session_remove};
 use crate::commands::skills::handle_skills_list;
 use crate::recipes::extract_from_cli::extract_recipe_info_from_cli;
@@ -42,33 +35,6 @@ use goose::session::SessionManager;
 use std::io::Read;
 use std::path::PathBuf;
 use tracing::warn;
-
-const GOOSE_SERVER_SECRET_KEY_ENV: &str = "GOOSE_SERVER__SECRET_KEY";
-
-fn generate_serve_secret_key() -> String {
-    use rand::distr::{Alphanumeric, SampleString};
-
-    format!(
-        "goose-acp-{}",
-        Alphanumeric.sample_string(&mut rand::rng(), 32)
-    )
-}
-
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ServePlatform {
-    #[default]
-    Cli,
-    Desktop,
-}
-
-impl From<ServePlatform> for GoosePlatform {
-    fn from(platform: ServePlatform) -> Self {
-        match platform {
-            ServePlatform::Cli => GoosePlatform::GooseCli,
-            ServePlatform::Desktop => GoosePlatform::GooseDesktop,
-        }
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "goose", author, version, display_name = "", about, long_about = None)]
@@ -570,32 +536,15 @@ enum SessionCommand {
             default_value = "markdown"
         )]
         format: String,
-
-        #[arg(
-            long = "nostr",
-            help = "Publish the JSON session export as an encrypted Nostr event and print a Goose share link"
-        )]
-        nostr: bool,
-
-        #[arg(
-            long = "relay",
-            value_name = "RELAY",
-            help = "Nostr relay URL to publish to (can be specified multiple times)",
-            action = clap::ArgAction::Append
-        )]
-        relays: Vec<String>,
     },
     #[command(
-        about = "Import a session from JSON, a Claude Code / Codex / Pi .jsonl, or an encrypted Nostr share link"
+        about = "Import a session from JSON or a Claude Code / Codex / Pi .jsonl transcript"
     )]
     Import {
         #[arg(
-            help = "Path to a goose session export, a Claude Code, Codex, or Pi .jsonl transcript, or a goose://sessions/nostr share link"
+            help = "Path to a goose session export, or a Claude Code, Codex, or Pi .jsonl transcript"
         )]
         input: String,
-
-        #[arg(long = "nostr", help = "Treat input as an encrypted Nostr share link")]
-        nostr: bool,
     },
     #[command(name = "diagnostics")]
     Diagnostics {
@@ -604,104 +553,6 @@ enum SessionCommand {
 
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum SchedulerCommand {
-    #[command(about = "Add a new scheduled job")]
-    Add {
-        #[arg(
-            long = "schedule-id",
-            alias = "id",
-            help = "Unique ID for the recurring scheduled job"
-        )]
-        schedule_id: String,
-        #[arg(
-            long,
-            help = "Cron expression for the schedule",
-            long_help = "Cron expression for when to run the job. Examples:\n  '0 * * * *'     - Every hour at minute 0\n  '0 */2 * * *'   - Every 2 hours\n  '@hourly'       - Every hour (shorthand)\n  '0 9 * * *'     - Every day at 9:00 AM\n  '0 9 * * 1'     - Every Monday at 9:00 AM\n  '0 0 1 * *'     - First day of every month at midnight"
-        )]
-        cron: String,
-        #[arg(
-            long,
-            help = "Recipe source (path to file, or base64 encoded recipe string)"
-        )]
-        recipe_source: String,
-        #[arg(
-            long,
-            value_name = "KEY=VALUE",
-            help = "Recipe parameter in KEY=VALUE format (can be specified multiple times)",
-            action = clap::ArgAction::Append,
-            value_parser = parse_key_val,
-        )]
-        params: Vec<(String, String)>,
-    },
-    #[command(about = "List all scheduled jobs")]
-    List {},
-    #[command(about = "Remove a scheduled job by ID")]
-    Remove {
-        #[arg(
-            long = "schedule-id",
-            alias = "id",
-            help = "ID of the scheduled job to remove (removes the recurring schedule)"
-        )]
-        schedule_id: String,
-    },
-    /// List sessions created by a specific schedule
-    #[command(about = "List sessions created by a specific schedule")]
-    Sessions {
-        /// ID of the schedule
-        #[arg(long = "schedule-id", alias = "id", help = "ID of the schedule")]
-        schedule_id: String,
-        #[arg(short = 'l', long, help = "Maximum number of sessions to return")]
-        limit: Option<usize>,
-    },
-    #[command(about = "Run a scheduled job immediately")]
-    RunNow {
-        /// ID of the schedule to run
-        #[arg(long = "schedule-id", alias = "id", help = "ID of the schedule to run")]
-        schedule_id: String,
-    },
-    /// Check status of scheduler services (deprecated - no external services needed)
-    #[command(about = "[Deprecated] Check status of scheduler services")]
-    ServicesStatus {},
-    /// Stop scheduler services (deprecated - no external services needed)
-    #[command(about = "[Deprecated] Stop scheduler services")]
-    ServicesStop {},
-    /// Show cron expression examples and help
-    #[command(about = "Show cron expression examples and help")]
-    CronHelp {},
-}
-
-#[derive(Subcommand)]
-enum GatewayCommand {
-    #[command(about = "Show gateway status")]
-    Status {},
-
-    #[command(about = "Start a gateway")]
-    Start {
-        #[arg(help = "Gateway type (e.g., 'telegram')")]
-        gateway_type: String,
-
-        #[arg(
-            long = "bot-token",
-            help = "Bot token for the gateway platform",
-            long_help = "Authentication token for the gateway platform (e.g., Telegram bot token)"
-        )]
-        bot_token: String,
-    },
-
-    #[command(about = "Stop a running gateway")]
-    Stop {
-        #[arg(help = "Gateway type to stop (e.g., 'telegram')")]
-        gateway_type: String,
-    },
-
-    #[command(about = "Generate a pairing code for a gateway")]
-    Pair {
-        #[arg(help = "Gateway type to generate pairing code for")]
-        gateway_type: String,
     },
 }
 
@@ -743,40 +594,6 @@ enum RecipeCommand {
         /// Recipe name to get recipe file to validate
         #[arg(help = "recipe name to get recipe file or full path to the recipe file to validate")]
         recipe_name: String,
-    },
-
-    /// Generate a deeplink for a recipe file
-    #[command(about = "Generate a deeplink for a recipe")]
-    Deeplink {
-        /// Recipe name to get recipe file to generate deeplink
-        #[arg(
-            help = "recipe name to get recipe file or full path to the recipe file to generate deeplink"
-        )]
-        recipe_name: String,
-        /// Recipe parameters in key=value format (can be specified multiple times)
-        #[arg(
-            short = 'p',
-            long = "param",
-            value_name = "KEY=VALUE",
-            help = "Recipe parameter in key=value format (can be specified multiple times)"
-        )]
-        params: Vec<String>,
-    },
-
-    /// Open a recipe in Goose Desktop
-    #[command(about = "Open a recipe in Goose Desktop")]
-    Open {
-        /// Recipe name to get recipe file to open
-        #[arg(help = "recipe name or full path to the recipe file")]
-        recipe_name: String,
-        /// Recipe parameters in key=value format (can be specified multiple times)
-        #[arg(
-            short = 'p',
-            long = "param",
-            value_name = "KEY=VALUE",
-            help = "Recipe parameter in key=value format (can be specified multiple times)"
-        )]
-        params: Vec<String>,
     },
 
     /// List available recipes
@@ -851,66 +668,6 @@ enum Command {
     Mcp {
         #[arg(value_parser = clap::value_parser!(McpCommand))]
         server: McpCommand,
-    },
-
-    /// Run goose as an ACP (Agent Client Protocol) agent
-    #[command(about = "Run goose as an ACP agent server on stdio")]
-    Acp {
-        /// Add builtin extensions by name
-        #[arg(
-            long = "with-builtin",
-            value_name = "NAME",
-            help = "Add builtin extensions by name (e.g., 'developer' or multiple: 'developer,github')",
-            long_help = "Add one or more builtin extensions that are bundled with goose by specifying their names, comma-separated",
-            value_delimiter = ','
-        )]
-        builtins: Vec<String>,
-    },
-
-    /// Start ACP server over HTTP and WebSocket
-    #[command(about = "Start ACP server over HTTP and WebSocket")]
-    Serve {
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-
-        #[arg(long, default_value = "3284")]
-        port: u16,
-
-        #[arg(long, help = "Serve ACP over TLS")]
-        tls: bool,
-
-        #[arg(long = "tls-cert-path", value_name = "PATH")]
-        tls_cert_path: Option<String>,
-
-        #[arg(long = "tls-key-path", value_name = "PATH")]
-        tls_key_path: Option<String>,
-
-        #[arg(long, value_enum, default_value_t = ServePlatform::Cli)]
-        platform: ServePlatform,
-
-        #[arg(
-            long = "with-builtin",
-            value_name = "NAME",
-            help = "Add builtin extensions by name (e.g., 'developer' or multiple: 'developer,github')",
-            long_help = "Add one or more builtin extensions that are bundled with goose by specifying their names, comma-separated",
-            value_delimiter = ',',
-            action = clap::ArgAction::Append
-        )]
-        builtins: Vec<String>,
-
-        #[arg(
-            long = "dangerously-unauthenticated",
-            help = "Start the ACP endpoint without requiring GOOSE_SERVER__SECRET_KEY"
-        )]
-        dangerously_unauthenticated: bool,
-
-        #[arg(
-            long = "allowed-origin",
-            value_name = "ORIGIN",
-            action = clap::ArgAction::Append,
-            help = "Allow an exact Origin value for ACP CORS; may be specified multiple times and replaces the default loopback origins"
-        )]
-        allowed_origins: Vec<String>,
     },
 
     /// Start or resume interactive chat sessions
@@ -1098,8 +855,8 @@ enum Command {
         merge: bool,
     },
 
-    /// Recipe utilities for validation and deeplinking
-    #[command(about = "Recipe utilities for validation and deeplinking")]
+    /// Recipe utilities for validation and listing
+    #[command(about = "Recipe utilities for validation and listing")]
     Recipe {
         #[command(subcommand)]
         command: RecipeCommand,
@@ -1117,23 +874,6 @@ enum Command {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
-    },
-
-    /// Manage scheduled jobs
-    #[command(about = "Manage scheduled jobs", visible_alias = "sched")]
-    Schedule {
-        #[command(subcommand)]
-        command: SchedulerCommand,
-    },
-
-    /// Manage gateways for external platform integrations (e.g., Telegram)
-    #[command(
-        about = "Manage gateways for external platform integrations",
-        visible_alias = "gw"
-    )]
-    Gateway {
-        #[command(subcommand)]
-        command: GatewayCommand,
     },
 
     /// Update the goose CLI version
@@ -1466,8 +1206,6 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Herd {}) => "herd",
         Some(Command::Info { .. }) => "info",
         Some(Command::Mcp { .. }) => "mcp",
-        Some(Command::Acp { .. }) => "acp",
-        Some(Command::Serve { .. }) => "serve",
         Some(Command::Session { .. }) => "session",
         Some(Command::Project {}) => "project",
         Some(Command::Worktree { .. }) => "worktree",
@@ -1476,8 +1214,6 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Loop { .. }) => "loop",
         Some(Command::Goal { .. }) => "goal",
         Some(Command::Orch { .. }) => "orch",
-        Some(Command::Gateway { .. }) => "gateway",
-        Some(Command::Schedule { .. }) => "schedule",
         #[cfg(feature = "update")]
         Some(Command::Update { .. }) => "update",
         Some(Command::Recipe { .. }) => "recipe",
@@ -1507,154 +1243,6 @@ async fn handle_mcp_command(server: McpCommand) -> Result<()> {
     Ok(())
 }
 
-struct ServeCommandArgs {
-    host: String,
-
-    port: u16,
-    tls: bool,
-    tls_cert_path: Option<String>,
-    tls_key_path: Option<String>,
-    platform: ServePlatform,
-    builtins: Vec<String>,
-    dangerously_unauthenticated: bool,
-    allowed_origins: Vec<String>,
-}
-
-async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
-    use axum::http::HeaderValue;
-    use goose::acp::server_factory::{AcpServer, AcpServerFactoryConfig};
-    use goose::acp::transport::create_router;
-    use goose::config::paths::Paths;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-    use tracing::{info, warn};
-
-    let ServeCommandArgs {
-        host,
-        port,
-        tls,
-        tls_cert_path,
-        tls_key_path,
-        platform,
-        builtins,
-        dangerously_unauthenticated,
-        allowed_origins,
-    } = args;
-
-    let builtins = if builtins.is_empty() {
-        vec!["developer".to_string()]
-    } else {
-        builtins
-    };
-
-    let additional_source_roots = Config::global()
-        .get_param::<String>("ADDITIONAL_AGENT_SOURCE_ROOTS")
-        .ok()
-        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|path| {
-            let path = path.canonicalize().unwrap_or(path);
-            SourceRoot::read_only(path)
-        })
-        .collect();
-
-    let server = Arc::new(AcpServer::new(AcpServerFactoryConfig {
-        builtins,
-        data_dir: Paths::data_dir(),
-        config_dir: Paths::config_dir(),
-        goose_platform: platform.into(),
-        additional_source_roots,
-        scheduler: None,
-    }));
-    let env_secret = std::env::var(GOOSE_SERVER_SECRET_KEY_ENV)
-        .ok()
-        .map(|secret| secret.trim().to_string())
-        .filter(|secret| !secret.is_empty());
-    let require_token = env_secret.is_some();
-    if !require_token && !dangerously_unauthenticated {
-        anyhow::bail!(
-            "{GOOSE_SERVER_SECRET_KEY_ENV} must be set to start `goose serve`; pass --dangerously-unauthenticated to run without ACP authentication"
-        );
-    }
-    if dangerously_unauthenticated && !require_token {
-        warn!(
-            "{GOOSE_SERVER_SECRET_KEY_ENV} is not set and --dangerously-unauthenticated was passed; the ACP endpoint will accept unauthenticated connections"
-        );
-    }
-    let additional_allowed_origins = allowed_origins
-        .into_iter()
-        .map(|origin| {
-            let origin = origin.trim();
-            if origin.is_empty() || origin == "*" {
-                anyhow::bail!("--allowed-origin must be a non-wildcard Origin value");
-            }
-            HeaderValue::from_str(origin).map_err(|error| {
-                anyhow::anyhow!("invalid --allowed-origin value `{origin}`: {error}")
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let secret_key = env_secret.unwrap_or_else(generate_serve_secret_key);
-    let router = create_router(
-        server,
-        secret_key,
-        require_token,
-        additional_allowed_origins,
-    );
-
-    let config = Config::global();
-    let tls_cert_path =
-        tls_cert_path.or_else(|| config.get_param::<String>("GOOSE_TLS_CERT_PATH").ok());
-    let tls_key_path =
-        tls_key_path.or_else(|| config.get_param::<String>("GOOSE_TLS_KEY_PATH").ok());
-    let tls = tls
-        || config.get_param::<bool>("GOOSE_TLS").unwrap_or(false)
-        || tls_cert_path.is_some()
-        || tls_key_path.is_some();
-
-    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-    if tls {
-        #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
-        {
-            let tls_setup = goose::acp::transport::tls::setup_tls(
-                tls_cert_path.as_deref(),
-                tls_key_path.as_deref(),
-            )
-            .await?;
-            info!("Starting ACP server on https://{}", addr);
-
-            #[cfg(feature = "rustls-tls")]
-            axum_server::bind_rustls(addr, tls_setup.config)
-                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await?;
-
-            #[cfg(feature = "native-tls")]
-            axum_server::bind_openssl(addr, tls_setup.config)
-                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
-                .await?;
-        }
-
-        #[cfg(not(any(feature = "rustls-tls", feature = "native-tls")))]
-        {
-            let _ = (tls_cert_path, tls_key_path);
-            anyhow::bail!(
-                "TLS was requested but no TLS backend is enabled. \
-                 Enable the `rustls-tls` or `native-tls` feature."
-            );
-        }
-    } else {
-        info!("Starting ACP server on http://{}", addr);
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
 async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
     match command {
         SessionCommand::List {
@@ -1677,8 +1265,6 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
             identifier,
             output,
             format,
-            nostr,
-            relays,
         } => {
             let session_manager = SessionManager::instance();
             let session_identifier = if let Some(id) = identifier {
@@ -1696,17 +1282,11 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
                     }
                 }
             };
-            crate::commands::session::handle_session_export(
-                session_identifier,
-                output,
-                format,
-                nostr,
-                relays,
-            )
-            .await?;
+            crate::commands::session::handle_session_export(session_identifier, output, format)
+                .await?;
         }
-        SessionCommand::Import { input, nostr } => {
-            crate::commands::session::handle_session_import(input, nostr).await?;
+        SessionCommand::Import { input } => {
+            crate::commands::session::handle_session_import(input).await?;
         }
         SessionCommand::Diagnostics { identifier, output } => {
             let session_manager = SessionManager::instance();
@@ -2219,43 +1799,6 @@ async fn handle_orch_command(text: String, max_cycles: Option<u32>, merge: bool)
     Ok(())
 }
 
-async fn handle_gateway_command(command: GatewayCommand) -> Result<()> {
-    use crate::commands::gateway;
-
-    match command {
-        GatewayCommand::Status {} => gateway::handle_gateway_status().await,
-        GatewayCommand::Start {
-            gateway_type,
-            bot_token,
-        } => {
-            let platform_config = serde_json::json!({ "bot_token": bot_token });
-            gateway::handle_gateway_start(gateway_type, platform_config).await
-        }
-        GatewayCommand::Stop { gateway_type } => gateway::handle_gateway_stop(gateway_type).await,
-        GatewayCommand::Pair { gateway_type } => gateway::handle_gateway_pair(gateway_type).await,
-    }
-}
-
-async fn handle_schedule_command(command: SchedulerCommand) -> Result<()> {
-    match command {
-        SchedulerCommand::Add {
-            schedule_id,
-            cron,
-            recipe_source,
-            params,
-        } => handle_schedule_add(schedule_id, cron, recipe_source, params).await,
-        SchedulerCommand::List {} => handle_schedule_list().await,
-        SchedulerCommand::Remove { schedule_id } => handle_schedule_remove(schedule_id).await,
-        SchedulerCommand::Sessions { schedule_id, limit } => {
-            handle_schedule_sessions(schedule_id, limit).await
-        }
-        SchedulerCommand::RunNow { schedule_id } => handle_schedule_run_now(schedule_id).await,
-        SchedulerCommand::ServicesStatus {} => handle_schedule_services_status().await,
-        SchedulerCommand::ServicesStop {} => handle_schedule_services_stop().await,
-        SchedulerCommand::CronHelp {} => handle_schedule_cron_help().await,
-    }
-}
-
 fn handle_plugin_subcommand(command: PluginCommand) -> Result<()> {
     match command {
         PluginCommand::Install { url, auto_update } => handle_plugin_install(&url, auto_update),
@@ -2266,17 +1809,6 @@ fn handle_plugin_subcommand(command: PluginCommand) -> Result<()> {
 fn handle_recipe_subcommand(command: RecipeCommand) -> Result<()> {
     match command {
         RecipeCommand::Validate { recipe_name } => handle_validate(&recipe_name),
-        RecipeCommand::Deeplink {
-            recipe_name,
-            params,
-        } => {
-            handle_deeplink(&recipe_name, &params)?;
-            Ok(())
-        }
-        RecipeCommand::Open {
-            recipe_name,
-            params,
-        } => handle_open(&recipe_name, &params),
         RecipeCommand::List { format, verbose } => handle_list(&format, verbose),
     }
 }
@@ -2515,31 +2047,6 @@ pub async fn cli() -> anyhow::Result<()> {
         Some(Command::Herd {}) => crate::commands::herd::handle_herd().await,
         Some(Command::Info { verbose, check }) => handle_info(verbose, check).await,
         Some(Command::Mcp { server }) => handle_mcp_command(server).await,
-        Some(Command::Acp { builtins }) => goose::acp::server::run(builtins).await,
-        Some(Command::Serve {
-            host,
-            port,
-            tls,
-            tls_cert_path,
-            tls_key_path,
-            platform,
-            builtins,
-            dangerously_unauthenticated,
-            allowed_origins,
-        }) => {
-            handle_serve_command(ServeCommandArgs {
-                host,
-                port,
-                tls,
-                tls_cert_path,
-                tls_key_path,
-                platform,
-                builtins,
-                dangerously_unauthenticated,
-                allowed_origins,
-            })
-            .await
-        }
         Some(Command::Session {
             command: Some(cmd), ..
         }) => handle_session_subcommand(cmd).await,
@@ -2626,8 +2133,6 @@ pub async fn cli() -> anyhow::Result<()> {
             max_cycles,
             merge,
         }) => handle_orch_command(text, max_cycles, merge).await,
-        Some(Command::Gateway { command }) => handle_gateway_command(command).await,
-        Some(Command::Schedule { command }) => handle_schedule_command(command).await,
         #[cfg(feature = "update")]
         Some(Command::Update {
             canary,
@@ -2831,35 +2336,6 @@ mod tests {
                 assert!(merge);
             }
             _ => panic!("expected orch command"),
-        }
-    }
-
-    #[test]
-    fn serve_command_accepts_dangerously_unauthenticated_flag() {
-        let cli = Cli::try_parse_from([
-            "goose",
-            "serve",
-            "--dangerously-unauthenticated",
-            "--allowed-origin",
-            "app://localhost",
-            "--allowed-origin",
-            "https://app.example",
-        ])
-        .expect("parse failed");
-
-        match cli.command {
-            Some(Command::Serve {
-                dangerously_unauthenticated,
-                allowed_origins,
-                ..
-            }) => {
-                assert!(dangerously_unauthenticated);
-                assert_eq!(
-                    allowed_origins,
-                    vec!["app://localhost", "https://app.example"]
-                );
-            }
-            _ => panic!("expected serve command"),
         }
     }
 

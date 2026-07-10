@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use tracing::{info, warn};
+use tracing::info;
 use utoipa::ToSchema;
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 14;
@@ -283,6 +283,10 @@ pub(crate) struct SessionListCursor {
     pub(crate) session_id: String,
 }
 
+// Paged session listing is retained for the interactive resume picker; its only
+// former production caller (the ACP session-list surface) was removed, so it is
+// currently exercised only by tests.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct SessionListPage {
     pub(crate) sessions: Vec<Session>,
@@ -297,6 +301,7 @@ pub(crate) struct SessionListFilters<'a> {
     pub(crate) only_sessions_with_messages: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct SessionListPageQuery<'a> {
     pub(crate) filters: SessionListFilters<'a>,
@@ -409,6 +414,7 @@ impl SessionManager {
         self.storage.list_sessions_by_types(Some(types)).await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn list_sessions_paged(
         &self,
         query: SessionListPageQuery<'_>,
@@ -594,7 +600,6 @@ impl SessionManager {
 pub struct SessionStorage {
     pool: Pool<Sqlite>,
     initialized: tokio::sync::OnceCell<()>,
-    session_dir: PathBuf,
 }
 
 pub(crate) fn role_to_string(role: &Role) -> &'static str {
@@ -619,6 +624,7 @@ fn normalized_message_timestamp_sql(column: &str) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn session_sort_at(session: &Session) -> DateTime<Utc> {
     session.last_message_at.unwrap_or(session.updated_at)
 }
@@ -764,12 +770,10 @@ impl SessionStorage {
     }
 
     pub fn new(data_dir: PathBuf) -> Self {
-        let session_dir = data_dir.join(SESSIONS_FOLDER);
-        let db_path = session_dir.join(DB_NAME);
+        let db_path = data_dir.join(SESSIONS_FOLDER).join(DB_NAME);
         Self {
             pool: Self::create_pool(&db_path),
             initialized: tokio::sync::OnceCell::new(),
-            session_dir,
         }
     }
 
@@ -787,9 +791,6 @@ impl SessionStorage {
                     Self::run_migrations(&self.pool).await?;
                 } else {
                     Self::create_schema(&self.pool).await?;
-                    if let Err(e) = Self::import_legacy(&self.pool, &self.session_dir).await {
-                        warn!("Failed to import some legacy sessions: {}", e);
-                    }
                 }
                 Ok::<(), anyhow::Error>(())
             })
@@ -912,118 +913,6 @@ impl SessionStorage {
         // the same transaction.
         crate::providers::inventory::create_tables(pool).await?;
 
-        Ok(())
-    }
-
-    async fn import_legacy(pool: &Pool<Sqlite>, session_dir: &PathBuf) -> Result<()> {
-        use crate::session::legacy;
-
-        let sessions = match legacy::list_sessions(session_dir) {
-            Ok(sessions) => sessions,
-            Err(_) => {
-                warn!("No legacy sessions found to import");
-                return Ok(());
-            }
-        };
-
-        if sessions.is_empty() {
-            return Ok(());
-        }
-
-        let mut imported_count = 0;
-        let mut failed_count = 0;
-
-        for (session_name, session_path) in sessions {
-            match legacy::load_session(&session_name, &session_path) {
-                Ok(session) => match Self::import_legacy_session(pool, &session).await {
-                    Ok(_) => {
-                        imported_count += 1;
-                        info!("  ✓ Imported: {}", session_name);
-                    }
-                    Err(e) => {
-                        failed_count += 1;
-                        info!("  ✗ Failed to import {}: {}", session_name, e);
-                    }
-                },
-                Err(e) => {
-                    failed_count += 1;
-                    info!("  ✗ Failed to load {}: {}", session_name, e);
-                }
-            }
-        }
-
-        info!(
-            "Import complete: {} successful, {} failed",
-            imported_count, failed_count
-        );
-        Ok(())
-    }
-
-    async fn import_legacy_session(pool: &Pool<Sqlite>, session: &Session) -> Result<()> {
-        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-
-        let recipe_json = match &session.recipe {
-            Some(recipe) => Some(serde_json::to_string(recipe)?),
-            None => None,
-        };
-
-        let user_recipe_values_json = match &session.user_recipe_values {
-            Some(user_recipe_values) => Some(serde_json::to_string(user_recipe_values)?),
-            None => None,
-        };
-
-        let model_config_json = match &session.model_config {
-            Some(model_config) => Some(serde_json::to_string(model_config)?),
-            None => None,
-        };
-
-        sqlx::query(
-            r#"
-        INSERT INTO sessions (
-            id, name, user_set_name, session_type, working_dir, created_at, updated_at, extension_data,
-            total_tokens, input_tokens, output_tokens,
-            cache_read_tokens, cache_write_tokens,
-            accumulated_total_tokens, accumulated_input_tokens, accumulated_output_tokens,
-            accumulated_cache_read_tokens, accumulated_cache_write_tokens,
-            accumulated_cost,
-            schedule_id, recipe_json, user_recipe_values_json,
-            provider_name, model_config_json, goose_mode
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-        )
-        .bind(&session.id)
-        .bind(&session.name)
-        .bind(session.user_set_name)
-        .bind(session.session_type.to_string())
-        .bind(&*session.working_dir.to_string_lossy())
-        .bind(session.created_at)
-        .bind(session.updated_at)
-        .bind(serde_json::to_string(&session.extension_data)?)
-        .bind(session.usage.total_tokens)
-        .bind(session.usage.input_tokens)
-        .bind(session.usage.output_tokens)
-        .bind(session.usage.cache_read_input_tokens)
-        .bind(session.usage.cache_write_input_tokens)
-        .bind(session.accumulated_usage.total_tokens)
-        .bind(session.accumulated_usage.input_tokens)
-        .bind(session.accumulated_usage.output_tokens)
-        .bind(session.accumulated_usage.cache_read_input_tokens)
-        .bind(session.accumulated_usage.cache_write_input_tokens)
-        .bind(session.accumulated_cost)
-        .bind(&session.schedule_id)
-        .bind(recipe_json)
-        .bind(user_recipe_values_json)
-        .bind(&session.provider_name)
-        .bind(model_config_json)
-        .bind(session.goose_mode.to_string())
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        if let Some(conversation) = &session.conversation {
-            Self::replace_conversation_inner(pool, &session.id, conversation).await?;
-        }
         Ok(())
     }
 
@@ -1796,6 +1685,7 @@ impl SessionStorage {
         .await
     }
 
+    #[allow(dead_code)]
     async fn list_sessions_paged(
         &self,
         query: SessionListPageQuery<'_>,

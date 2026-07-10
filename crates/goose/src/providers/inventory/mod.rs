@@ -159,6 +159,9 @@ pub struct RefreshSkip {
 #[derive(Debug, Clone)]
 pub(crate) struct RefreshJob {
     pub provider_id: String,
+    // The DB-backed model-inventory refresh service is dead after the ACP server
+    // surface removal; its full excision is deferred to the stage-5 provider pass.
+    #[allow(dead_code)]
     pub identity: InventoryIdentity,
 }
 
@@ -193,12 +196,14 @@ pub struct ProviderInventoryService {
     refreshing_keys: Arc<RwLock<HashSet<String>>>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct RefreshGuard {
     inventory_key: String,
     refreshing_keys: Arc<RwLock<HashSet<String>>>,
     completed: bool,
 }
 
+#[allow(dead_code)]
 impl RefreshGuard {
     /// Mark the refresh as finished and remove its inventory key from the
     /// refreshing-keys set. `RefreshGuard` is the single owner of refresh-key
@@ -580,6 +585,7 @@ impl ProviderInventoryService {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn refresh_guard(&self, identity: &InventoryIdentity) -> RefreshGuard {
         RefreshGuard {
             inventory_key: identity.inventory_key.clone(),
@@ -588,6 +594,7 @@ impl ProviderInventoryService {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn refresh_with_provider(
         &self,
         provider_name: &str,
@@ -846,6 +853,7 @@ impl ProviderInventoryService {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn ensure_refresh_identity_current(
     provider_id: &str,
     planned_identity: &InventoryIdentity,

@@ -251,7 +251,6 @@ impl ProviderFixture {
         let agent = Agent::with_config(AgentConfig::new(
             session_manager.clone(),
             permission_manager,
-            None,
             mode,
             true,
             GoosePlatform::GooseCli,

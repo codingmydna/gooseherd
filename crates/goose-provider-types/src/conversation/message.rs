@@ -119,10 +119,9 @@ impl ToolRequest {
     }
 
     /// Returns the persisted LLM-generated title for this tool call, if any.
-    /// Set asynchronously by [`crate::acp::server`] after `provider.complete_fast`
-    /// resolves; survives session reload via SQLite. Falls back to `None` for
-    /// older sessions that predate persistence — callers should use a deterministic
-    /// title in that case.
+    /// Set asynchronously after `provider.complete_fast` resolves; survives session
+    /// reload via SQLite. Falls back to `None` for older sessions that predate
+    /// persistence — callers should use a deterministic title in that case.
     pub fn persisted_title(&self) -> Option<&str> {
         self.tool_meta
             .as_ref()
@@ -132,8 +131,7 @@ impl ToolRequest {
 
     /// Returns the persisted per-chain summary anchored on this tool request,
     /// if any. Only the FIRST tool request in a chain (a run of consecutive
-    /// tool blocks within one assistant message) carries this. See
-    /// [`crate::acp::server`] for how chains are detected and summarized.
+    /// tool blocks within one assistant message) carries this.
     pub fn persisted_chain_summary(&self) -> Option<PersistedChainSummary> {
         let obj = self
             .tool_meta
