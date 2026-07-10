@@ -6,6 +6,7 @@ use rustyline::validate::Validator;
 use rustyline::{Context, Helper, Result};
 use std::borrow::Cow;
 use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::sync::Arc;
 use strum::VariantNames;
 
@@ -67,6 +68,80 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Configure Shift+Enter newline for this terminal",
     ),
 ];
+
+const FILE_MENTION_LIMIT: usize = 50;
+
+fn at_mention_token(line: &str) -> Option<(usize, &str)> {
+    let token_start = line
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let token = line.get(token_start..)?;
+
+    token.starts_with('@').then_some((token_start, token))
+}
+
+fn file_mention_candidates(root: &Path, token: &str) -> Vec<Pair> {
+    let path_query = token.strip_prefix('@').unwrap_or(token);
+    let (dir_part, name_query) = path_query.rfind('/').map_or(("", path_query), |separator| {
+        path_query.split_at(separator + 1)
+    });
+    let base = root.join(dir_part);
+    if !base.is_dir() {
+        return Vec::new();
+    }
+
+    let mut builder = ignore::WalkBuilder::new(&base);
+    builder.max_depth(Some(1));
+    builder.git_ignore(true);
+    builder.git_exclude(true);
+    builder.git_global(true);
+    builder.require_git(false);
+    builder.ignore(true);
+    builder.hidden(false);
+
+    let lowercase_query = name_query.to_lowercase();
+    let mut matches: Vec<(String, bool)> = builder
+        .build()
+        .flatten()
+        .filter(|entry| entry.path() != base)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            if name == ".git" || !name.to_lowercase().contains(&lowercase_query) {
+                return None;
+            }
+
+            Some((
+                name.into_owned(),
+                entry
+                    .file_type()
+                    .is_some_and(|file_type| file_type.is_dir()),
+            ))
+        })
+        .collect();
+
+    matches.sort_by(|(left_name, left_is_dir), (right_name, right_is_dir)| {
+        right_is_dir.cmp(left_is_dir).then_with(|| {
+            left_name
+                .to_lowercase()
+                .cmp(&right_name.to_lowercase())
+                .then_with(|| left_name.cmp(right_name))
+        })
+    });
+    matches.truncate(FILE_MENTION_LIMIT);
+
+    matches
+        .into_iter()
+        .map(|(name, is_dir)| {
+            let suffix = if is_dir { "/" } else { "" };
+            Pair {
+                display: format!("{name}{suffix}"),
+                replacement: format!("@{dir_part}{name}{suffix}"),
+            }
+        })
+        .collect()
+}
 
 fn slash_command_candidates(token: &str, limit: usize) -> Vec<(&'static str, &'static str)> {
     let query = token.trim_start_matches('/');
@@ -560,6 +635,11 @@ impl GooseCompleter {
 
         Ok((line.len(), vec![]))
     }
+
+    fn complete_file_mention(&self, token_start: usize, token: &str) -> Result<(usize, Vec<Pair>)> {
+        let root = std::env::current_dir().unwrap_or_default();
+        Ok((token_start, file_mention_candidates(root.as_path(), token)))
+    }
 }
 
 impl Completer for GooseCompleter {
@@ -658,6 +738,10 @@ impl Completer for GooseCompleter {
             }
 
             return Ok((pos, vec![]));
+        }
+
+        if let Some((token_start, token)) = at_mention_token(line) {
+            return self.complete_file_mention(token_start, token);
         }
 
         // For normal text (not slash commands), try file path completion
@@ -783,7 +867,9 @@ mod tests {
 
     use super::*;
     use crate::session::output;
+    use std::fs;
     use std::sync::{Arc, RwLock};
+    use tempfile::TempDir;
 
     // Helper function to create a test completion cache
     fn create_test_cache() -> Arc<RwLock<CompletionCache>> {
@@ -851,6 +937,121 @@ mod tests {
         ];
 
         Arc::new(RwLock::new(cache))
+    }
+
+    fn create_file_mention_fixture() -> TempDir {
+        let fixture = tempfile::tempdir().unwrap();
+        fs::create_dir_all(fixture.path().join("src")).unwrap();
+        fs::create_dir_all(fixture.path().join("docs")).unwrap();
+        fs::create_dir_all(fixture.path().join("target/debug")).unwrap();
+        fs::create_dir_all(fixture.path().join(".git")).unwrap();
+        fs::create_dir_all(fixture.path().join(".github/workflows")).unwrap();
+        fs::write(fixture.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(fixture.path().join("src/lib.rs"), "").unwrap();
+        fs::write(fixture.path().join("README.md"), "read me\n").unwrap();
+        fs::write(fixture.path().join("target/debug/foo"), "").unwrap();
+        fs::write(fixture.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(fixture.path().join(".github/workflows/ci.yml"), "").unwrap();
+        fs::write(fixture.path().join(".gitignore"), "target/\n").unwrap();
+        fixture
+    }
+
+    #[test]
+    fn recognizes_at_mention_as_the_last_token() {
+        assert_eq!(at_mention_token("look at @src"), Some((8, "@src")));
+        assert_eq!(at_mention_token("@src"), Some((0, "@src")));
+        assert_eq!(at_mention_token("mail a@b.com"), None);
+        assert_eq!(at_mention_token("hello "), None);
+    }
+
+    #[test]
+    fn file_mentions_sort_directories_first_and_append_slashes() {
+        let fixture = create_file_mention_fixture();
+        let candidates = file_mention_candidates(fixture.path(), "@");
+        let replacements: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.replacement.as_str())
+            .collect();
+
+        assert_eq!(
+            replacements,
+            vec!["@.github/", "@docs/", "@src/", "@.gitignore", "@README.md"]
+        );
+        assert_eq!(candidates[1].display, "docs/");
+    }
+
+    #[test]
+    fn file_mentions_continue_inside_directories() {
+        let fixture = create_file_mention_fixture();
+        let candidates = file_mention_candidates(fixture.path(), "@src/ma");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "@src/main.rs");
+    }
+
+    #[test]
+    fn file_mentions_respect_gitignore_and_exclude_git_directory() {
+        let fixture = create_file_mention_fixture();
+        let replacements: Vec<_> = file_mention_candidates(fixture.path(), "@")
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect();
+
+        assert!(!replacements.iter().any(|candidate| candidate == "@target/"));
+        assert!(!replacements.iter().any(|candidate| candidate == "@.git/"));
+        assert!(replacements
+            .iter()
+            .any(|candidate| candidate == "@.github/"));
+    }
+
+    #[test]
+    fn file_mentions_are_deterministically_sorted_and_limited() {
+        let fixture = tempfile::tempdir().unwrap();
+        for index in (0..60).rev() {
+            fs::write(fixture.path().join(format!("f{index:02}")), "").unwrap();
+        }
+
+        let first: Vec<_> = file_mention_candidates(fixture.path(), "@")
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect();
+        let second: Vec<_> = file_mention_candidates(fixture.path(), "@")
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect();
+
+        assert_eq!(first.len(), FILE_MENTION_LIMIT);
+        assert_eq!(first, second);
+        assert_eq!(first.first().map(String::as_str), Some("@f00"));
+        assert_eq!(first.last().map(String::as_str), Some("@f49"));
+    }
+
+    #[test]
+    fn file_mentions_match_case_insensitive_substrings() {
+        let fixture = create_file_mention_fixture();
+
+        let root_matches = file_mention_candidates(fixture.path(), "@readme");
+        assert_eq!(root_matches[0].replacement, "@README.md");
+
+        let nested_matches = file_mention_candidates(fixture.path(), "@src/AIN");
+        assert_eq!(nested_matches[0].replacement, "@src/main.rs");
+    }
+
+    #[test]
+    fn non_at_input_keeps_existing_slash_completion() {
+        let completer = GooseCompleter::new(create_test_cache());
+        let history = rustyline::history::DefaultHistory::new();
+        let context = Context::new(&history);
+        let candidates = completer.complete("/mo", "/mo".len(), &context).unwrap().1;
+
+        assert_eq!(at_mention_token("plain text"), None);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.replacement.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/mode ", "/model "]
+        );
     }
 
     #[test]
