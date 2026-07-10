@@ -29,11 +29,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_weather_tool() -> Result<()> {
-        // Google tells me it only knows about the weather in the US, so we skip it.
         run_scenario(
             "weather_tool",
             text("tell me what the weather is in Berlin, Germany"),
-            Some(&["Google"]),
+            None,
             |result| {
                 assert!(result.error.is_none());
 
@@ -59,12 +58,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_image_analysis() -> Result<()> {
-        // Google says it doesn't know about images, the other providers complain about
-        // the image format, so we only run this for OpenAI and Anthropic.
+        // groq complains about the image format, so we only run this for OpenAI and Anthropic.
         run_scenario(
             "image_analysis",
             image("What do you see in this image?", "test_image"),
-            Some(&["Google", "azure_openai", "groq"]),
+            Some(&["groq"]),
             |result| {
                 assert!(result.error.is_none());
                 let last_message = result.last_message()?;

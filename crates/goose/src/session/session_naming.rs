@@ -8,6 +8,10 @@ use crate::{providers::base::Provider, utils::safe_truncate};
 
 pub static MSG_COUNT_FOR_SESSION_NAME_GENERATION: usize = 3;
 
+const SESSION_NAME_BEGIN_MARKER: &str = "---BEGIN USER MESSAGES---";
+const SESSION_NAME_END_MARKER: &str = "---END USER MESSAGES---";
+const SESSION_NAME_SUFFIX: &str = "Generate a short title for the above messages.";
+
 fn strip_xml_tags(text: &str) -> String {
     static BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?s)<([a-zA-Z][a-zA-Z0-9_]*)[^>]*>.*?</[a-zA-Z][a-zA-Z0-9_]*>").unwrap()
@@ -122,10 +126,6 @@ pub(crate) async fn generate_session_name(
         "session_name.md",
         &std::collections::HashMap::<String, String>::new(),
     )?;
-
-    use crate::providers::cli_common::{
-        SESSION_NAME_BEGIN_MARKER, SESSION_NAME_END_MARKER, SESSION_NAME_SUFFIX,
-    };
 
     let preprompt_section = if preprompt_context.is_empty() {
         String::new()

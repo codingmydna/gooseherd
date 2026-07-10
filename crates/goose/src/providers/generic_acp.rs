@@ -12,7 +12,6 @@ use crate::acp::{
 use crate::config::search_path::SearchPaths;
 use crate::config::{Config, ConfigError, ExtensionConfig, GooseMode};
 use crate::providers::base::{current_working_dir, Provider, ProviderMetadata, ProviderType};
-use crate::providers::inventory::{InventoryIdentityInput, InventoryRegistration};
 use crate::providers::provider_registry::{ProviderConstructor, ProviderRegistry};
 
 pub const GOOSE_ACP_AGENTS_KEY: &str = "GOOSE_ACP_AGENTS";
@@ -189,7 +188,6 @@ pub fn register_generic_acp_providers_from_agents(
         };
 
         let metadata = generic_acp_metadata(key);
-        let inventory = generic_acp_inventory(provider_name.clone(), program.clone());
         let constructor = generic_acp_constructor(
             provider_name,
             program,
@@ -197,24 +195,11 @@ pub fn register_generic_acp_providers_from_agents(
             spec.env().clone(),
             spec.env_remove().to_vec(),
         );
-        registry.register_acp_agent(metadata, ProviderType::Custom, Some(inventory), constructor);
+        registry.register_acp_agent(metadata, ProviderType::Custom, constructor);
         registered += 1;
     }
 
     registered
-}
-
-fn generic_acp_inventory(provider_name: String, program: String) -> InventoryRegistration {
-    let identity_provider_name = provider_name.clone();
-    let identity_program = program.clone();
-    InventoryRegistration::new(false, move || {
-        let resolved_command = resolve_acp_program(&identity_program)?;
-        Ok(
-            InventoryIdentityInput::new(&identity_provider_name, &identity_provider_name)
-                .with_public("command", resolved_command.display().to_string()),
-        )
-    })
-    .with_configured(move || resolve_acp_program(&program).is_ok())
 }
 
 fn generic_acp_constructor(

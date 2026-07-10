@@ -1,6 +1,5 @@
 use super::api_client::TlsConfig;
 use super::base::{ConfigKey, ModelInfo, Provider, ProviderDef, ProviderMetadata, ProviderType};
-use super::inventory::{InventoryIdentityInput, InventoryRegistration, InventoryResolvers};
 use crate::config::{DeclarativeProviderConfig, ExtensionConfig};
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -21,15 +20,41 @@ pub type ProviderConstructor = Arc<
 
 pub type ProviderCleanup = Arc<dyn Fn() -> BoxFuture<'static, Result<()>> + Send + Sync>;
 
+/// Actionable guidance for a provider name that gooseherd removed. Returns
+/// `None` for names that were never a gooseherd provider (genuine typos).
+pub fn removed_provider_hint(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "claude-code" => "use 'claude-acp' instead (run `goose herd` to install the adapter)",
+        "codex" | "chatgpt_codex" => {
+            "use 'codex-acp' instead (run `goose herd` to install the adapter)"
+        }
+        "github_copilot" => "use 'copilot-acp' instead (run `goose herd` to install the adapter)",
+        "gemini-cli" | "gemini_oauth" => {
+            "use an ACP agent (set GOOSE_ACP_AGENTS to run `gemini --acp`)"
+        }
+        "cursor-agent" => "use an ACP agent via GOOSE_ACP_AGENTS",
+        "litellm" | "tetrate" | "nano-gpt" | "avian" | "azure_openai" | "databricks"
+        | "databricks_v2" | "snowflake" | "huggingface" | "gcp_vertex_ai" | "google" | "xai"
+        | "xai_oauth" | "kimi_code" | "bedrock" | "sagemaker" => {
+            "add a custom provider JSON in ~/.config/goose/custom_providers/ (openai-compatible)"
+        }
+        _ => return None,
+    })
+}
+
+/// Build a removed-provider error for a name that used to resolve, or `None`
+/// when the name was never a known provider.
+pub fn removed_provider_error(name: &str) -> Option<anyhow::Error> {
+    removed_provider_hint(name)
+        .map(|hint| anyhow::anyhow!("provider '{name}' was removed in gooseherd — {hint}"))
+}
+
 #[derive(Clone)]
 pub struct ProviderEntry {
     metadata: ProviderMetadata,
     pub(crate) constructor: ProviderConstructor,
-    pub(crate) inventory_identity: super::inventory::InventoryIdentityResolver,
-    pub(crate) inventory_configured: super::inventory::InventoryConfiguredResolver,
     pub(crate) cleanup: Option<ProviderCleanup>,
     provider_type: ProviderType,
-    supports_inventory_refresh: bool,
     tls_config: Option<TlsConfig>,
 }
 
@@ -40,18 +65,6 @@ impl ProviderEntry {
 
     pub fn provider_type(&self) -> ProviderType {
         self.provider_type
-    }
-
-    pub fn supports_inventory_refresh(&self) -> bool {
-        self.supports_inventory_refresh
-    }
-
-    pub fn inventory_identity(&self) -> Result<InventoryIdentityInput> {
-        (self.inventory_identity)()
-    }
-
-    pub fn inventory_configured(&self) -> bool {
-        (self.inventory_configured)()
     }
 
     /// Apply provider-specific normalization to a model config: materialize
@@ -114,20 +127,8 @@ impl ProviderRegistry {
     where
         F: ProviderDef + 'static,
     {
-        self.register_with_inventory::<F>(preferred, None);
-    }
-
-    pub fn register_with_inventory<F>(
-        &mut self,
-        preferred: bool,
-        inventory_registration: Option<InventoryRegistration>,
-    ) where
-        F: ProviderDef + 'static,
-    {
         let metadata = F::metadata();
         let name = metadata.name.clone();
-
-        let inventory = InventoryResolvers::for_metadata(&metadata, inventory_registration);
 
         self.entries.insert(
             name,
@@ -145,15 +146,12 @@ impl ProviderRegistry {
                         Ok(Arc::new(provider) as Arc<dyn Provider>)
                     })
                 }),
-                inventory_identity: inventory.identity,
-                inventory_configured: inventory.configured,
                 cleanup: None,
                 provider_type: if preferred {
                     ProviderType::Preferred
                 } else {
                     ProviderType::Builtin
                 },
-                supports_inventory_refresh: inventory.supports_refresh,
                 tls_config: self.tls_config.clone(),
             },
         );
@@ -163,85 +161,29 @@ impl ProviderRegistry {
         &mut self,
         metadata: ProviderMetadata,
         provider_type: ProviderType,
-        inventory_registration: Option<InventoryRegistration>,
         constructor: ProviderConstructor,
     ) {
         let name = metadata.name.clone();
-        let inventory = InventoryResolvers::for_metadata(&metadata, inventory_registration);
-
         self.entries.insert(
             name,
             ProviderEntry {
                 metadata,
                 constructor,
-                inventory_identity: inventory.identity,
-                inventory_configured: inventory.configured,
                 cleanup: None,
                 provider_type,
-                supports_inventory_refresh: inventory.supports_refresh,
                 tls_config: self.tls_config.clone(),
             },
         );
     }
 
-    pub fn register_with_name<P, F, G>(
+    pub fn register_with_name<P, F>(
         &mut self,
         config: &DeclarativeProviderConfig,
         provider_type: ProviderType,
-        supports_inventory_refresh: bool,
         constructor: F,
-        inventory_identity: G,
     ) where
         P: ProviderDef + 'static,
         F: Fn(Option<TlsConfig>) -> Result<P::Provider> + Send + Sync + 'static,
-        G: Fn() -> Result<InventoryIdentityInput> + Send + Sync + 'static,
-    {
-        self.register_with_name_impl::<P, F, G>(
-            config,
-            provider_type,
-            supports_inventory_refresh,
-            constructor,
-            inventory_identity,
-            None,
-        );
-    }
-
-    pub fn register_with_name_and_inventory_configured<P, F, G, H>(
-        &mut self,
-        config: &DeclarativeProviderConfig,
-        provider_type: ProviderType,
-        supports_inventory_refresh: bool,
-        constructor: F,
-        inventory_identity: G,
-        inventory_configured: H,
-    ) where
-        P: ProviderDef + 'static,
-        F: Fn(Option<TlsConfig>) -> Result<P::Provider> + Send + Sync + 'static,
-        G: Fn() -> Result<InventoryIdentityInput> + Send + Sync + 'static,
-        H: Fn() -> bool + Send + Sync + 'static,
-    {
-        self.register_with_name_impl::<P, F, G>(
-            config,
-            provider_type,
-            supports_inventory_refresh,
-            constructor,
-            inventory_identity,
-            Some(Arc::new(inventory_configured)),
-        );
-    }
-
-    fn register_with_name_impl<P, F, G>(
-        &mut self,
-        config: &DeclarativeProviderConfig,
-        provider_type: ProviderType,
-        supports_inventory_refresh: bool,
-        constructor: F,
-        inventory_identity: G,
-        inventory_configured: Option<super::inventory::InventoryConfiguredResolver>,
-    ) where
-        P: ProviderDef + 'static,
-        F: Fn(Option<TlsConfig>) -> Result<P::Provider> + Send + Sync + 'static,
-        G: Fn() -> Result<InventoryIdentityInput> + Send + Sync + 'static,
     {
         let base_metadata = P::metadata();
         let description = config
@@ -324,13 +266,6 @@ impl ProviderRegistry {
             model_selection_hint: None,
             fast_model: config.fast_model.clone(),
         };
-        let inventory_config_keys = custom_metadata.config_keys.clone();
-        let default_inventory_configured = Arc::new(move || {
-            super::inventory::default_inventory_configured(
-                &inventory_config_keys,
-                crate::config::Config::global(),
-            )
-        });
 
         self.entries.insert(
             config.name.clone(),
@@ -343,11 +278,8 @@ impl ProviderRegistry {
                         Ok(Arc::new(provider) as Arc<dyn Provider>)
                     })
                 }),
-                inventory_identity: Arc::new(inventory_identity),
-                inventory_configured: inventory_configured.unwrap_or(default_inventory_configured),
                 cleanup: None,
                 provider_type,
-                supports_inventory_refresh,
                 tls_config: self.tls_config.clone(),
             },
         );
@@ -372,10 +304,10 @@ impl ProviderRegistry {
         name: &str,
         extensions: Vec<ExtensionConfig>,
     ) -> Result<Arc<dyn Provider>> {
-        let entry = self
-            .entries
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown provider: {}", name))?;
+        let entry = self.entries.get(name).ok_or_else(|| {
+            removed_provider_error(name)
+                .unwrap_or_else(|| anyhow::anyhow!("Unknown provider: {}", name))
+        })?;
 
         entry.create(extensions).await
     }
@@ -424,24 +356,21 @@ mod tests {
     }
 
     #[test]
-    fn register_with_name_can_override_inventory_configured() {
+    fn register_with_name_uses_config_name() {
         let mut registry = ProviderRegistry::new(None);
-        registry.register_with_name_and_inventory_configured::<OpenAiProviderDef, _, _, _>(
+        registry.register_with_name::<OpenAiProviderDef, _>(
             &test_config(),
             ProviderType::Declarative,
-            false,
             |_| unreachable!("constructor is not used by this test"),
-            || Ok(InventoryIdentityInput::new("custom_hf", "huggingface")),
-            || false,
         );
 
         let entry = registry.entries.get("custom_hf").unwrap();
-
-        assert!(!entry.inventory_configured());
+        assert_eq!(entry.metadata().name, "custom_hf");
+        assert_eq!(entry.provider_type(), ProviderType::Declarative);
     }
 
     #[test]
-    fn register_acp_agent_uses_runtime_metadata_and_inventory() {
+    fn register_acp_agent_uses_runtime_metadata() {
         let mut registry = ProviderRegistry::new(None);
         let metadata = ProviderMetadata::new(
             "gemini-acp",
@@ -456,22 +385,27 @@ mod tests {
             Box::pin(async { unreachable!("constructor is not used by this test") })
         });
 
-        registry.register_acp_agent(
-            metadata,
-            ProviderType::Custom,
-            Some(InventoryRegistration::new(false, || {
-                Ok(InventoryIdentityInput::new("gemini-acp", "gemini-acp"))
-            })),
-            constructor,
-        );
+        registry.register_acp_agent(metadata, ProviderType::Custom, constructor);
 
         let entry = registry.entries.get("gemini-acp").unwrap();
         assert_eq!(entry.metadata().display_name, "Gemini (ACP)");
         assert_eq!(entry.provider_type(), ProviderType::Custom);
-        assert!(!entry.supports_inventory_refresh());
-        assert_eq!(
-            entry.inventory_identity().unwrap().provider_id,
-            "gemini-acp"
-        );
+    }
+
+    #[test]
+    fn removed_provider_names_map_to_actionable_hints() {
+        assert!(removed_provider_hint("claude-code")
+            .unwrap()
+            .contains("claude-acp"));
+        assert!(removed_provider_hint("chatgpt_codex")
+            .unwrap()
+            .contains("codex-acp"));
+        assert!(removed_provider_hint("github_copilot")
+            .unwrap()
+            .contains("copilot-acp"));
+        assert!(removed_provider_hint("databricks")
+            .unwrap()
+            .contains("custom_providers"));
+        assert!(removed_provider_hint("not-a-real-provider").is_none());
     }
 }

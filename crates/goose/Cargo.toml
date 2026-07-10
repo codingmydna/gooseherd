@@ -24,7 +24,6 @@ rustls-tls = [
     "reqwest/rustls",
     "rmcp/reqwest",
     "sqlx/runtime-tokio-rustls",
-    "jsonwebtoken/aws_lc_rs",
     "oauth2/reqwest",
     "oauth2/rustls-tls",
     "goose-providers/rustls-tls",
@@ -34,7 +33,6 @@ native-tls = [
     "reqwest/native-tls",
     "rmcp/reqwest-native-tls",
     "sqlx/runtime-tokio-native-tls",
-    "jsonwebtoken/rust_crypto",
     "oauth2/reqwest",
     "oauth2/native-tls",
     "goose-providers/native-tls",
@@ -112,9 +110,6 @@ sqlx = { version = "0.8.5", default-features = false, features = [
     "migrate",
 ] }
 
-# For GCP Vertex AI provider auth
-jsonwebtoken = { version = "10.2", default-features = false, features = ["use_pem"] }
-
 blake3 = { version = "1", default-features = false, features = ["std"] }
 fs2 = { workspace = true }
 tokio-stream = { workspace = true, features = ["io-util"] }
@@ -187,15 +182,6 @@ goose-mcp = { path = "../goose-mcp", default-features = false }
 insta = { version = "1", default-features = false }
 dtor = { version = "1.0.5", default-features = false, features = ["proc_macro"] }
 tower = { version = "0.5.2", default-features = false, features = ["util"] }
-jsonwebtoken = { version = "10.2", default-features = false, features = ["rust_crypto"] }
-
-[[example]]
-name = "agent"
-path = "examples/agent.rs"
-
-[[example]]
-name = "databricks_oauth"
-path = "examples/databricks_oauth.rs"
 
 [[bin]]
 name = "analyze_cli"

@@ -139,35 +139,20 @@ mod tests {
             Some("http://localhost:11434")
         );
 
-        let databricks = entries
-            .iter()
-            .find(|entry| entry.provider_id == "databricks")
-            .expect("setup catalog should include databricks");
-        assert_eq!(
-            databricks.setup_method,
-            ProviderSetupMethod::HostWithOauthFallback
-        );
-        assert_eq!(
-            databricks
-                .fields
+        // Removed providers must not surface in the setup catalog (pickers show
+        // only surviving providers), even though the canonical catalog retains
+        // their inert template data.
+        assert!(
+            !entries
                 .iter()
-                .map(|field| field.key.as_str())
-                .collect::<Vec<_>>(),
-            ["DATABRICKS_HOST", "DATABRICKS_TOKEN"]
+                .any(|entry| entry.provider_id == "databricks"),
+            "removed provider databricks should be absent from the setup catalog"
         );
-
-        let huggingface = entries
-            .iter()
-            .find(|entry| entry.provider_id == "huggingface")
-            .expect("setup catalog should include huggingface");
-        assert_eq!(huggingface.setup_method, ProviderSetupMethod::SingleApiKey);
-        assert_eq!(
-            huggingface
-                .fields
+        assert!(
+            !entries
                 .iter()
-                .map(|field| field.key.as_str())
-                .collect::<Vec<_>>(),
-            ["HF_TOKEN"]
+                .any(|entry| entry.provider_id == "huggingface"),
+            "removed provider huggingface should be absent from the setup catalog"
         );
 
         let atomic_chat = entries

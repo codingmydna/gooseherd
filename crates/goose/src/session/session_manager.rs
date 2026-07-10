@@ -908,11 +908,6 @@ impl SessionStorage {
 
         tx.commit().await?;
 
-        // The inventory tables already use `CREATE TABLE IF NOT EXISTS`
-        // and run on the shared pool, so they don't need to be inside
-        // the same transaction.
-        crate::providers::inventory::create_tables(pool).await?;
-
         Ok(())
     }
 
@@ -1153,7 +1148,10 @@ impl SessionStorage {
                     .await?;
             }
             11 => {
-                crate::providers::inventory::create_tables_in_tx(tx).await?;
+                // Migration 11 formerly created the provider-inventory tables.
+                // gooseherd removed the inventory service; existing DBs keep the
+                // now-inert tables and new DBs simply skip this step. The arm is
+                // retained as a no-op so the schema version counter stays aligned.
             }
             12 => {
                 // Add archived_at, project_id columns to sessions.
