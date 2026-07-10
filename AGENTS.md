@@ -1,117 +1,79 @@
 # AGENTS Instructions
 
-goose is an AI agent framework in Rust with CLI and Electron desktop interfaces.
+gooseherd is a CLI-first multi-model orchestration harness (a fork of goose): an
+expensive frontier model plans and reviews, cheaper models implement, and machine
+gates verify — over ACP-driven vendor CLIs (claude-acp, codex-acp, any agent via
+one config entry) and native OpenAI/Anthropic-compatible APIs. Desktop app, web
+UI, and hosted services are non-goals.
 
-## Setup
-```bash
-source bin/activate-hermit
-cargo build
-```
+## Crate map
 
-## Commands
+The trim is staged and in progress per `docs/overhaul-2026-07.md`; this is the
+target layout, and some crates below still exist mid-trim.
 
-### Build
-```bash
-cargo build                   # debug
-cargo build --release         # release  
-just release-binary           # release binary
-```
-
-### Test
-```bash
-cargo test                   # all tests
-cargo test -p goose          # specific crate
-cargo test --package goose --test mcp_integration_test
-just record-mcp-tests        # record MCP
-```
-
-### Lint/Format
-```bash
-cargo fmt
-cargo clippy --all-targets -- -D warnings
-```
-
-### UI
-```bash
-just run-ui                  # start desktop
-cd ui/desktop && pnpm run typecheck
-cd ui/desktop && pnpm test   # test UI
-```
-
-## Structure
 ```
 crates/
-├── goose              # core logic
-├── goose-acp-macros   # ACP proc macros
-├── goose-cli          # CLI entry
-├── goose-mcp          # MCP extensions
-├── goose-test         # test utilities
-└── goose-test-support # test helpers
-
-ui/desktop/            # Electron app
+├── goose               # core: agents, providers, ACP client, sessions, extensions
+├── goose-cli           # CLI entry, orchestrate/arena/goal/loop, TUI rendering
+├── goose-providers     # provider implementations
+├── goose-provider-types# shared provider/model types + canonical model registry
+├── goose-mcp           # MCP extensions — memory only after the trim
+├── goose-test          # test tooling (MCP replay recorder)
+├── goose-test-support  # shared test helpers
+└── goose-sdk-types     # shared serializable types
 ```
 
-## Development Loop
+## Key entry points
+
+- `crates/goose-cli/src/cli.rs` — CLI argument surface and command dispatch.
+- `crates/goose-cli/src/session/orchestrate/` — the plan → implement → review loop:
+  `runner` (drives a run), `phases`, `planner`, `roles`, `gates` (machine gates),
+  `workspace` (per-run git worktree).
+- `crates/goose-cli/src/session/{arena,goal,looping,exemplars}.rs` — blind
+  multi-model arena, goal loop, `/loop`, and exemplar hill-climbing.
+- `crates/goose/src/acp/provider.rs` — the ACP client (product core) plus the
+  orch implement permission policy.
+- `crates/goose/src/agents/agent.rs` — the agent loop.
+
+## Build / test / lint
+
+Plain cargo, no hermit. `just` wraps the common tasks (run `just` to list them).
+
 ```bash
-# 1. source bin/activate-hermit
-# 2. Make changes
-# 3. cargo fmt
+cargo build                                                        # just build
+cargo build --release -p goose-cli                                 # just release
+cargo test                                                         # just test
+cargo fmt                                                          # just fmt
+cargo clippy --workspace --all-targets --exclude v8 -- -D warnings # just lint
 ```
 
-### Run these only if the user has asked you to build/test your changes:
-```
-# 1. cargo build
-# 2. cargo test -p <crate>
-# 3. cargo clippy --all-targets -- -D warnings
-```
+`just install` builds the release binary and copies it to `~/.local/bin/goose`.
+Run build/test/clippy only when asked to verify a change.
 
-## Rules
+## Machine gates
 
-- Test: Prefer tests/ folder, e.g. crates/goose/tests/
-- Test: When adding features, update goose-self-test.yaml, rebuild, then run `goose run --recipe goose-self-test.yaml` to validate
-- Error: Use anyhow::Result
-- Provider: Implement Provider trait see providers/base.rs
-- MCP: Extensions in crates/goose-mcp/
-- UI Desktop: Use ACP SDK types or local `src/types/*` types. Do not import generated OpenAPI types/client code from `ui/desktop/src/api`
+Configured quality gates run before the reviewer is called and bounce mechanical
+failures straight back to the implementer. `.goose-gates.yaml` at the repo root
+takes priority; safe `package.json`/`go.mod` gates are derived next; the
+`GOOSE_ORCH_GATES` env var is the global fallback.
 
 ## Code Quality
 
-- Comments: Write self-documenting code - prefer clear names over comments
-- Comments: Never add comments that restate what code does
-- Comments: Only comment for complex algorithms, non-obvious business logic, or "why" not "what"
-- Simplicity: Don't make things optional that don't need to be - the compiler will enforce
-- Simplicity: Booleans should default to false, not be optional
-- Errors: Don't add error context that doesn't add useful information (e.g., `.context("Failed to X")` when error already says it failed)
-- Simplicity: Avoid overly defensive code - trust Rust's type system
-- Logging: Clean up existing logs, don't add more unless for errors or security events
-
-## Ink / Terminal UI (ui/text)
-
-- Ink renders React to a fixed character grid — not a browser. Content that exceeds a Box's dimensions is NOT clipped; it visually overflows into neighboring cells and breaks the layout.
-
-- Ink-Text: Never use `wrap="wrap"` inside a fixed-height Box — wrapped text can exceed the Box height and bleed into adjacent components. Use `wrap="truncate"` and pre-truncate the string to fit the available character budget (lines × width).
-  
-- Ink-Layout: When changing card/cell dimensions, always recalculate how much content fits. Account for borders (2 chars), padding, margins, and sibling elements when computing the
-remaining space for dynamic text.
-  
-- Ink-Overflow: Ink has no `overflow: hidden`. The only way to prevent overflow is to ensure content never exceeds the container size — truncate text, limit list items, or cap height.
-  
-- Ink-FlexGrow: Avoid `flexGrow={1}` on text containers inside fixed-height cards — the text will try to fill available space but Ink won't clip it if it exceeds the boundary.
-  
-- Ink-HeightBudget: When computing how many rows/items fit vertically, count EVERY line used by headers, footers, margins, borders, and scroll indicators. Under-reserving vertical space (e.g., `height - 8` when chrome actually uses 16 lines) causes Ink to squeeze out margins between items, making borders collapse. Always audit the actual line count.
-  
-- Ink-TrailingMargin: Don't apply `marginBottom` to the last item in a list — it wastes a line and can push content out of the container. Use conditional margins or container `gap`.
+- Comments: write self-documenting code; prefer clear names over comments. Never
+  restate what the code does. Comment only complex algorithms, non-obvious
+  business logic, or "why" — never "what". No comments on self-evident operations,
+  getters/setters, constructors, or standard Rust idioms.
+- Simplicity: don't make things optional that needn't be — let the compiler
+  enforce. Booleans default to false, not optional. Avoid overly defensive code;
+  trust Rust's type system.
+- Errors: use `anyhow::Result`. Don't add context that restates the error
+  (`.context("Failed to X")` when the error already says it failed).
+- Logging: clean up stray logs; add them only for errors or security events.
 
 ## Never
 
-- Never: Recreate `ui/desktop/src/api` or add `@hey-api/openapi-ts` to `ui/desktop`
-- Cargo.toml: For human-authored dependency changes, use `cargo add` instead of manually editing dependency entries unless there is a specific reason not to.
-- Cargo.toml: Automated dependency bump PRs are exempt; when manual edits are necessary, keep `Cargo.lock` consistent.
-- Never: Skip cargo fmt
-- Never: Merge without running clippy
-- Never: Comment self-evident operations (`// Initialize`, `// Return result`), getters/setters, constructors, or standard Rust idioms
-
-## Entry Points
-- CLI: crates/goose-cli/src/main.rs
-- UI: ui/desktop/src/main.ts
-- Agent: crates/goose/src/agents/agent.rs
+- Never skip `cargo fmt`.
+- Never merge without running clippy.
+- For human-authored dependency changes, use `cargo add` rather than editing
+  `Cargo.toml` by hand (automated bump PRs are exempt); keep `Cargo.lock`
+  consistent.

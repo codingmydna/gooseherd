@@ -39,6 +39,8 @@ jobs:
           sed -i.bak 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
           rm -f Cargo.toml.bak
 
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -56,9 +58,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build CLI
-        run: |
-          source ./bin/activate-hermit
-          cargo build --release -p goose-cli
+        run: cargo build --release -p goose-cli
 
       - name: Package binary
         shell: bash

@@ -303,7 +303,6 @@ the whole idea is wrong, if you can show your ledger.
 ## Credits and license
 
 Built on [goose](https://github.com/aaif-goose/goose) by Block and the AAIF
-community (upstream README: [README.upstream.md](README.upstream.md)).
-Apache-2.0, same as upstream. Not affiliated with Block, AAIF, Anthropic, or
+community. Apache-2.0, same as upstream. Not affiliated with Block, AAIF, Anthropic, or
 OpenAI. Model subscriptions are governed by their vendors' terms — this
 project only drives the vendors' own CLIs.
