@@ -66,8 +66,6 @@ urlencoding = { workspace = true }
 clap_complete = { version = "4", default-features = false }
 comfy-table = { version = "7", default-features = false }
 sha2 = { workspace = true }
-axum.workspace = true
-axum-server = { version = "0.8", default-features = false, optional = true }
 clap_complete_nushell = { version = "4", default-features = false }
 libc = "0.2.186"
 ignore.workspace = true
@@ -81,15 +79,11 @@ default = ["rustls-tls", "system-keyring"]
 otel = ["goose/otel"]
 system-keyring = ["goose/system-keyring"]
 rustls-tls = [
-    "dep:axum-server",
-    "axum-server/tls-rustls",
     "goose/rustls-tls",
     "goose-mcp/rustls-tls",
     "goose-providers/rustls-tls",
 ]
 native-tls = [
-    "dep:axum-server",
-    "axum-server/tls-openssl",
     "goose/native-tls",
     "goose-mcp/native-tls",
     "goose-providers/native-tls",

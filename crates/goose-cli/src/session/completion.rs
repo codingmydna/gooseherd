@@ -57,8 +57,6 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/init", "Analyze the repo and write AGENTS.md"),
     ("/remember", "Append a note to .goosehints project memory"),
     ("/btw", "Side question in the background, history untouched"),
-    ("/plan", "Enter plan mode"),
-    ("/endplan", "Exit plan mode"),
     ("/compact", "Compact the conversation to free context"),
     ("/clear", "Clear the conversation history"),
     ("/r", "Toggle full tool output"),

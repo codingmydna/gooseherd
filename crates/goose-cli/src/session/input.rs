@@ -26,8 +26,6 @@ pub enum InputResult {
     PromptCommand(PromptCommandOptions),
     GooseMode(String),
     Model(Option<String>),
-    Plan(PlanCommandOptions),
-    EndPlan,
     Orchestrate(String),
     Status,
     UsageInfo,
@@ -59,11 +57,6 @@ pub struct PromptCommandOptions {
     pub name: String,
     pub info: bool,
     pub arguments: HashMap<String, String>,
-}
-
-#[derive(Debug)]
-pub struct PlanCommandOptions {
-    pub message_text: String,
 }
 
 struct CtrlCHandler {
@@ -338,8 +331,6 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_MODE: &str = "/mode ";
     const CMD_MODEL: &str = "/model";
     const CMD_MODEL_WITH_SPACE: &str = "/model ";
-    const CMD_PLAN: &str = "/plan";
-    const CMD_ENDPLAN: &str = "/endplan";
     const CMD_ORCH: &str = "/orch";
     const CMD_GOAL: &str = "/goal";
     const CMD_LOOP: &str = "/loop";
@@ -426,10 +417,6 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
                 Some(InputResult::Model(Some(model)))
             }
         }
-        s if s.starts_with(CMD_PLAN) => {
-            parse_plan_command(s.get(CMD_PLAN.len()..).unwrap_or("").trim().to_string())
-        }
-        s if s == CMD_ENDPLAN => Some(InputResult::EndPlan),
         s if s == CMD_ORCH || s.starts_with(&format!("{CMD_ORCH} ")) => Some(
             InputResult::Orchestrate(s.get(CMD_ORCH.len()..).unwrap_or("").trim().to_string()),
         ),
@@ -592,14 +579,6 @@ fn parse_prompt_command(args: &str) -> Option<InputResult> {
     Some(InputResult::PromptCommand(options))
 }
 
-fn parse_plan_command(input: String) -> Option<InputResult> {
-    let options = PlanCommandOptions {
-        message_text: input.trim().to_string(),
-    };
-
-    Some(InputResult::Plan(options))
-}
-
 fn print_help() {
     let newline_key = get_newline_key().to_ascii_uppercase();
     let modes = GooseMode::VARIANTS.join(", ");
@@ -616,9 +595,9 @@ fn print_help() {
 /mode <name> - Set the goose mode to use ({modes})
 /model [provider/]model - Without args, open a provider/model picker; with args, switch this session and save it as default
 /effort [target] <level> - Without args, pick reasoning effort for session/planner/implementer/reviewer; bare level sets session effort
-/plan <message_text> -  Enters 'plan' mode with optional message. Create a plan based on the current messages and asks user if they want to act on it.
 /orch <task> - Run the task through a plan/implement/review loop: planner model plans, implementer model executes, reviewer model reviews until approved (GOOSE_PLANNER_*, GOOSE_IMPLEMENTER_*, GOOSE_REVIEWER_* config)
 /goal <goal> [--max N] [--check \"cmd\"] - Retry a normal turn until a deterministic check or evaluator says GOAL_MET
+/loop [every] <prompt> - Repeat a prompt on an interval until stopped (/loopstop) or done
 /status - Show session status: provider/model/effort/connection type, orchestration roles, subagent config, token usage
 /usage - Show token usage and cost for this session
 /stats - Orch/goal run statistics: per-role/model tokens, durations, verdicts, reported-model verification
@@ -631,15 +610,9 @@ fn print_help() {
 /remember <note> - Append a note to this project's .goosehints memory
 /terminal-setup - Install a terminal key binding so Shift+Enter can insert a newline
 !<command> - Run a shell command directly; its output is added to the conversation context
-                        If user acts on the plan, goose mode is set to 'auto' and returns to 'normal' goose mode.
-                        To warm up goose before using '/plan', we recommend setting '/mode approve' & putting appropriate context into goose.
-                        The model is used based on $GOOSE_PLANNER_PROVIDER and $GOOSE_PLANNER_MODEL environment variables.
-                        If no model is set, the default model is used.
-/endplan - Exit plan mode and return to 'normal' goose mode.
 /recipe [filepath] - Generate a recipe from the current conversation and save it to the specified filepath (must end with .yaml).
                        If no filepath is provided, it will be saved to ./recipe.yaml.
 /compact - Compact the current conversation to reduce context length while preserving key information.
-/status - Show session status: model, provider, mode, and token usage.
 /edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
                Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
 /skills - List available skills or enable skills by name (usage: /skills [<name>...])
@@ -943,24 +916,6 @@ mod tests {
             // Invalid arguments are ignored but logged
         } else {
             panic!("Expected PromptCommand");
-        }
-    }
-
-    #[test]
-    fn test_plan_mode() {
-        // Test plan mode with no text
-        let result = handle_slash_command("/plan");
-        assert!(result.is_some());
-
-        // Test plan mode with text
-        let result = handle_slash_command("/plan hello world");
-        assert!(result.is_some());
-        let options = result.unwrap();
-        match options {
-            InputResult::Plan(options) => {
-                assert_eq!(options.message_text, "hello world");
-            }
-            _ => panic!("Expected Plan"),
         }
     }
 

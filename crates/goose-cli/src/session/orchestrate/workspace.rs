@@ -420,12 +420,8 @@ fn path_scope(path: &str) -> Option<String> {
         Some("cli".to_string())
     } else if path.starts_with("crates/goose-mcp/") {
         Some("mcp".to_string())
-    } else if path.starts_with("crates/goose-server/") {
-        Some("server".to_string())
     } else if path.starts_with("crates/goose/") {
         Some("goose".to_string())
-    } else if path.starts_with("ui/desktop/") {
-        Some("ui".to_string())
     } else {
         path.split('/').next().map(ToString::to_string)
     }
@@ -648,9 +644,9 @@ mod tests {
         assert_eq!(
             subject(
                 "\n\nAdd a very long orchestration lifecycle summary that should be truncated before it turns into an unwieldy commit subject.",
-                &["ui/desktop/src/main.ts"]
+                &["docs/reference.md"]
             ),
-            "feat(ui): add a very long orchestration lifecycle summary that should be..."
+            "feat(docs): add a very long orchestration lifecycle summary that should be..."
         );
     }
 

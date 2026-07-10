@@ -11,11 +11,7 @@ use goose_mcp::MemoryServer;
 use crate::commands::configure::handle_configure;
 use crate::commands::info::handle_info;
 use crate::commands::plugin::{handle_plugin_install, handle_plugin_update};
-use crate::commands::project::{handle_project_default, handle_projects_interactive};
 use crate::commands::recipe::{handle_list, handle_validate};
-use crate::commands::term::{
-    handle_term_info, handle_term_init, handle_term_log, handle_term_run, Shell,
-};
 
 use crate::commands::session::{handle_session_list, handle_session_remove};
 use crate::commands::skills::handle_skills_list;
@@ -30,7 +26,6 @@ use goose::session::session_manager::SessionType;
 use goose::session::SessionManager;
 use std::io::Read;
 use std::path::PathBuf;
-use tracing::warn;
 
 #[derive(Parser)]
 #[command(name = "goose", author, version, display_name = "", about, long_about = None)]
@@ -720,20 +715,12 @@ enum Command {
         extension_opts: ExtensionOptions,
     },
 
-    /// Open the last project directory
-    #[command(about = "Open the last project directory", visible_alias = "p")]
-    Project {},
-
     /// Manage isolated git worktrees for parallel Goose sessions
     #[command(about = "Manage isolated git worktrees for parallel Goose sessions")]
     Worktree {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
-
-    /// List recent project directories
-    #[command(about = "List recent project directories", visible_alias = "ps")]
-    Projects,
 
     /// Execute commands from an instruction file
     #[command(about = "Execute commands from an instruction file or stdin")]
@@ -872,24 +859,6 @@ enum Command {
         command: PluginCommand,
     },
 
-    /// Terminal-integrated session (one session per terminal)
-    #[command(
-        about = "Terminal-integrated goose session",
-        long_about = "Runs a goose session tied to your terminal window.\n\
-                      Each terminal maintains its own persistent session that resumes automatically.\n\n\
-                      Setup:\n  \
-                        eval \"$(goose term init zsh)\"  # zsh/bash\n  \
-                        let init = ($nu.cache-dir | path join \"goose-term-init.nu\"); ^goose term init nu | save --force $init; source $init\n\n\
-                      Usage:\n  \
-                        goose term run \"list files in this directory\"\n  \
-                        @goose \"create a python script\"  # using alias\n  \
-                        @g \"quick question\"  # short alias"
-    )]
-    Term {
-        #[command(subcommand)]
-        command: TermCommand,
-    },
-
     /// Generate completions for various shells
     #[command(
         about = "Generate the autocompletion script or Nushell module for the specified shell"
@@ -1011,72 +980,6 @@ enum Command {
     },
 }
 
-#[derive(Subcommand)]
-enum TermCommand {
-    /// Print shell initialization script
-    #[command(
-        about = "Print shell initialization script",
-        long_about = "Prints shell configuration to set up terminal-integrated sessions.\n\
-                      Each terminal gets a persistent goose session that automatically resumes.\n\n\
-                      Setup:\n  \
-                        echo 'eval \"$(goose term init zsh)\"' >> ~/.zshrc\n  \
-                        source ~/.zshrc\n\n\
-                        Nushell:\n  \
-                        let init = ($nu.cache-dir | path join \"goose-term-init.nu\")\n  \
-                        ^goose term init nu | save --force $init\n  \
-                        source $init\n\n\
-                      With --default (anything typed that isn't a command goes to goose):\n  \
-                        echo 'eval \"$(goose term init zsh --default)\"' >> ~/.zshrc\n  \
-                        ^goose term init nu --default | save --force $init"
-    )]
-    Init {
-        /// Shell type (bash, zsh, fish, nu, powershell)
-        #[arg(value_enum)]
-        shell: Shell,
-
-        #[arg(short, long, help = "Name for the terminal session")]
-        name: Option<String>,
-
-        /// Make goose the default handler for unknown commands
-        #[arg(
-            long = "default",
-            help = "Make goose the default handler for unknown commands",
-            long_help = "When enabled, anything you type that isn't a valid command will be sent to goose. Supported for zsh, bash, and nu."
-        )]
-        default: bool,
-    },
-
-    /// Log a shell command (called by shell hook)
-    #[command(about = "Log a shell command to the session", hide = true)]
-    Log {
-        /// The command that was executed
-        command: String,
-    },
-
-    /// Run a prompt in the terminal session
-    #[command(
-        about = "Run a prompt in the terminal session",
-        long_about = "Run a prompt in the terminal-integrated session.\n\n\
-                      Examples:\n  \
-                        goose term run list files in this directory\n  \
-                        @goose list files  # using alias\n  \
-                        @g why did that fail  # short alias"
-    )]
-    Run {
-        /// The prompt to send to goose (multiple words allowed without quotes)
-        #[arg(required = true, num_args = 1..)]
-        prompt: Vec<String>,
-    },
-
-    /// Print session info for prompt integration
-    #[command(
-        about = "Print session info for prompt integration",
-        long_about = "Prints compact session info (token usage, model) for shell prompt integration.\n\
-                      Example output: ●○○○○ sonnet"
-    )]
-    Info,
-}
-
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum CliProviderVariant {
     OpenAi,
@@ -1122,9 +1025,7 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Info { .. }) => "info",
         Some(Command::Mcp { .. }) => "mcp",
         Some(Command::Session { .. }) => "session",
-        Some(Command::Project {}) => "project",
         Some(Command::Worktree { .. }) => "worktree",
-        Some(Command::Projects) => "projects",
         Some(Command::Run { .. }) => "run",
         Some(Command::Loop { .. }) => "loop",
         Some(Command::Goal { .. }) => "goal",
@@ -1132,7 +1033,6 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Recipe { .. }) => "recipe",
         Some(Command::Skills { .. }) => "skills",
         Some(Command::Plugin { .. }) => "plugin",
-        Some(Command::Term { .. }) => "term",
         Some(Command::Completion { .. }) => "completion",
         Some(Command::Review { .. }) => "review",
         Some(Command::ValidateExtensions { .. }) => "validate-extensions",
@@ -1715,19 +1615,6 @@ async fn handle_skills_subcommand(command: SkillsCommand) -> Result<()> {
     }
 }
 
-async fn handle_term_subcommand(command: TermCommand) -> Result<()> {
-    match command {
-        TermCommand::Init {
-            shell,
-            name,
-            default,
-        } => handle_term_init(shell, name, default).await,
-        TermCommand::Log { command } => handle_term_log(command).await,
-        TermCommand::Run { prompt } => handle_term_run(prompt).await,
-        TermCommand::Info => handle_term_info().await,
-    }
-}
-
 async fn handle_default_session() -> Result<()> {
     if !Config::global().exists() {
         return handle_configure().await;
@@ -1767,10 +1654,6 @@ pub async fn cli() -> anyhow::Result<()> {
     register_builtin_extensions(goose_mcp::BUILTIN_EXTENSIONS.clone());
 
     let cli = Cli::parse();
-
-    if let Err(e) = crate::project_tracker::update_project_tracker(None, None) {
-        warn!("Warning: Failed to update project tracker: {}", e);
-    }
 
     let command_name = get_command_name(&cli.command);
     tracing::info!(
@@ -1814,15 +1697,7 @@ pub async fn cli() -> anyhow::Result<()> {
             )
             .await
         }
-        Some(Command::Project {}) => {
-            handle_project_default()?;
-            Ok(())
-        }
         Some(Command::Worktree { command }) => handle_worktree_subcommand(command),
-        Some(Command::Projects) => {
-            handle_projects_interactive()?;
-            Ok(())
-        }
         Some(Command::Run {
             input_opts,
             identifier,
@@ -1879,7 +1754,6 @@ pub async fn cli() -> anyhow::Result<()> {
         Some(Command::Recipe { command }) => handle_recipe_subcommand(command),
         Some(Command::Skills { command }) => handle_skills_subcommand(command).await,
         Some(Command::Plugin { command }) => handle_plugin_subcommand(command),
-        Some(Command::Term { command }) => handle_term_subcommand(command).await,
         Some(Command::Review {
             range,
             prompt,
@@ -1974,20 +1848,6 @@ mod tests {
         assert!(script.contains("module completions"));
         assert!(script.contains("export extern goose"));
         assert!(script.contains("export use completions *"));
-    }
-
-    #[test]
-    fn term_init_help_mentions_nushell() {
-        let mut cmd = Cli::command();
-        let term = cmd.find_subcommand_mut("term").expect("term command");
-        let init = term.find_subcommand_mut("init").expect("init command");
-        let mut buffer = Vec::new();
-
-        init.write_long_help(&mut buffer).expect("write help");
-
-        let help = String::from_utf8(buffer).expect("utf8");
-        assert!(help.contains("goose term init nu"));
-        assert!(help.contains("Supported for zsh, bash, and nu"));
     }
 
     #[test]
