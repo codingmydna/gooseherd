@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::{ledger, output, plan_exemplars, review_exemplars, CliSession};
+use crate::session::{exemplars, ledger, output, plan_exemplars, review_exemplars, CliSession};
 
 use super::gates::{
     gate_banner_line, gate_outputs_review_section, gate_passed_review_note, next_gate_step,
@@ -209,6 +209,9 @@ impl CliSession {
             .repo_root
             .clone()
             .unwrap_or_else(|| workspace.original_dir.clone());
+        // Stable per-repo key so exemplars archived here are preferred by future
+        // runs in the same repo (see exemplar store repo scoping).
+        let repo_scope = exemplars::repo_scope_key(&repo_pack_root);
         let repo_pack = if repo_pack::repo_pack_injects(planner_role)
             || repo_pack::repo_pack_injects(implementer_role)
         {
@@ -244,6 +247,7 @@ impl CliSession {
             interactive,
             planner_role,
             planner_repo_pack,
+            Some(&repo_scope),
             &meta,
         )
         .await
@@ -258,6 +262,7 @@ impl CliSession {
                     task,
                     reviewer_role,
                     &[],
+                    Some(&repo_scope),
                 );
             }
         };
@@ -280,6 +285,7 @@ impl CliSession {
                         task,
                         reviewer_role,
                         &[],
+                        Some(&repo_scope),
                     );
                 }
             }
@@ -318,6 +324,7 @@ impl CliSession {
                 task,
                 reviewer_role,
                 &[],
+                Some(&repo_scope),
             );
         }
         config.set_param(goose::acp::ORCH_IMPLEMENT_ACTIVE_KEY, false)?;
@@ -345,6 +352,7 @@ impl CliSession {
             task,
             &implementer_role.provider_name,
             &implementer_role.model,
+            Some(&repo_scope),
             Some(&run_id),
         );
         if let Some(section) = &failure_modes.prompt_section {
@@ -503,6 +511,7 @@ impl CliSession {
                             &run_id,
                             task,
                             reviewer_role,
+                            Some(&repo_scope),
                         );
                         return Ok(OrchOutcome::GateFailed);
                     }
@@ -552,6 +561,7 @@ impl CliSession {
                 task,
                 &reviewer_role.provider_name,
                 &reviewer_role.model,
+                Some(&repo_scope),
                 Some(&run_id),
             );
             phase_banner(
@@ -658,6 +668,7 @@ impl CliSession {
                             task,
                             reviewer_role,
                             &pending_review_archives,
+                            Some(&repo_scope),
                         );
                     }
                 };
@@ -692,6 +703,7 @@ impl CliSession {
                             task,
                             reviewer_role,
                             &pending_review_archives,
+                            Some(&repo_scope),
                         );
                     }
                 }
@@ -750,7 +762,13 @@ impl CliSession {
             );
 
             if approved {
-                archive_pending_reviews(&pending_review_archives, &run_id, task, reviewer_role);
+                archive_pending_reviews(
+                    &pending_review_archives,
+                    &run_id,
+                    task,
+                    reviewer_role,
+                    Some(&repo_scope),
+                );
                 plan_exemplars::archive_approved_plan(
                     true,
                     &plan_exemplars::ArchiveRequest {
@@ -760,6 +778,7 @@ impl CliSession {
                         planner_provider: &planner_role.provider_name,
                         planner_model: &planner_role.model,
                         planner_context_limit,
+                        repo_root: Some(&repo_scope),
                         approved_at_ms: ledger::now_ms(),
                     },
                 );
@@ -773,7 +792,13 @@ impl CliSession {
                 return Ok(OrchOutcome::Approved);
             }
             if cycle == max_cycles {
-                archive_pending_reviews(&pending_review_archives, &run_id, task, reviewer_role);
+                archive_pending_reviews(
+                    &pending_review_archives,
+                    &run_id,
+                    task,
+                    reviewer_role,
+                    Some(&repo_scope),
+                );
                 println!(
                     "{}",
                     console::style(format!(

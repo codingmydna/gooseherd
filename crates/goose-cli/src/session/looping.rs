@@ -669,6 +669,9 @@ impl CliSession {
             plan_exemplar_run_ids: None,
             review_exemplars_injected: None,
             review_exemplar_run_ids: None,
+            playbook_injected: None,
+            arena_rank: None,
+            arena_winner: None,
         });
     }
 

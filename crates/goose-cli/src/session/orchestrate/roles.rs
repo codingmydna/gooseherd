@@ -50,6 +50,15 @@ pub(in crate::session) fn resolve_all_roles() -> Result<OrchRoles> {
     })
 }
 
+/// The judge role, used by the arena judge and — as a fallback — the goal
+/// evaluator. Resolves `GOOSE_JUDGE_{PROVIDER,MODEL,EFFORT}` with the reviewer as
+/// its fallback, which itself falls back to the planner and then the session
+/// default. Full chain: JUDGE → REVIEWER → PLANNER → session default.
+pub(in crate::session) fn resolve_judge_role() -> Result<RoleConfig> {
+    let roles = resolve_all_roles()?;
+    Ok(resolve_role("JUDGE", &roles.reviewer))
+}
+
 fn resolve_role(prefix: &str, fallback: &RoleConfig) -> RoleConfig {
     let config = Config::global();
     RoleConfig {

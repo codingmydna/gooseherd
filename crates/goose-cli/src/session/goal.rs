@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use super::orchestrate::{build_role_provider, git_evidence, resolve_all_roles, RoleConfig};
+use super::orchestrate::{build_role_provider, git_evidence, resolve_judge_role, RoleConfig};
 use super::{ledger, output, CliSession};
 
 pub(crate) const GOAL_USAGE: &str = "\
@@ -425,19 +425,20 @@ fn resolve_evaluator_role() -> Result<RoleConfig> {
             effort: config.get_param::<String>(EVALUATOR_EFFORT_KEY).ok(),
         }),
         (None, None) => {
-            let roles = resolve_all_roles().map_err(|error| {
+            // No explicit evaluator: fall back to the judge role, which resolves
+            // GOOSE_JUDGE_* → reviewer → planner → session default.
+            let mut role = resolve_judge_role().map_err(|error| {
                 anyhow::anyhow!(
-                    "No evaluator model configured. Set {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or configure the reviewer fallback with GOOSE_REVIEWER_PROVIDER and GOOSE_REVIEWER_MODEL. Reviewer fallback resolution failed: {error}"
+                    "No evaluator model configured. Set {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or configure the judge/reviewer fallback with GOOSE_JUDGE_* / GOOSE_REVIEWER_*. Fallback resolution failed: {error}"
                 )
             })?;
-            let mut role = roles.reviewer;
             if let Ok(effort) = config.get_param::<String>(EVALUATOR_EFFORT_KEY) {
                 role.effort = Some(effort);
             }
             Ok(role)
         }
         _ => anyhow::bail!(
-            "Incomplete evaluator config. Set both {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or unset both to fall back to GOOSE_REVIEWER_PROVIDER / GOOSE_REVIEWER_MODEL."
+            "Incomplete evaluator config. Set both {EVALUATOR_PROVIDER_KEY} and {EVALUATOR_MODEL_KEY}, or unset both to fall back to GOOSE_JUDGE_* / GOOSE_REVIEWER_*."
         ),
     }
 }
@@ -934,6 +935,9 @@ impl CliSession {
             plan_exemplar_run_ids: None,
             review_exemplars_injected: None,
             review_exemplar_run_ids: None,
+            playbook_injected: None,
+            arena_rank: None,
+            arena_winner: None,
         });
     }
 
@@ -964,6 +968,9 @@ impl CliSession {
             plan_exemplar_run_ids: None,
             review_exemplars_injected: None,
             review_exemplar_run_ids: None,
+            playbook_injected: None,
+            arena_rank: None,
+            arena_winner: None,
         });
     }
 }

@@ -1,18 +1,20 @@
-use goose::config::{paths::Paths, Config};
-use goose::utils::safe_truncate;
+use goose::config::paths::Paths;
+use goose::utils::middle_out_truncate;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub(super) use super::exemplars::InjectionMode;
-use super::exemplars::{self, ExemplarInjection, SimilarityRecord};
+use super::exemplars::{self, ExemplarInjection, SimilarityRecord, StoreConfig};
 
-const EXEMPLARS_DIR: &str = "plan_exemplars";
-const ENABLED_KEY: &str = "GOOSE_PLAN_EXEMPLARS";
-const INJECT_KEY: &str = "GOOSE_PLAN_EXEMPLARS_INJECT";
-const K_KEY: &str = "GOOSE_PLAN_EXEMPLARS_K";
-const CHAR_LIMIT_KEY: &str = "GOOSE_PLAN_EXEMPLARS_CHAR_LIMIT";
-const DEFAULT_K: usize = 2;
-const DEFAULT_CHAR_LIMIT: usize = 8_000;
+const STORE: StoreConfig = StoreConfig {
+    dir: "plan_exemplars",
+    key_prefix: "GOOSE_PLAN_EXEMPLARS",
+    default_k: 2,
+    default_char_limit: 8_000,
+};
+
+const INJECTION_HEADER: &str =
+    "참고: 유사 과제에서 승인된 계획 예시 (형태를 참고하되 내용은 현재 과제 기준으로)\n\n";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct ExemplarIndexRecord {
@@ -23,6 +25,8 @@ pub(super) struct ExemplarIndexRecord {
     pub(super) planner_model: String,
     pub(super) planner_context_limit: Option<usize>,
     pub(super) path: String,
+    #[serde(default)]
+    pub(super) repo_root: Option<String>,
 }
 
 impl SimilarityRecord for ExemplarIndexRecord {
@@ -33,6 +37,18 @@ impl SimilarityRecord for ExemplarIndexRecord {
     fn recency_ms(&self) -> u128 {
         self.approved_at_ms
     }
+
+    fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn repo_root(&self) -> Option<&str> {
+        self.repo_root.as_deref()
+    }
 }
 
 pub(super) struct ArchiveRequest<'a> {
@@ -42,6 +58,7 @@ pub(super) struct ArchiveRequest<'a> {
     pub(super) planner_provider: &'a str,
     pub(super) planner_model: &'a str,
     pub(super) planner_context_limit: Option<usize>,
+    pub(super) repo_root: Option<&'a str>,
     pub(super) approved_at_ms: u128,
 }
 
@@ -51,8 +68,9 @@ pub(super) fn build_injection(
     task: &str,
     planner_provider: &str,
     planner_model: &str,
+    repo_root: Option<&str>,
 ) -> PlanExemplarInjection {
-    if !exemplars_enabled() {
+    if !STORE.enabled() {
         return PlanExemplarInjection::default();
     }
 
@@ -61,49 +79,22 @@ pub(super) fn build_injection(
         task,
         planner_provider,
         planner_model,
-        injection_mode(),
-        configured_k(),
-        configured_char_limit(),
+        STORE.injection_mode(),
+        STORE.k(),
+        STORE.char_limit(),
+        repo_root,
     )
 }
 
 pub(super) fn archive_approved_plan(approved: bool, request: &ArchiveRequest<'_>) -> bool {
-    if !exemplars_enabled() {
+    if !STORE.enabled() {
         return false;
     }
 
     archive_approval_in_state_dir(&Paths::state_dir(), approved, request)
 }
 
-fn exemplars_enabled() -> bool {
-    Config::global()
-        .get_param::<bool>(ENABLED_KEY)
-        .unwrap_or(true)
-}
-
-fn injection_mode() -> InjectionMode {
-    let raw = Config::global()
-        .get_param::<String>(INJECT_KEY)
-        .unwrap_or_else(|_| "auto".to_string());
-    exemplars::parse_injection_mode(&raw)
-}
-
-fn configured_k() -> usize {
-    Config::global()
-        .get_param::<usize>(K_KEY)
-        .ok()
-        .filter(|k| *k > 0)
-        .unwrap_or(DEFAULT_K)
-}
-
-fn configured_char_limit() -> usize {
-    Config::global()
-        .get_param::<usize>(CHAR_LIMIT_KEY)
-        .ok()
-        .filter(|limit| *limit > 0)
-        .unwrap_or(DEFAULT_CHAR_LIMIT)
-}
-
+#[allow(clippy::too_many_arguments)]
 fn build_injection_from_state_dir(
     state_dir: &Path,
     task: &str,
@@ -112,55 +103,31 @@ fn build_injection_from_state_dir(
     mode: InjectionMode,
     k: usize,
     char_limit: usize,
+    repo_root: Option<&str>,
 ) -> PlanExemplarInjection {
     if !exemplars::should_inject(planner_provider, planner_model, mode) {
         return PlanExemplarInjection::default();
     }
 
-    let Some(records) = read_index_from_state_dir(state_dir) else {
-        return PlanExemplarInjection::default();
-    };
-    let selected = select_similar_records(&records, task, k);
+    let records = exemplars::read_index::<ExemplarIndexRecord>(state_dir, STORE.dir);
+    let selected = exemplars::select_similar_records(&records, task, k, repo_root);
     if selected.is_empty() {
         return PlanExemplarInjection::default();
     }
 
-    let mut selected_run_ids = Vec::new();
-    let mut examples = String::from(
-        "참고: 유사 과제에서 승인된 계획 예시 (형태를 참고하되 내용은 현재 과제 기준으로)\n\n",
-    );
-
-    for record in selected {
-        let Ok(plan) = std::fs::read_to_string(&record.path) else {
-            continue;
-        };
-        selected_run_ids.push(record.run_id.clone());
-        examples.push_str(&format!(
+    // Acceptance criteria and verification commands live at the END of a plan,
+    // so keep both ends: a smaller head for shape, a larger tail for the gates.
+    let tail = char_limit * 5 / 8;
+    let head = char_limit.saturating_sub(tail);
+    exemplars::assemble_injection(&selected, INJECTION_HEADER, |index, record, plan| {
+        format!(
             "예시 {} (run_id: {})\n<approved_plan_example run_id=\"{}\">\n{}\n</approved_plan_example>\n\n",
-            selected_run_ids.len(),
+            index,
             record.run_id,
             record.run_id,
-            safe_truncate(&plan, char_limit)
-        ));
-    }
-
-    if selected_run_ids.is_empty() {
-        return PlanExemplarInjection::default();
-    }
-
-    PlanExemplarInjection {
-        injected: true,
-        selected_run_ids,
-        prompt_section: Some(examples.trim_end().to_string()),
-    }
-}
-
-fn select_similar_records(
-    records: &[ExemplarIndexRecord],
-    task: &str,
-    k: usize,
-) -> Vec<ExemplarIndexRecord> {
-    exemplars::select_similar_records(records, task, k)
+            middle_out_truncate(plan, head, tail)
+        )
+    })
 }
 
 fn archive_approval_in_state_dir(
@@ -173,7 +140,7 @@ fn archive_approval_in_state_dir(
     }
 
     let file_name = format!("{}.md", request.run_id);
-    let plan_path = exemplars::artifact_path(state_dir, EXEMPLARS_DIR, &file_name);
+    let plan_path = exemplars::artifact_path(state_dir, STORE.dir, &file_name);
     let record = ExemplarIndexRecord {
         run_id: request.run_id.to_string(),
         task: request.task.to_string(),
@@ -182,19 +149,15 @@ fn archive_approval_in_state_dir(
         planner_model: request.planner_model.to_string(),
         planner_context_limit: request.planner_context_limit,
         path: plan_path.display().to_string(),
+        repo_root: request.repo_root.map(str::to_string),
     };
 
-    exemplars::archive_text_and_record(
-        state_dir,
-        EXEMPLARS_DIR,
-        &file_name,
-        request.plan_text,
-        &record,
-    )
+    exemplars::archive_text_and_record(state_dir, STORE.dir, &file_name, request.plan_text, &record)
 }
 
-fn read_index_from_state_dir(state_dir: &Path) -> Option<Vec<ExemplarIndexRecord>> {
-    exemplars::read_index(state_dir, EXEMPLARS_DIR)
+#[cfg(test)]
+fn read_index_from_state_dir(state_dir: &Path) -> Vec<ExemplarIndexRecord> {
+    exemplars::read_index(state_dir, STORE.dir)
 }
 
 #[cfg(test)]
@@ -220,6 +183,7 @@ mod tests {
             planner_model: "fable-5".to_string(),
             planner_context_limit: Some(200_000),
             path: path.display().to_string(),
+            repo_root: None,
         }
     }
 
@@ -237,7 +201,13 @@ mod tests {
         let index = state_dir.join("plan_exemplars").join("exemplars.jsonl");
         let mut line = serde_json::to_string(&record).expect("json");
         line.push('\n');
-        fs::write(index, line).expect("write index");
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(index)
+            .expect("open index");
+        file.write_all(line.as_bytes()).expect("write index");
     }
 
     #[test]
@@ -264,10 +234,11 @@ mod tests {
             ),
         ];
 
-        let selected = select_similar_records(
+        let selected = exemplars::select_similar_records(
             &records,
             "Inject approved plan exemplars into the orch planner prompt",
             2,
+            None,
         );
 
         assert_eq!(
@@ -287,14 +258,16 @@ mod tests {
             record(state.path(), "payment", "결제 오류 재시도 로직 수정", 100),
         ];
 
-        let selected = select_similar_records(&records, "결제 실패 오류 처리 보강", 1);
+        let selected =
+            exemplars::select_similar_records(&records, "결제 실패 오류 처리 보강", 1, None);
 
         assert_eq!(selected[0].run_id, "payment");
     }
 
     #[test]
     fn select_similar_records_returns_empty_for_empty_store() {
-        let selected = select_similar_records(&[], "anything", 2);
+        let selected =
+            exemplars::select_similar_records::<ExemplarIndexRecord>(&[], "anything", 2, None);
 
         assert!(selected.is_empty());
     }
@@ -309,6 +282,7 @@ mod tests {
             planner_provider: "fable",
             planner_model: "fable-5",
             planner_context_limit: Some(200_000),
+            repo_root: None,
             approved_at_ms: 10,
         };
 
@@ -326,6 +300,7 @@ mod tests {
             planner_provider: "fable",
             planner_model: "fable-5",
             planner_context_limit: Some(200_000),
+            repo_root: Some("/repos/mine"),
             approved_at_ms: 20,
         };
 
@@ -336,7 +311,7 @@ mod tests {
             "approved plan"
         );
 
-        let records = read_index_from_state_dir(state.path()).expect("index");
+        let records = read_index_from_state_dir(state.path());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].run_id, "approved");
         assert_eq!(records[0].task, "Fix the approved thing");
@@ -344,7 +319,81 @@ mod tests {
         assert_eq!(records[0].planner_provider, "fable");
         assert_eq!(records[0].planner_model, "fable-5");
         assert_eq!(records[0].planner_context_limit, Some(200_000));
+        assert_eq!(records[0].repo_root.as_deref(), Some("/repos/mine"));
         assert!(records[0].path.ends_with("approved.md"));
+    }
+
+    #[test]
+    fn read_index_skips_corrupt_lines_without_aborting() {
+        let state = tempfile::tempdir().expect("tempdir");
+        write_record_with_plan(
+            state.path(),
+            "good",
+            "a valid archived plan",
+            100,
+            "plan body",
+        );
+        let index = state.path().join("plan_exemplars").join("exemplars.jsonl");
+        // A truncated / corrupt line must not disable the whole store.
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&index)
+            .expect("open index");
+        file.write_all(b"{not valid json\n")
+            .expect("append corrupt");
+
+        let records = read_index_from_state_dir(state.path());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].run_id, "good");
+    }
+
+    #[test]
+    fn injection_prefers_same_repo_exemplars() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let mut cross = record(
+            state.path(),
+            "cross",
+            "Inject approved plan exemplars into the orch planner prompt",
+            300,
+        );
+        cross.repo_root = Some("/repos/other".to_string());
+        let mut mine = record(
+            state.path(),
+            "mine",
+            "Inject approved plan exemplars into the orch planner",
+            100,
+        );
+        mine.repo_root = Some("/repos/mine".to_string());
+        for rec in [&cross, &mine] {
+            let path = std::path::PathBuf::from(&rec.path);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(&path, format!("{} plan", rec.run_id)).expect("write plan");
+            let index = state.path().join("plan_exemplars").join("exemplars.jsonl");
+            let mut line = serde_json::to_string(rec).expect("json");
+            line.push('\n');
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(index)
+                .expect("open index");
+            file.write_all(line.as_bytes()).expect("write index");
+        }
+
+        let injection = build_injection_from_state_dir(
+            state.path(),
+            "Inject approved plan exemplars into the orch planner prompt",
+            "claude-acp",
+            "opus",
+            InjectionMode::Auto,
+            1,
+            8_000,
+            Some("/repos/mine"),
+        );
+
+        assert!(injection.injected);
+        assert_eq!(injection.selected_run_ids, vec!["mine".to_string()]);
     }
 
     #[test]
@@ -366,6 +415,7 @@ mod tests {
             InjectionMode::Auto,
             2,
             8_000,
+            None,
         );
 
         assert!(injection.injected);
@@ -374,6 +424,41 @@ mod tests {
             .prompt_section
             .expect("prompt")
             .contains("approved plan shape"));
+    }
+
+    #[test]
+    fn injection_tail_preserving_keeps_acceptance_criteria() {
+        let state = tempfile::tempdir().expect("tempdir");
+        // A long plan whose acceptance criteria live at the very end. The old
+        // head-only truncation dropped them; middle-out must keep them.
+        let mut plan = String::from("Files\n");
+        plan.push_str(&"x".repeat(6_000));
+        plan.push_str("\nAcceptance criteria: gate must rerun and pass\n");
+        write_record_with_plan(
+            state.path(),
+            "orch-plan",
+            "Add approved plan exemplar injection to the orch planner",
+            100,
+            &plan,
+        );
+
+        let injection = build_injection_from_state_dir(
+            state.path(),
+            "Inject approved plan exemplars into the orch planner prompt",
+            "claude-acp",
+            "opus",
+            InjectionMode::Auto,
+            1,
+            4_000,
+            None,
+        );
+
+        let prompt = injection.prompt_section.expect("prompt");
+        assert!(prompt.contains("truncated"));
+        assert!(
+            prompt.contains("Acceptance criteria: gate must rerun and pass"),
+            "acceptance criteria at plan tail must survive truncation"
+        );
     }
 
     #[test]
@@ -396,6 +481,7 @@ mod tests {
                 InjectionMode::Auto,
                 2,
                 8_000,
+                None,
             );
 
             assert!(!injection.injected);
@@ -423,6 +509,7 @@ mod tests {
             InjectionMode::Always,
             2,
             8_000,
+            None,
         );
         assert!(always.injected);
 
@@ -434,6 +521,7 @@ mod tests {
             InjectionMode::Never,
             2,
             8_000,
+            None,
         );
         assert!(!never.injected);
     }

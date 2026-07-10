@@ -7,6 +7,7 @@ use super::phases::{archive_pending_reviews, PendingReviewArchive};
 use super::roles::RoleConfig;
 use super::OrchOutcome;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_phase_error(
     err: anyhow::Error,
     role: &str,
@@ -15,10 +16,11 @@ pub(super) fn handle_phase_error(
     task: &str,
     reviewer_role: &RoleConfig,
     pending_reviews: &[PendingReviewArchive],
+    repo_root: Option<&str>,
 ) -> anyhow::Result<OrchOutcome> {
     if is_limit_error(&err) {
         output::hide_thinking();
-        archive_pending_reviews(pending_reviews, run_id, task, reviewer_role);
+        archive_pending_reviews(pending_reviews, run_id, task, reviewer_role, repo_root);
         render_limit_error(role, role_cfg, &err, run_id);
         Ok(OrchOutcome::LimitError)
     } else {

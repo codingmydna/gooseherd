@@ -41,6 +41,7 @@ pub(super) async fn run_plan_phase(
     interactive: bool,
     planner_role: &RoleConfig,
     planner_repo_pack: Option<&str>,
+    repo_scope: Option<&str>,
     meta: &PhaseMeta<'_>,
 ) -> Result<PlanPhaseOutput> {
     let role_idle_timeout = if interactive {
@@ -48,8 +49,12 @@ pub(super) async fn run_plan_phase(
     } else {
         Some(orch_phase_idle_timeout())
     };
-    let plan_exemplar_injection =
-        plan_exemplars::build_injection(task, &planner_role.provider_name, &planner_role.model);
+    let plan_exemplar_injection = plan_exemplars::build_injection(
+        task,
+        &planner_role.provider_name,
+        &planner_role.model,
+        repo_scope,
+    );
 
     output::set_active_role_status(Some(output::ActiveRoleStatus {
         role: output::ActiveRole::Planner,

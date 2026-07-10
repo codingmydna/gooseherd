@@ -183,6 +183,7 @@ fn archive_pending_reviews_flushes_all_review_cycles() {
         "run-1",
         "Add review exemplar archive and injection",
         &reviewer_role,
+        Some("/repos/mine"),
     );
 
     let state_dir = root.path().join("state").join("review_exemplars");

@@ -11,7 +11,7 @@ mod runner;
 mod workspace;
 
 pub(crate) use gates::{gate_banner_line, resolve_gates, GateSource};
-pub(super) use roles::{build_role_provider, resolve_all_roles, RoleConfig};
+pub(super) use roles::{build_role_provider, resolve_all_roles, resolve_judge_role, RoleConfig};
 pub(super) use workspace::git_evidence;
 
 const MAX_CYCLES_KEY: &str = "GOOSE_ORCH_MAX_CYCLES";

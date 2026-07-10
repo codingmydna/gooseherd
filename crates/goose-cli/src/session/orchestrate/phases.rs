@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::session::{exemplars, ledger, orch_ask, output, review_exemplars};
 
-use super::roles::RoleConfig;
+use super::roles::{playbook_injected, RoleConfig};
 
 const PHASE_IDLE_TIMEOUT_KEY: &str = "GOOSE_ORCH_PHASE_IDLE_TIMEOUT_SECS";
 const MIN_PLAN_CHARS_KEY: &str = "GOOSE_ORCH_MIN_PLAN_CHARS";
@@ -344,6 +344,9 @@ pub(super) fn record_self_verification(
         plan_exemplar_run_ids: None,
         review_exemplars_injected: None,
         review_exemplar_run_ids: None,
+        playbook_injected: None,
+        arena_rank: None,
+        arena_winner: None,
     });
 }
 
@@ -643,6 +646,7 @@ pub(super) fn archive_pending_reviews(
     run_id: &str,
     task: &str,
     reviewer_role: &RoleConfig,
+    repo_root: Option<&str>,
 ) {
     for review in pending_reviews {
         review_exemplars::archive_review(&review_exemplars::ArchiveReviewRequest {
@@ -654,6 +658,7 @@ pub(super) fn archive_pending_reviews(
             reviewer_provider: &reviewer_role.provider_name,
             reviewer_model: &reviewer_role.model,
             reviewer_context_limit: review.reviewer_context_limit,
+            repo_root,
             reviewed_at_ms: review.reviewed_at_ms,
         });
     }
@@ -764,6 +769,9 @@ pub(super) fn record_phase(
         review_exemplars_injected: review_exemplar_injection.map(|injection| injection.injected),
         review_exemplar_run_ids: review_exemplar_injection
             .map(|injection| injection.selected_run_ids.clone()),
+        playbook_injected: Some(playbook_injected(role_cfg)),
+        arena_rank: None,
+        arena_winner: None,
     });
 }
 
@@ -833,6 +841,9 @@ pub(super) fn record_question_round(
         plan_exemplar_run_ids: None,
         review_exemplars_injected: None,
         review_exemplar_run_ids: None,
+        playbook_injected: None,
+        arena_rank: None,
+        arena_winner: None,
     });
 }
 
