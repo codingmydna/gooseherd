@@ -6,7 +6,9 @@ use goose::conversation::message::{
     ActionRequiredData, Message, MessageContent, SystemNotificationContent, SystemNotificationType,
     ToolRequest, ToolResponse,
 };
+use goose::providers::base::ContextWindowUsage;
 use goose::providers::canonical::maybe_get_canonical_model;
+use goose::session::ContextWindowState;
 #[cfg(target_os = "windows")]
 use goose::subprocess::SubprocessExt;
 use goose::utils::safe_truncate;
@@ -2264,22 +2266,86 @@ fn set_terminal_title() {
     let _ = std::io::stdout().flush();
 }
 
-pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
-    use console::style;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextGauge {
+    Unknown,
+    Measured { used: usize, limit: usize },
+}
 
-    if context_limit == 0 {
-        println!(
-            "  {}",
-            style("context usage unavailable (context limit is 0)").dim()
-        );
-        return;
+impl ContextGauge {
+    pub fn pct(&self) -> Option<usize> {
+        match self {
+            Self::Unknown => None,
+            Self::Measured { limit: 0, .. } => None,
+            Self::Measured { used, limit } => {
+                Some(((*used as f64 / *limit as f64) * 100.0).round() as usize)
+            }
+        }
     }
 
-    let percentage =
-        (((total_tokens as f64 / context_limit as f64) * 100.0).round() as usize).min(100);
+    pub fn is_over(&self) -> bool {
+        matches!(self, Self::Measured { used, limit } if *limit > 0 && used > limit)
+    }
+
+    pub fn status_fragment(&self) -> String {
+        match self.pct() {
+            Some(pct) => format!("ctx {pct}%"),
+            None => "ctx ?".to_string(),
+        }
+    }
+}
+
+pub fn resolve_gauge(
+    manages_own_context: bool,
+    measured: Option<ContextWindowUsage>,
+    fingerprint: Option<&ContextWindowState>,
+    current_model: &str,
+    last_turn_tokens: usize,
+    configured_limit: usize,
+) -> ContextGauge {
+    if manages_own_context {
+        if let Some(ContextWindowUsage { used, limit }) = measured.filter(|usage| usage.limit > 0) {
+            return ContextGauge::Measured { used, limit };
+        }
+
+        if let Some(fingerprint) =
+            fingerprint.filter(|state| state.model == current_model && state.size > 0)
+        {
+            if let (Ok(used), Ok(limit)) = (
+                usize::try_from(fingerprint.used),
+                usize::try_from(fingerprint.size),
+            ) {
+                return ContextGauge::Measured { used, limit };
+            }
+        }
+
+        return ContextGauge::Unknown;
+    }
+
+    if configured_limit == 0 {
+        ContextGauge::Unknown
+    } else {
+        ContextGauge::Measured {
+            used: last_turn_tokens,
+            limit: configured_limit,
+        }
+    }
+}
+
+pub fn render_context_usage(gauge: &ContextGauge) -> String {
+    use console::style;
+
+    let Some(percentage) = gauge.pct() else {
+        return format!(
+            "  {}",
+            style("context usage unknown (limit not yet reported)").dim()
+        );
+    };
+
+    let bar_percentage = percentage.min(100);
 
     let bar_width = 20;
-    let filled = ((percentage as f64 / 100.0) * bar_width as f64).round() as usize;
+    let filled = ((bar_percentage as f64 / 100.0) * bar_width as f64).round() as usize;
     let empty = bar_width - filled.min(bar_width);
 
     let bar = format!("{}{}", "━".repeat(filled), "╌".repeat(empty));
@@ -2291,27 +2357,53 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
         style(bar).red()
     };
 
-    fn format_tokens(n: usize) -> String {
-        if n >= 1_000_000 {
-            format!("{:.1}M", n as f64 / 1_000_000.0)
-        } else if n >= 1_000 {
-            format!("{:.0}k", n as f64 / 1_000.0)
-        } else {
-            n.to_string()
-        }
-    }
+    let ContextGauge::Measured { used, limit } = gauge else {
+        unreachable!("gauge pct is only present for measured context");
+    };
 
-    println!(
+    format!(
         "  {} {} {}",
         colored_bar,
         style(format!("{}%", percentage)).dim(),
         style(format!(
             "{}/{}",
-            format_tokens(total_tokens),
-            format_tokens(context_limit)
+            format_tokens(*used),
+            format_tokens(*limit)
         ))
         .dim(),
-    );
+    )
+}
+
+pub fn display_context_usage(gauge: &ContextGauge) {
+    println!("{}", render_context_usage(gauge));
+}
+
+pub fn overflow_warning(gauge: &ContextGauge, manages_own_context: bool) -> Option<String> {
+    if !gauge.is_over() {
+        return None;
+    }
+
+    if manages_own_context {
+        Some(
+            "context over limit — the connected agent compacts its own context automatically; the gauge will drop after its next compaction"
+                .to_string(),
+        )
+    } else {
+        Some(
+            "context over limit — run /compact to summarize the conversation, or /clear to start fresh"
+                .to_string(),
+        )
+    }
+}
+
+fn format_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn estimate_cost_usd(provider: &str, model: &str, usage: &Usage) -> Option<f64> {
@@ -2799,5 +2891,102 @@ mod tests {
             acp_call_summary("edit", None, &json!({"file_path": "src/main.rs"})).as_deref(),
             Some("src/main.rs")
         );
+    }
+
+    #[test]
+    fn context_gauge_over_limit_renders_honest_percentage_and_warnings() {
+        console::set_colors_enabled(false);
+        let gauge = ContextGauge::Measured {
+            used: 1_140_000,
+            limit: 1_000_000,
+        };
+
+        assert_eq!(gauge.pct(), Some(114));
+        assert_eq!(gauge.status_fragment(), "ctx 114%");
+
+        let rendered = render_context_usage(&gauge);
+        assert!(rendered.contains("━━━━━━━━━━━━━━━━━━━━"));
+        assert!(rendered.contains("114%"));
+        assert!(rendered.contains("1.1M/1.0M"));
+
+        assert_eq!(
+            overflow_warning(&gauge, true).as_deref(),
+            Some(
+                "context over limit — the connected agent compacts its own context automatically; the gauge will drop after its next compaction"
+            )
+        );
+        assert_eq!(
+            overflow_warning(&gauge, false).as_deref(),
+            Some("context over limit — run /compact to summarize the conversation, or /clear to start fresh")
+        );
+    }
+
+    #[test]
+    fn context_gauge_unknown_omits_default_limit() {
+        console::set_colors_enabled(false);
+
+        let gauge = resolve_gauge(true, None, None, "claude-opus", 4_200_000, 128_000);
+
+        assert_eq!(gauge, ContextGauge::Unknown);
+        assert_eq!(gauge.status_fragment(), "ctx ?");
+        assert_eq!(
+            render_context_usage(&gauge),
+            "  context usage unknown (limit not yet reported)"
+        );
+    }
+
+    #[test]
+    fn context_gauge_restores_matching_resume_fingerprint() {
+        let fingerprint =
+            goose::session::ContextWindowState::new(920_000, 1_000_000, "claude-opus".to_string());
+
+        let gauge = resolve_gauge(
+            true,
+            None,
+            Some(&fingerprint),
+            "claude-opus",
+            4_200_000,
+            128_000,
+        );
+
+        assert_eq!(
+            gauge,
+            ContextGauge::Measured {
+                used: 920_000,
+                limit: 1_000_000
+            }
+        );
+    }
+
+    #[test]
+    fn context_gauge_rejects_stale_model_fingerprint() {
+        let fingerprint =
+            goose::session::ContextWindowState::new(920_000, 1_000_000, "claude-fable".to_string());
+
+        let gauge = resolve_gauge(
+            true,
+            None,
+            Some(&fingerprint),
+            "claude-opus",
+            4_200_000,
+            128_000,
+        );
+
+        assert_eq!(gauge, ContextGauge::Unknown);
+    }
+
+    #[test]
+    fn context_gauge_keeps_non_acp_last_turn_behavior() {
+        let gauge = resolve_gauge(false, None, None, "gpt-test", 64_000, 128_000);
+
+        assert_eq!(
+            gauge,
+            ContextGauge::Measured {
+                used: 64_000,
+                limit: 128_000
+            }
+        );
+        assert_eq!(gauge.pct(), Some(50));
+        assert!(render_context_usage(&gauge).contains("50%"));
     }
 }

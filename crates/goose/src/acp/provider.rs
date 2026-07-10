@@ -37,7 +37,7 @@ use crate::context_mgmt::format_message_for_compacting;
 use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY};
 use crate::permission::permission_confirmation::PrincipalType;
 use crate::permission::{Permission, PermissionConfirmation};
-use crate::providers::base::{MessageStream, PermissionRouting, Provider};
+use crate::providers::base::{ContextWindowUsage, MessageStream, PermissionRouting, Provider};
 use crate::subprocess::configure_subprocess;
 use goose_providers::errors::ProviderError;
 use goose_providers::model::ModelConfig;
@@ -287,6 +287,9 @@ pub struct AcpProvider {
     /// in which case `get_context_limit()` falls back to the supplied model
     /// configuration's context limit.
     context_size: Arc<AtomicU64>,
+    /// Latest `used` reported alongside `context_size`, representing tokens
+    /// currently in the ACP agent's context window.
+    context_used: Arc<AtomicU64>,
 
     /// Config option id used to select the model, if this agent supports it.
     model_config_option_id: Option<String>,
@@ -376,11 +379,13 @@ impl AcpProvider {
         let pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let context_size = Arc::new(AtomicU64::new(0));
+        let context_used = Arc::new(AtomicU64::new(0));
         let client_loop = AcpClientLoop::new(
             config,
             goose_mode_shared.clone(),
             pending_tool_updates.clone(),
             context_size.clone(),
+            context_used.clone(),
         );
         let loop_thread = spawn_client_loop(run(client_loop, rx, init_tx));
 
@@ -415,6 +420,7 @@ impl AcpProvider {
             pending_tool_updates,
             handoff_context_sent: AtomicBool::new(false),
             context_size,
+            context_used,
             model_config_option_id,
             applied_model: Arc::new(Mutex::new(applied_model)),
             tx: Some(tx),
@@ -488,6 +494,8 @@ impl AcpProvider {
 
         self.send_set_config_option("", config_id, model_name.to_string())
             .await?;
+        self.context_used.store(0, Ordering::Relaxed);
+        self.context_size.store(0, Ordering::Relaxed);
 
         let mut applied = self
             .applied_model
@@ -554,6 +562,17 @@ impl Provider for AcpProvider {
             return Ok(size as usize);
         }
         Ok(model_config.context_limit())
+    }
+
+    fn measured_context_window(&self) -> Option<ContextWindowUsage> {
+        let limit = self.context_size.load(Ordering::Relaxed);
+        if limit == 0 {
+            return None;
+        }
+        Some(ContextWindowUsage {
+            used: self.context_used.load(Ordering::Relaxed).try_into().ok()?,
+            limit: limit.try_into().ok()?,
+        })
     }
 
     async fn update_mode(&self, session_id: &str, mode: GooseMode) -> Result<(), ProviderError> {
@@ -900,6 +919,7 @@ struct AcpClientLoop {
     prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
     pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
     context_size: Arc<AtomicU64>,
+    context_used: Arc<AtomicU64>,
 }
 
 impl AcpClientLoop {
@@ -908,6 +928,7 @@ impl AcpClientLoop {
         goose_mode: Arc<Mutex<GooseMode>>,
         pending_tool_updates: Arc<Mutex<HashMap<String, AccumulatedToolCall>>>,
         context_size: Arc<AtomicU64>,
+        context_used: Arc<AtomicU64>,
     ) -> Self {
         Self {
             config,
@@ -915,6 +936,7 @@ impl AcpClientLoop {
             prompt_response_tx: Arc::new(Mutex::new(None)),
             pending_tool_updates,
             context_size,
+            context_used,
         }
     }
 
@@ -969,6 +991,7 @@ impl AcpClientLoop {
             prompt_response_tx,
             pending_tool_updates,
             context_size,
+            context_used,
         } = self;
         let notification_callback = config.notification_callback.clone();
         let reverse_modes = reverse_mode_mapping(&config.mode_mapping);
@@ -982,6 +1005,7 @@ impl AcpClientLoop {
                     let goose_mode = goose_mode.clone();
                     let pending_tool_updates = pending_tool_updates.clone();
                     let context_size = context_size.clone();
+                    let context_used = context_used.clone();
                     async move |notification: SessionNotification, _cx| {
                         if let Some(ref cb) = notification_callback {
                             cb(notification.clone());
@@ -1016,6 +1040,7 @@ impl AcpClientLoop {
                                 }
                             }
                             SessionUpdate::UsageUpdate(usage) => {
+                                context_used.store(usage.used, Ordering::Relaxed);
                                 context_size.store(usage.size, Ordering::Relaxed);
                             }
                             _ => {}
@@ -2272,6 +2297,7 @@ mod tests {
                 pending_tool_updates: Arc::new(Mutex::new(HashMap::new())),
                 handoff_context_sent: AtomicBool::new(false),
                 context_size: Arc::new(AtomicU64::new(0)),
+                context_used: Arc::new(AtomicU64::new(0)),
                 model_config_option_id: None,
                 applied_model: Arc::new(Mutex::new(None)),
                 tx,
@@ -2390,6 +2416,56 @@ mod tests {
 
         provider.context_size.store(200_000, Ordering::Relaxed);
         assert_eq!(provider.get_context_limit(&model).await.unwrap(), 200_000);
+    }
+
+    #[tokio::test]
+    async fn measured_context_window_surfaces_captured_used_and_size() {
+        let (provider, _) = test_provider();
+        assert_eq!(provider.measured_context_window(), None);
+
+        provider.context_used.store(114_000, Ordering::Relaxed);
+        provider.context_size.store(200_000, Ordering::Relaxed);
+
+        assert_eq!(
+            provider.measured_context_window(),
+            Some(goose_providers::base::ContextWindowUsage {
+                used: 114_000,
+                limit: 200_000,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn model_config_change_clears_measured_context_window() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (mut provider, _) = test_provider_with_tx(Some(tx));
+        provider.model_config_option_id = Some("model".to_string());
+        provider.context_used.store(114_000, Ordering::Relaxed);
+        provider.context_size.store(200_000, Ordering::Relaxed);
+
+        let apply = tokio::spawn(async move {
+            provider
+                .apply_model_if_changed("claude-opus")
+                .await
+                .expect("model apply succeeds");
+            provider
+        });
+
+        let ClientRequest::SetConfigOption {
+            config_id,
+            value,
+            response_tx,
+            ..
+        } = rx.recv().await.expect("expected config request")
+        else {
+            panic!("unexpected client request");
+        };
+        assert_eq!(config_id, "model");
+        assert_eq!(value, "claude-opus");
+        response_tx.send(Ok(())).unwrap();
+
+        let provider = apply.await.unwrap();
+        assert_eq!(provider.measured_context_window(), None);
     }
 
     #[tokio::test]

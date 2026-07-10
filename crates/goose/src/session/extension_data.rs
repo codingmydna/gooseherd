@@ -99,6 +99,24 @@ impl TodoState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextWindowState {
+    pub used: u64,
+    pub size: u64,
+    pub model: String,
+}
+
+impl ExtensionState for ContextWindowState {
+    const EXTENSION_NAME: &'static str = "context_window";
+    const VERSION: &'static str = "v0";
+}
+
+impl ContextWindowState {
+    pub fn new(used: u64, size: u64, model: String) -> Self {
+        Self { used, size, model }
+    }
+}
+
 /// Enabled extensions state implementation for storing which extensions are active
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnabledExtensionsState {
