@@ -156,15 +156,34 @@ while a turn is running and it's injected at the next tool boundary.
 
 ## Setup
 
-You need Rust, plus the ACP adapters for whichever subscriptions you want to
-drive:
+### Install (recommended)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/codingmydna/gooseherd/main/scripts/install.sh | bash
+```
+
+Installs the latest release binary to `~/.local/bin/goose`.
+`GOOSE_BIN_DIR`, `GOOSE_VERSION`, and `GOOSE_REPO` override the defaults.
+
+### Manual download
+
+Grab the tar.gz for your platform from the
+[releases page](https://github.com/codingmydna/gooseherd/releases), verify the
+`.sha256`, and copy `goose` somewhere on your `PATH`.
+
+### Build from source
+
+```sh
+cargo build --release -p goose-cli
+cp target/release/goose ~/.local/bin/goose
+```
+
+Whichever install path you choose, install the ACP adapters for the
+subscriptions you want to drive:
 
 ```sh
 npm install -g @agentclientprotocol/claude-agent-acp   # Claude Code subscription
 npm install -g @agentclientprotocol/codex-acp          # ChatGPT/Codex subscription
-
-cargo build --release -p goose-cli
-cp target/release/goose ~/.local/bin/goose
 ```
 
 Log in once with each vendor's own CLI (`claude`, `codex login`) — gooseherd
@@ -258,6 +277,9 @@ provider at Z.ai's OpenAI-compatible endpoint with `OPENAI_BASE_URL` and
 
 ## Troubleshooting
 
+- macOS says it cannot verify the developer — the binary is not yet signed or
+  notarized; for a manually downloaded binary, run
+  `xattr -d com.apple.quarantine ~/.local/bin/goose`.
 - `could not resolve command 'claude-agent-acp'` — the adapter isn't
   installed: `npm install -g @agentclientprotocol/claude-agent-acp` (and make
   sure `claude` itself is logged in). Same pattern for `codex-acp`.
