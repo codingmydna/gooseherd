@@ -11,6 +11,9 @@ description.workspace = true
 [lints]
 workspace = true
 
+[lib]
+doctest = false
+
 [[bin]]
 name = "goose"
 path = "src/main.rs"

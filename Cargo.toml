@@ -123,3 +123,9 @@ cudaforge = { git = "https://github.com/jbg/cudaforge", rev = "e7c1967340e40673d
 # full debug info and stay fully debuggable; release builds are unaffected.
 [profile.dev.package."*"]
 debug = false
+
+# Test gates run across multiple worktrees against the same CARGO_TARGET_DIR.
+# Disabling incremental avoids races where rustc loses test-profile working
+# objects under target/debug/incremental while copying them into deps.
+[profile.test]
+incremental = false

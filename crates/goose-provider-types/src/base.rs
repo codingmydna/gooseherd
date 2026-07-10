@@ -376,6 +376,12 @@ pub fn stream_from_single_message(message: Message, usage: ProviderUsage) -> Mes
     Box::pin(stream)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextWindowUsage {
+    pub used: usize,
+    pub limit: usize,
+}
+
 /// Base trait for AI providers (OpenAI, Anthropic, etc)
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -409,6 +415,11 @@ pub trait Provider: Send + Sync {
     /// session). The default returns the limit derived from the model config.
     async fn get_context_limit(&self, model_config: &ModelConfig) -> Result<usize, ProviderError> {
         Ok(model_config.context_limit())
+    }
+
+    /// Live context-window telemetry reported by the backend, when available.
+    fn measured_context_window(&self) -> Option<ContextWindowUsage> {
+        None
     }
 
     fn retry_config(&self) -> RetryConfig {

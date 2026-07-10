@@ -44,6 +44,7 @@ use goose::permission::Permission;
 use goose::permission::PermissionConfirmation;
 use goose::providers::base::Provider;
 use goose::providers::base::ProviderUsage;
+use goose::session::{ContextWindowState, ExtensionState};
 use goose::utils::safe_truncate;
 pub(crate) use looping::{parse_interval as parse_loop_interval, LoopCommand, LOOP_USAGE};
 pub use orchestrate::OrchOutcome;
@@ -206,6 +207,7 @@ pub struct CliSession {
     goal_active: AtomicBool,
     goal_stop_requested: AtomicBool,
     goal_status: std::sync::Mutex<Option<goal::GoalStatusSnapshot>>,
+    context_over_warned: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +327,7 @@ impl CliSession {
             goal_active: AtomicBool::new(false),
             goal_stop_requested: AtomicBool::new(false),
             goal_status: std::sync::Mutex::new(None),
+            context_over_warned: AtomicBool::new(false),
         }
     }
 
@@ -2300,10 +2303,12 @@ impl CliSession {
             .agent
             .model_config_for_session(&self.session_id)
             .await?;
-        let context_limit = provider
+        let configured_limit = provider
             .get_context_limit(&model_config)
             .await
             .unwrap_or_else(|_| model_config.context_limit());
+        let manages_own_context = provider.manages_own_context();
+        let measured_context = provider.measured_context_window();
 
         let config = Config::global();
         let show_cost = config
@@ -2314,40 +2319,85 @@ impl CliSession {
             .get_goose_provider()
             .unwrap_or_else(|_| "unknown".to_string());
 
-        let total_tokens = match self.get_session().await {
-            Ok(metadata) => {
-                let total_tokens = metadata.usage.total_tokens.unwrap_or(0) as usize;
+        let metadata = self.get_session().await.ok();
+        let total_tokens = metadata
+            .as_ref()
+            .map(|metadata| metadata.usage.total_tokens.unwrap_or(0) as usize)
+            .unwrap_or(0);
+        let fingerprint = metadata.as_ref().and_then(|metadata| {
+            <ContextWindowState as ExtensionState>::from_extension_data(&metadata.extension_data)
+        });
 
-                output::display_context_usage(total_tokens, context_limit);
+        let gauge = output::resolve_gauge(
+            manages_own_context,
+            measured_context,
+            fingerprint.as_ref(),
+            &model_config.model_name,
+            total_tokens,
+            configured_limit,
+        );
 
-                if show_cost {
-                    output::display_cost_usage(
-                        &provider_name,
-                        &model_config.model_name,
-                        &metadata.usage,
-                    );
-                }
-                total_tokens
+        output::display_context_usage(&gauge);
+
+        if show_cost {
+            if let Some(metadata) = metadata.as_ref() {
+                output::display_cost_usage(
+                    &provider_name,
+                    &model_config.model_name,
+                    &metadata.usage,
+                );
             }
-            Err(_) => {
-                output::display_context_usage(0, context_limit);
-                0
+        }
+
+        if manages_own_context {
+            if let (Some(metadata), Some(measured)) = (metadata.as_ref(), measured_context) {
+                if let (Ok(used), Ok(size)) =
+                    (u64::try_from(measured.used), u64::try_from(measured.limit))
+                {
+                    let next_state =
+                        ContextWindowState::new(used, size, model_config.model_name.clone());
+                    if fingerprint.as_ref() != Some(&next_state) {
+                        let mut extension_data = metadata.extension_data.clone();
+                        match next_state.to_extension_data(&mut extension_data) {
+                            Ok(()) => {
+                                if let Err(err) = self
+                                    .agent
+                                    .config
+                                    .session_manager
+                                    .update(&self.session_id)
+                                    .extension_data(extension_data)
+                                    .apply()
+                                    .await
+                                {
+                                    warn!("failed to persist context window state: {err}");
+                                }
+                            }
+                            Err(err) => warn!("failed to serialize context window state: {err}"),
+                        }
+                    }
+                }
+            }
+        }
+
+        match output::overflow_warning(&gauge, manages_own_context) {
+            Some(warning) => {
+                if !self.context_over_warned.swap(true, Ordering::SeqCst) {
+                    println!("{}", console::style(warning).yellow());
+                }
+            }
+            None => {
+                self.context_over_warned.store(false, Ordering::SeqCst);
             }
         };
 
         // Keep the input-line hint status in sync (rendered by GooseCompleter).
         let mode = self.agent.goose_mode().await;
-        let pct = if context_limit > 0 {
-            (total_tokens * 100) / context_limit
-        } else {
-            0
-        };
         let status_line = format!(
-            "{}/{} · {} · ctx {}%",
+            "{}/{} · {} · {}",
             provider.get_name(),
             model_config.model_name,
             mode,
-            pct
+            gauge.status_fragment()
         );
         if let Ok(mut cache) = self.completion_cache.write() {
             cache.status_line = Some(status_line);
