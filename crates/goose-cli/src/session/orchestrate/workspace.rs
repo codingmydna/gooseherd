@@ -431,18 +431,36 @@ fn path_scope(path: &str) -> Option<String> {
     }
 }
 
-pub(super) fn finalize_worktree_approval(workspace: &OrchWorkspace, task: &str, auto_merge: bool) {
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FinalizeOutcome {
+    InPlace,
+    NothingToMerge,
+    ManualHint,
+    Merged,
+    Conflict,
+    Error,
+}
+
+fn manual_merge_hint(branch: &str) -> String {
+    format!("  to merge: git merge {branch}")
+}
+
+pub(super) fn finalize_worktree_approval(
+    workspace: &OrchWorkspace,
+    task: &str,
+    auto_merge: bool,
+) -> FinalizeOutcome {
     let Some(branch) = workspace.branch.as_deref() else {
         println!(
             "  {}",
             console::style("auto-commit skipped: in-place orchestration").dim()
         );
-        return;
+        return FinalizeOutcome::InPlace;
     };
 
     let changed_paths = changed_paths_for_commit(&workspace.impl_dir);
     let message = conventional_commit_subject(task, &changed_paths);
-    match worktree::commit_all(&workspace.impl_dir, &message, &[".goose-orch"]) {
+    let committed = match worktree::commit_all(&workspace.impl_dir, &message, &[".goose-orch"]) {
         Ok(true) => {
             println!(
                 "{}",
@@ -450,23 +468,34 @@ pub(super) fn finalize_worktree_approval(workspace: &OrchWorkspace, task: &str, 
                     .green()
                     .bold()
             );
-            println!("  to merge: git merge {branch}");
+            true
         }
-        Ok(false) => {
-            println!(
-                "  {}",
-                console::style("auto-commit skipped: no changes to commit").dim()
-            );
-            return;
-        }
+        Ok(false) => false,
         Err(error) => {
             output::render_error(&format!("Auto-commit failed: {error}"));
-            return;
+            return FinalizeOutcome::Error;
         }
+    };
+
+    let ahead = match worktree::commits_ahead(&workspace.original_dir, branch) {
+        Ok(ahead) => ahead,
+        Err(error) => {
+            output::render_error(&format!("Failed to check commits awaiting merge: {error}"));
+            return FinalizeOutcome::Error;
+        }
+    };
+
+    if !committed && ahead == 0 {
+        println!(
+            "  {}",
+            console::style("auto-commit skipped: no changes to commit").dim()
+        );
+        return FinalizeOutcome::NothingToMerge;
     }
 
     if !auto_merge {
-        return;
+        println!("{}", manual_merge_hint(branch));
+        return FinalizeOutcome::ManualHint;
     }
 
     match worktree::merge_branch(&workspace.original_dir, branch) {
@@ -489,18 +518,21 @@ pub(super) fn finalize_worktree_approval(workspace: &OrchWorkspace, task: &str, 
                     ));
                 }
             }
+            FinalizeOutcome::Merged
         }
         Ok(MergeResult::Conflict) => {
             output::render_error(&format!(
                 "Auto-merge stopped because of conflicts. Resolve manually with `git merge {branch}`; worktree kept at {}.",
                 workspace.impl_dir.display()
             ));
+            FinalizeOutcome::Conflict
         }
         Err(error) => {
             output::render_error(&format!(
                 "Auto-merge failed: {error}. Resolve manually with `git merge {branch}`; worktree kept at {}.",
                 workspace.impl_dir.display()
             ));
+            FinalizeOutcome::Error
         }
     }
 }
@@ -658,5 +690,108 @@ Do not classify this as docs just because the body mentions docs/loops.md.
             super::parse_status_path("R  old.txt -> 새.txt"),
             Some("새.txt".to_string())
         );
+    }
+
+    #[test]
+    fn finalize_merges_self_committed_changes_and_provides_manual_hint() {
+        let repo = init_repo();
+        let workspace = super::setup_orch_workspace_with_force(repo.path(), "self-commit", false);
+        let original_head =
+            crate::worktree::git(repo.path(), &["rev-parse", "HEAD"]).expect("original head");
+        fs::write(workspace.impl_dir.join("self-committed.txt"), "approved\n")
+            .expect("write implementation");
+        git(&workspace.impl_dir, &["add", "self-committed.txt"]);
+        git(
+            &workspace.impl_dir,
+            &["commit", "-m", "feat: implementer own commit"],
+        );
+
+        let manual_outcome =
+            super::finalize_worktree_approval(&workspace, "Implement approved change", false);
+
+        assert_eq!(manual_outcome, super::FinalizeOutcome::ManualHint);
+        assert_eq!(
+            super::manual_merge_hint("orch/self-commit"),
+            "  to merge: git merge orch/self-commit"
+        );
+        assert_eq!(
+            crate::worktree::git(repo.path(), &["rev-parse", "HEAD"]).expect("head after hint"),
+            original_head
+        );
+
+        let merge_outcome =
+            super::finalize_worktree_approval(&workspace, "Implement approved change", true);
+
+        assert_eq!(merge_outcome, super::FinalizeOutcome::Merged);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("self-committed.txt"))
+                .expect("merged implementation"),
+            "approved\n"
+        );
+        let log =
+            crate::worktree::git(repo.path(), &["log", "--format=%s"]).expect("commit subjects");
+        assert!(log
+            .lines()
+            .any(|line| line == "feat: implementer own commit"));
+        assert_eq!(
+            log.lines()
+                .filter(|line| *line == "feat: implementer own commit")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn finalize_merges_implementer_commit_and_uncommitted_changes() {
+        let repo = init_repo();
+        let workspace = super::setup_orch_workspace_with_force(repo.path(), "mixed", false);
+        fs::write(workspace.impl_dir.join("committed.txt"), "implementer\n")
+            .expect("write committed implementation");
+        git(&workspace.impl_dir, &["add", "committed.txt"]);
+        git(
+            &workspace.impl_dir,
+            &["commit", "-m", "feat: implementer own commit"],
+        );
+        fs::write(workspace.impl_dir.join("pending.txt"), "orchestrator\n")
+            .expect("write pending implementation");
+
+        let outcome =
+            super::finalize_worktree_approval(&workspace, "Add mixed approval changes", true);
+
+        assert_eq!(outcome, super::FinalizeOutcome::Merged);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("committed.txt")).expect("committed file"),
+            "implementer\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join("pending.txt")).expect("pending file"),
+            "orchestrator\n"
+        );
+        let log =
+            crate::worktree::git(repo.path(), &["log", "--format=%s"]).expect("commit subjects");
+        assert!(log
+            .lines()
+            .any(|line| line == "feat: implementer own commit"));
+        assert!(log
+            .lines()
+            .any(|line| line == "feat(pending.txt): add mixed approval changes"));
+    }
+
+    #[test]
+    fn finalize_skips_merge_when_worktree_has_no_changes() {
+        let repo = init_repo();
+        let workspace = super::setup_orch_workspace_with_force(repo.path(), "no-change", false);
+        let original_head =
+            crate::worktree::git(repo.path(), &["rev-parse", "HEAD"]).expect("original head");
+
+        let outcome =
+            super::finalize_worktree_approval(&workspace, "No implementation changes", true);
+
+        assert_eq!(outcome, super::FinalizeOutcome::NothingToMerge);
+        assert_eq!(
+            crate::worktree::git(repo.path(), &["rev-parse", "HEAD"]).expect("head after finalize"),
+            original_head
+        );
+        assert!(workspace.impl_dir.exists());
     }
 }
