@@ -87,6 +87,8 @@ thread_local! {
     );
     static RESPONSE_BULLET_SHOWN: RefCell<bool> = const { RefCell::new(false) };
     static THINKING_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LIVE_INPUT_HINT: std::cell::Cell<LiveHintState> =
+        const { std::cell::Cell::new(LiveHintState::Idle) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,6 +286,37 @@ pub fn set_thinking_context(context: Option<String>) {
 
 fn get_thinking_context() -> Option<String> {
     THINKING_CONTEXT.with(|c| c.borrow().clone())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveHintState {
+    Idle,
+    Showing,
+    Done,
+}
+
+/// Arm the one-time steering hint shown on the spinner while live input is
+/// active. Only takes effect the first time a turn runs with live input on;
+/// subsequent turns fall back to the plain interrupt hint.
+pub fn arm_live_input_hint() {
+    LIVE_INPUT_HINT.with(|state| {
+        if state.get() == LiveHintState::Idle {
+            state.set(LiveHintState::Showing);
+        }
+    });
+}
+
+/// Retire the one-time steering hint once its turn has finished.
+pub fn finish_live_input_hint() {
+    LIVE_INPUT_HINT.with(|state| {
+        if state.get() == LiveHintState::Showing {
+            state.set(LiveHintState::Done);
+        }
+    });
+}
+
+fn live_input_hint_active() -> bool {
+    LIVE_INPUT_HINT.with(|state| state.get() == LiveHintState::Showing)
 }
 
 pub struct ThinkingStatusLabelInput<'a> {
@@ -562,7 +595,11 @@ impl ThinkingIndicator {
             .map(|started| started.elapsed())
             .unwrap_or_default();
         let running_tools = running_tool_summaries();
-        let hint = "(Ctrl+C to interrupt)";
+        let hint = if live_input_hint_active() {
+            "type to steer · Esc interrupt · /status"
+        } else {
+            "(Ctrl+C to interrupt)"
+        };
         let terminal_width = thinking_status_width();
         let hint_width = measure_text_width("  ") + measure_text_width(hint);
         let status_width =
@@ -730,6 +767,26 @@ pub fn run_status_hook(status: &str) {
 
             let _ = result;
         });
+    }
+}
+
+/// Minimum turn duration before a completion bell is worth ringing — short
+/// turns are answered before the user's attention has wandered.
+const BELL_MIN_DURATION: Duration = Duration::from_secs(10);
+
+pub fn should_ring_bell(is_tty: bool, elapsed: Duration, enabled: bool) -> bool {
+    is_tty && enabled && elapsed >= BELL_MIN_DURATION
+}
+
+/// Ring the terminal bell (BEL to stderr) when a slow turn finishes, so the
+/// user gets pulled back. Gated on a TTY and the `GOOSE_BELL` knob.
+pub fn ring_bell_if(elapsed: Duration) {
+    let enabled = Config::global()
+        .get_param::<bool>("GOOSE_BELL")
+        .unwrap_or(true);
+    if should_ring_bell(std::io::stdout().is_terminal(), elapsed, enabled) {
+        eprint!("\x07");
+        let _ = std::io::stderr().flush();
     }
 }
 
@@ -1276,7 +1333,7 @@ fn print_tool_output(text: &str) {
         println!(
             "    {}",
             style(format!(
-                "... ({} lines hidden, /toggle to show all)",
+                "... ({} lines hidden, /r to show all)",
                 lines.len() - head - tail
             ))
             .dim()
@@ -2601,6 +2658,27 @@ mod tests {
         indicator.begin_fresh_turn();
 
         assert!(indicator.turn_started_at.unwrap() > stale_start);
+    }
+
+    #[test]
+    fn bell_rings_only_on_a_tty_when_enabled_and_slow() {
+        assert!(should_ring_bell(true, Duration::from_secs(15), true));
+        assert!(should_ring_bell(true, BELL_MIN_DURATION, true));
+        assert!(!should_ring_bell(false, Duration::from_secs(15), true));
+        assert!(!should_ring_bell(true, Duration::from_secs(15), false));
+        assert!(!should_ring_bell(true, Duration::from_secs(3), true));
+    }
+
+    #[test]
+    fn live_input_hint_shows_once_then_retires() {
+        assert!(!live_input_hint_active());
+        arm_live_input_hint();
+        assert!(live_input_hint_active());
+        finish_live_input_hint();
+        assert!(!live_input_hint_active());
+        // A second turn does not re-arm the one-time hint.
+        arm_live_input_hint();
+        assert!(!live_input_hint_active());
     }
 
     #[test]

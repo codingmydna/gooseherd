@@ -24,7 +24,7 @@ use crate::session::{
 use goose::agents::Container;
 use goose::session::session_manager::SessionType;
 use goose::session::SessionManager;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -354,6 +354,12 @@ pub struct RunBehavior {
     pub scheduled_job_id: Option<String>,
 }
 
+/// `goose session -r` with no id on an interactive tty shows the recent-session
+/// picker; with an id, or when piped, it resolves silently (latest / specified).
+fn resume_uses_picker(has_identifier: bool, stdin_tty: bool, stdout_tty: bool) -> bool {
+    !has_identifier && stdin_tty && stdout_tty
+}
+
 async fn get_or_create_session_id(
     identifier: Option<Identifier>,
     resume: bool,
@@ -367,6 +373,19 @@ async fn get_or_create_session_id(
     let session_manager = SessionManager::instance();
 
     let resolved_id = if resume {
+        if resume_uses_picker(
+            identifier.is_some(),
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        ) {
+            let session_id = crate::commands::session::prompt_interactive_session_selection(
+                &session_manager,
+                "resume",
+            )
+            .await?;
+            return Ok(Some(session_id));
+        }
+
         let Some(id) = identifier else {
             let sessions = session_manager.list_sessions().await?;
             let session_id = sessions
@@ -1092,6 +1111,7 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
             } else {
                 match crate::commands::session::prompt_interactive_session_selection(
                     &session_manager,
+                    "export",
                 )
                 .await
                 {
@@ -1115,6 +1135,7 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
             } else {
                 match crate::commands::session::prompt_interactive_session_selection(
                     &session_manager,
+                    "run diagnostics on",
                 )
                 .await
                 {
@@ -1842,6 +1863,14 @@ fn handle_worktree_subcommand(command: WorktreeCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_shows_picker_only_without_id_on_a_tty() {
+        assert!(resume_uses_picker(false, true, true));
+        assert!(!resume_uses_picker(true, true, true));
+        assert!(!resume_uses_picker(false, false, true));
+        assert!(!resume_uses_picker(false, true, false));
+    }
 
     #[test]
     fn completion_command_accepts_nushell_alias() {

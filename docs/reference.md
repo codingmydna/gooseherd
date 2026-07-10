@@ -111,13 +111,14 @@ even for frontier models; `never` disables it.
 | `GOOSE_ARENA_LINEUP` | `codex-acp/gpt-5.5` | Default arena contestant lineup |
 | `GOOSE_ARENA_TIMEOUT_SECS` | 900 | Per-contestant timeout |
 | `GOOSE_GOAL_MAX_ATTEMPTS` | 5 | `goose goal` / `/goal` max attempts |
-| `GOOSE_LIVE_INPUT` | false | Live stdin steering while a turn streams (tty + unix) |
+| `GOOSE_LIVE_INPUT` | on (unix tty) | Live stdin steering + bare-Esc interrupt while a turn streams; set `false` to disable |
 
 ## UX, rendering & misc
 
 | Knob | Default | Description |
 |---|---|---|
-| `GOOSE_STATUS_HOOK` | unset | Command run on status changes (turn-end notifications) |
+| `GOOSE_STATUS_HOOK` | unset | Shell command run on each status change, receiving the status word as its argument (`thinking` when a turn starts, `waiting` when it returns to the prompt). Runs detached; stdout/stderr are discarded. Use it for desktop notifications or tmux/status-bar integration. |
+| `GOOSE_BELL` | true | Ring the terminal bell (BEL) when a turn that ran longer than 10s finishes on a tty |
 | `GOOSE_CLI_THEME` | `ansi` | Syntax-highlight theme |
 | `GOOSE_CLI_DARK_THEME` / `GOOSE_CLI_LIGHT_THEME` | built-in | Theme names |
 | `GOOSE_CLI_SHOW_COST` | false | Show token cost in the status line |

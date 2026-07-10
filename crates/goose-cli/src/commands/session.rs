@@ -395,6 +395,7 @@ fn export_session_to_markdown(
 /// Shows a list of available sessions and lets the user select one
 pub async fn prompt_interactive_session_selection(
     session_manager: &SessionManager,
+    action: &str,
 ) -> Result<String> {
     let sessions = session_manager.list_sessions().await?;
 
@@ -403,7 +404,8 @@ pub async fn prompt_interactive_session_selection(
     }
 
     // Build the selection prompt
-    let mut selector = select("Select a session to export:");
+    let prompt = format!("Select a session to {action}:");
+    let mut selector = select(&prompt);
 
     // Map to display text
     let display_map: std::collections::HashMap<String, Session> = sessions
@@ -428,13 +430,14 @@ pub async fn prompt_interactive_session_selection(
 
     // Add a cancel option
     let cancel_value = String::from("cancel");
-    selector = selector.item(cancel_value, "Cancel", "Cancel export");
+    let cancel_hint = format!("Cancel {action}");
+    selector = selector.item(cancel_value, "Cancel", cancel_hint);
 
     // Get user selection
     let selected_display_text: String = selector.interact()?;
 
     if selected_display_text == "cancel" {
-        return Err(anyhow::anyhow!("Export canceled"));
+        return Err(anyhow::anyhow!("{action} canceled"));
     }
 
     // Retrieve the selected session

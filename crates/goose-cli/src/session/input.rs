@@ -3,13 +3,12 @@ use super::goal;
 use super::looping::{self, ParsedLoopCommand};
 use super::{CompletionCache, HintStatus};
 use anyhow::Result;
-use goose::config::{Config, GooseMode};
+use goose::config::Config;
 use rustyline::Editor;
 use shlex;
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::sync::Arc;
-use strum::VariantNames;
 
 const MIN_INPUT_BOX_WIDTH: usize = 20;
 
@@ -315,7 +314,22 @@ pub fn get_input(
     // Handle slash commands
     match handle_slash_command(&input) {
         Some(result) => Ok(result),
-        None => Ok(InputResult::Message(input.trim().to_string())),
+        None => {
+            let token = input.split_whitespace().next().unwrap_or_default();
+            match super::commands_registry::nearest_command(token) {
+                Some(suggestion) => {
+                    println!(
+                        "{}",
+                        console::style(format!(
+                            "Unknown command {token} — did you mean {suggestion}?"
+                        ))
+                        .yellow()
+                    );
+                    Ok(InputResult::Retry)
+                }
+                None => Ok(InputResult::Message(input.trim().to_string())),
+            }
+        }
     }
 }
 
@@ -581,50 +595,20 @@ fn parse_prompt_command(args: &str) -> Option<InputResult> {
 
 fn print_help() {
     let newline_key = get_newline_key().to_ascii_uppercase();
-    let modes = GooseMode::VARIANTS.join(", ");
+    println!("{}\n", super::commands_registry::help_text());
     println!(
-        "Available commands:
-/exit or /quit - Exit the session
-/t - Toggle Light/Dark/Ansi theme
-/t <name> - Set theme directly (light, dark, ansi)
-/r - Toggle full tool output display (show complete tool parameters without truncation)
-/extension <command> - Add a stdio extension (format: ENV1=val1 command args...)
-/builtin <names> - Add builtin extensions by name (comma-separated)
-/prompts [--extension <name>] - List all available prompts, optionally filtered by extension
-/prompt <n> [--info] [key=value...] - Get prompt info or execute a prompt
-/mode <name> - Set the goose mode to use ({modes})
-/model [provider/]model - Without args, open a provider/model picker; with args, switch this session and save it as default
-/effort [target] <level> - Without args, pick reasoning effort for session/planner/implementer/reviewer; bare level sets session effort
-/orch <task> - Run the task through a plan/implement/review loop: planner model plans, implementer model executes, reviewer model reviews until approved (GOOSE_PLANNER_*, GOOSE_IMPLEMENTER_*, GOOSE_REVIEWER_* config)
-/goal <goal> [--max N] [--check \"cmd\"] - Retry a normal turn until a deterministic check or evaluator says GOAL_MET
-/loop [every] <prompt> - Repeat a prompt on an interval until stopped (/loopstop) or done
-/status - Show session status: provider/model/effort/connection type, orchestration roles, subagent config, token usage
-/usage - Show token usage and cost for this session
-/stats - Orch/goal run statistics: per-role/model tokens, durations, verdicts, reported-model verification
-/arena [lineup=provider/model,...] <task> - Run the same task on each contestant in isolated git worktrees, then blind-judge the diffs (GOOSE_ARENA_LINEUP, GOOSE_ARENA_TIMEOUT_SECS)
-/worktree <name> - Create a named git worktree under .goose/worktrees and print how to enter it
-/btw <question> - Ask a side question (answered by the planner model) without adding it to the session history
-/roles [role=provider/model ...] - Show or change /orch role assignments in-session (also effort=<level>, cycles=<n>)
-/preset [save <name> | <name> | delete <name>] - Save/apply/delete role presets; bare /preset opens a picker. Shift+Tab cycles presets at the prompt
-/init - Analyze this repository and write (or improve) AGENTS.md
-/remember <note> - Append a note to this project's .goosehints memory
-/terminal-setup - Install a terminal key binding so Shift+Enter can insert a newline
-!<command> - Run a shell command directly; its output is added to the conversation context
-/recipe [filepath] - Generate a recipe from the current conversation and save it to the specified filepath (must end with .yaml).
-                       If no filepath is provided, it will be saved to ./recipe.yaml.
-/compact - Compact the current conversation to reduce context length while preserving key information.
-/edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
-               Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
-/skills - List available skills or enable skills by name (usage: /skills [<name>...])
-/? or /help - Display this help message
-/clear - Clears the current chat history
+        "Keybindings:
+  Enter                 Submit
+  Ctrl+{newline_key}                Insert a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
+  Shift+Tab             Cycle role presets
+  Esc                   Interrupt the current turn
+  Ctrl+C                Clear the line, or exit on an empty line
+  Shift+Enter           Insert a newline (run /terminal-setup first)
+  Up / Down             Navigate command history
 
-Navigation:
-Ctrl+C - Clear current line if text is entered, otherwise exit the session
-Shift+Enter - Add a newline after your terminal sends a distinct key sequence; run /terminal-setup if it submits instead
-Option+Enter - Add a newline using the ESC+Enter sequence
-Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
-Up/Down arrows - Navigate through command history"
+  !<command>            Run a shell command; its output joins the conversation
+
+hooks: GOOSE_STATUS_HOOK"
     );
 }
 
@@ -656,6 +640,36 @@ fn print_editor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::commands_registry::COMMANDS;
+
+    #[test]
+    fn every_registry_command_and_alias_has_a_dispatch_arm() {
+        for command in COMMANDS {
+            let sample = if command.needs_args {
+                format!("{} x", command.name)
+            } else {
+                command.name.to_string()
+            };
+            assert!(
+                handle_slash_command(&sample).is_some(),
+                "registry command {} has no dispatch arm",
+                command.name
+            );
+            for alias in command.aliases {
+                assert!(
+                    handle_slash_command(alias).is_some(),
+                    "registry alias {alias} has no dispatch arm",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_slash_command_falls_through_to_unregistered() {
+        // Nothing outside the registry should dispatch, so typo suggestions and
+        // message passthrough can take over.
+        assert!(handle_slash_command("/definitelynotacommand").is_none());
+    }
 
     #[test]
     fn boxed_prompt_draws_top_border_and_prompt() {

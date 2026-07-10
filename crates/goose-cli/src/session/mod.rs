@@ -1,5 +1,6 @@
 mod arena;
 mod builder;
+mod commands_registry;
 mod completion;
 pub mod editor;
 mod elicitation;
@@ -499,14 +500,7 @@ impl CliSession {
                 console::style("●").red(),
                 console::style(format!("session closed · {}", &self.session_id)).dim()
             );
-            println!(
-                "  {}",
-                console::style(format!(
-                    "resume with: goose session --resume --session-id {}",
-                    &self.session_id
-                ))
-                .cyan()
-            );
+            println!("  {}", console::style("resume with: goose s -r").cyan());
         }
 
         result
@@ -1642,16 +1636,22 @@ impl CliSession {
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
 
-        // Live stdin while the turn streams: slash commands and steering text.
+        // Live stdin while the turn streams: slash commands, steering text, and
+        // a bare Esc to interrupt. On by default on an interactive tty (unix);
+        // GOOSE_LIVE_INPUT=false opts out.
         let mut live_stdin = if interactive
-            && Config::global()
-                .get_param::<bool>("GOOSE_LIVE_INPUT")
-                .unwrap_or(false)
-        {
+            && live_input::should_enable_live_input(
+                std::io::stdout().is_terminal(),
+                std::io::stdin().is_terminal(),
+                Config::global().get_param::<bool>("GOOSE_LIVE_INPUT").ok(),
+            ) {
             live_input::LiveStdin::enable()
         } else {
             None
         };
+        if live_stdin.is_some() {
+            output::arm_live_input_hint();
+        }
         let mut live_tick = tokio::time::interval(std::time::Duration::from_millis(150));
         live_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut status_tick = tokio::time::interval(output::thinking_status_refresh_interval());
@@ -1847,8 +1847,16 @@ impl CliSession {
                 }
                 _ = live_tick.tick(), if live_stdin.is_some() => {
                     if let Some(ls) = live_stdin.as_mut() {
-                        while let Some(line) = ls.poll_line() {
-                            self.handle_live_command(&line).await;
+                        for event in ls.poll_events() {
+                            match event {
+                                live_input::LiveInputEvent::Steer(line) => {
+                                    self.handle_live_command(&line).await;
+                                }
+                                live_input::LiveInputEvent::Interrupt => {
+                                    cancel_token_clone.cancel();
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -1861,6 +1869,7 @@ impl CliSession {
             }
         }
         drop(live_stdin);
+        output::finish_live_input_hint();
 
         let leftover_steers = self.take_uninjected_steers();
         if !leftover_steers.is_empty() {
@@ -1934,6 +1943,7 @@ impl CliSession {
             if self.stats {
                 print_run_stats(run_started, first_token_at, last_usage.as_ref());
             }
+            output::ring_bell_if(run_started.elapsed());
         }
 
         Ok(())

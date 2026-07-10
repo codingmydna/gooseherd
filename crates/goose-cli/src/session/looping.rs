@@ -113,7 +113,7 @@ enum WaitInputEvent {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum WaitInputClass {
+pub(crate) enum WaitInputClass {
     BareEsc,
     EscapeSequence { len: usize, complete: bool },
     Ordinary,
@@ -267,7 +267,7 @@ fn format_interval(duration: Duration) -> String {
     }
 }
 
-fn classify_wait_input(bytes: &[u8]) -> WaitInputClass {
+pub(crate) fn classify_wait_input(bytes: &[u8]) -> WaitInputClass {
     if bytes.first() != Some(&0x1b) {
         return WaitInputClass::Ordinary;
     }
@@ -285,7 +285,7 @@ fn classify_wait_input(bytes: &[u8]) -> WaitInputClass {
     WaitInputClass::BareEsc
 }
 
-fn escape_sequence_tail_len(bytes: &[u8]) -> (usize, bool) {
+pub(crate) fn escape_sequence_tail_len(bytes: &[u8]) -> (usize, bool) {
     for (index, &byte) in bytes.iter().enumerate() {
         if (0x30..=0x3f).contains(&byte) || (0x20..=0x2f).contains(&byte) {
             continue;
