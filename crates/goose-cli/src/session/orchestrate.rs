@@ -9,6 +9,7 @@ mod roles;
 mod runner;
 mod workspace;
 
+pub(crate) use gates::{partition_gates, resolve_gates, GateOrigin};
 pub(super) use roles::{build_role_provider, resolve_all_roles, RoleConfig};
 
 const MAX_CYCLES_KEY: &str = "GOOSE_ORCH_MAX_CYCLES";

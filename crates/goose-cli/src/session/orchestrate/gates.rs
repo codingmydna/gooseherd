@@ -30,14 +30,145 @@ pub(super) fn effective_gates(gates: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GateOrigin {
+    LocalFile,
+    Derived(String),
+    Global,
+    None,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedGates {
+    pub gates: Vec<String>,
+    pub origin: GateOrigin,
+}
+
+pub(crate) fn resolve_gates(repo_dir: &Path, global_gates: Vec<String>) -> ResolvedGates {
+    if let Ok(contents) = std::fs::read_to_string(repo_dir.join(".goosegates")) {
+        let gates = parse_gate_lines(&contents);
+        if !gates.is_empty() {
+            return ResolvedGates {
+                gates,
+                origin: GateOrigin::LocalFile,
+            };
+        }
+    }
+
+    // Cargo repositories retain their existing global configuration unchanged.
+    if !repo_dir.join("Cargo.toml").exists() {
+        let (gates, sources) = derive_manifest_gates(repo_dir);
+        if !gates.is_empty() {
+            return ResolvedGates {
+                gates,
+                origin: GateOrigin::Derived(sources.join("+")),
+            };
+        }
+    }
+
+    let gates = effective_gates(global_gates);
+    if gates.is_empty() {
+        ResolvedGates {
+            gates,
+            origin: GateOrigin::None,
+        }
+    } else {
+        ResolvedGates {
+            gates,
+            origin: GateOrigin::Global,
+        }
+    }
+}
+
+fn parse_gate_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn derive_manifest_gates(repo_dir: &Path) -> (Vec<String>, Vec<String>) {
+    let mut gates = Vec::new();
+    let mut sources = Vec::new();
+
+    if let Ok(package_json) = std::fs::read_to_string(repo_dir.join("package.json")) {
+        let package_manager = node_package_manager(repo_dir);
+        let node_gates = derive_node_gates(&package_json, package_manager);
+        if !node_gates.is_empty() {
+            gates.extend(node_gates);
+            sources.push(format!("package.json ({package_manager})"));
+        }
+    }
+    if repo_dir.join("go.mod").exists() {
+        gates.extend(["go build ./...".to_string(), "go test ./...".to_string()]);
+        sources.push("go.mod".to_string());
+    }
+    if let Ok(pyproject) = std::fs::read_to_string(repo_dir.join("pyproject.toml")) {
+        let python_gates = derive_python_gates(&pyproject, repo_dir.join("uv.lock").exists());
+        if !python_gates.is_empty() {
+            gates.extend(python_gates);
+            sources.push("pyproject.toml".to_string());
+        }
+    }
+    (gates, sources)
+}
+
+fn node_package_manager(repo_dir: &Path) -> &'static str {
+    for (lockfile, package_manager) in [
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("package-lock.json", "npm"),
+    ] {
+        if repo_dir.join(lockfile).exists() {
+            return package_manager;
+        }
+    }
+    "npm"
+}
+
+fn derive_node_gates(package_json: &str, package_manager: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(package_json) else {
+        return Vec::new();
+    };
+    let Some(scripts) = value.get("scripts").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+
+    ["test", "build"]
+        .into_iter()
+        .filter_map(|name| {
+            let script = scripts.get(name)?.as_str()?.trim();
+            if script.is_empty() || (name == "test" && is_placeholder_test_script(script)) {
+                None
+            } else {
+                Some(format!("{package_manager} run {name}"))
+            }
+        })
+        .collect()
+}
+
+fn is_placeholder_test_script(script: &str) -> bool {
+    script.to_ascii_lowercase().contains("no test specified")
+}
+
+fn derive_python_gates(pyproject: &str, has_uv_lock: bool) -> Vec<String> {
+    // uv.lock makes this safe on a clean checkout; other Python setups may lack an environment.
+    if has_uv_lock && pyproject.contains("pytest") {
+        vec!["uv run pytest".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 #[derive(Debug)]
-pub(super) struct GateSkip {
+pub(crate) struct GateSkip {
     pub command: String,
     pub reason: String,
 }
 
 #[derive(Debug, Default)]
-pub(super) struct GatePartition {
+pub(crate) struct GatePartition {
     pub applicable: Vec<String>,
     pub skipped: Vec<GateSkip>,
 }
@@ -48,7 +179,7 @@ pub(super) struct GatePartition {
 /// not installed. Without this, an unrelated gate fails forever and re-dispatches
 /// the implementer — which is how orchestrating a JS repo with goose's own Rust
 /// gates looped and pushed the implementer to fabricate a `Cargo.toml`.
-pub(super) fn partition_gates(impl_dir: &Path, gates: &[String]) -> GatePartition {
+pub(crate) fn partition_gates(impl_dir: &Path, gates: &[String]) -> GatePartition {
     let mut partition = GatePartition::default();
     for gate in gates {
         let command = gate.trim();
@@ -156,7 +287,39 @@ fn spawn_gate(impl_dir: &Path, command: &str) -> std::io::Result<std::process::O
         cmd
     };
 
-    cmd.current_dir(impl_dir).output()
+    cmd.current_dir(impl_dir).env("CI", "true").output()
+}
+
+pub(crate) fn gate_origin_banner(resolved: &ResolvedGates, partition: &GatePartition) -> String {
+    let skipped = if partition.skipped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} of {} skipped)",
+            partition.skipped.len(),
+            resolved.gates.len()
+        )
+    };
+    match &resolved.origin {
+        GateOrigin::LocalFile => format!(
+            "gates: {} from .goosegates{skipped}",
+            partition.applicable.len()
+        ),
+        GateOrigin::Derived(source) => {
+            format!(
+                "gates: {} derived from {source}{skipped}",
+                partition.applicable.len()
+            )
+        }
+        GateOrigin::Global => format!(
+            "gates: {} from global GOOSE_ORCH_GATES{skipped}",
+            partition.applicable.len()
+        ),
+        GateOrigin::None => {
+            "gates: none (no .goosegates, no supported manifest, GOOSE_ORCH_GATES unset)"
+                .to_string()
+        }
+    }
 }
 
 fn command_needs_shell(command: &str) -> bool {
@@ -484,6 +647,115 @@ mod tests {
         assert_eq!(
             super::gate_passed_review_note(&gates),
             "\n\ngates passed: cargo fmt --check; cargo test -p goose-cli"
+        );
+    }
+
+    #[test]
+    fn node_package_manager_prefers_lockfiles_in_priority_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(super::node_package_manager(temp.path()), "npm");
+        fs::write(temp.path().join("package-lock.json"), "{}").expect("npm lock");
+        assert_eq!(super::node_package_manager(temp.path()), "npm");
+        fs::write(temp.path().join("yarn.lock"), "").expect("yarn lock");
+        assert_eq!(super::node_package_manager(temp.path()), "yarn");
+        fs::write(temp.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").expect("pnpm lock");
+        assert_eq!(super::node_package_manager(temp.path()), "pnpm");
+    }
+
+    #[test]
+    fn node_derivation_uses_only_real_test_and_build_scripts() {
+        let gates = super::derive_node_gates(
+            r#"{"scripts":{"test":"vitest run","build":"tsc","lint":"eslint .","typecheck":"tsc --noEmit"}}"#,
+            "pnpm",
+        );
+        assert_eq!(gates, ["pnpm run test", "pnpm run build"]);
+
+        let placeholder = super::derive_node_gates(
+            r#"{"scripts":{"test":"echo \"Error: no test specified\" && exit 1","lint":"eslint ."}}"#,
+            "npm",
+        );
+        assert!(placeholder.is_empty());
+    }
+
+    #[test]
+    fn local_gate_file_takes_precedence_over_manifest_derivation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join(".goosegates"),
+            "# checks\ncustom test\n\ncustom build\n",
+        )
+        .expect("gate file");
+        fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"test":"vitest run","build":"tsc"}}"#,
+        )
+        .expect("package json");
+
+        let resolved = super::resolve_gates(temp.path(), vec!["cargo test".to_string()]);
+        assert_eq!(resolved.origin, super::GateOrigin::LocalFile);
+        assert_eq!(resolved.gates, ["custom test", "custom build"]);
+    }
+
+    #[test]
+    fn resolve_gates_falls_back_to_global_and_preserves_cargo_repos() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = vec!["cargo fmt --check".to_string()];
+        let resolved = super::resolve_gates(temp.path(), global.clone());
+        assert_eq!(resolved.origin, super::GateOrigin::Global);
+
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"test\"\n",
+        )
+        .expect("cargo manifest");
+        fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"test":"vitest run"}}"#,
+        )
+        .expect("package json");
+        let resolved = super::resolve_gates(temp.path(), global);
+        assert_eq!(resolved.origin, super::GateOrigin::Global);
+        assert_eq!(resolved.gates, ["cargo fmt --check"]);
+
+        let empty = tempfile::tempdir().expect("empty tempdir");
+        assert_eq!(
+            super::resolve_gates(empty.path(), Vec::new()).origin,
+            super::GateOrigin::None
+        );
+    }
+
+    #[test]
+    fn derives_go_and_safe_uv_pytest_gates() {
+        let go = tempfile::tempdir().expect("go tempdir");
+        fs::write(go.path().join("go.mod"), "module example.com/test\n").expect("go mod");
+        let resolved = super::resolve_gates(go.path(), Vec::new());
+        assert_eq!(resolved.gates, ["go build ./...", "go test ./..."]);
+
+        let python = tempfile::tempdir().expect("python tempdir");
+        fs::write(
+            python.path().join("pyproject.toml"),
+            "[project]\ndependencies = [\"pytest\"]\n",
+        )
+        .expect("pyproject");
+        fs::write(python.path().join("uv.lock"), "version = 1\n").expect("uv lock");
+        let resolved = super::resolve_gates(python.path(), Vec::new());
+        assert_eq!(resolved.gates, ["uv run pytest"]);
+        assert!(super::derive_python_gates("pytest", false).is_empty());
+    }
+
+    #[test]
+    fn gate_origin_banner_reports_source_and_skips() {
+        let resolved = super::ResolvedGates {
+            gates: vec!["npm run test".to_string()],
+            origin: super::GateOrigin::Derived("package.json".to_string()),
+        };
+        let partition = super::GatePartition {
+            applicable: vec!["npm run test".to_string()],
+            skipped: Vec::new(),
+        };
+        assert_eq!(
+            super::gate_origin_banner(&resolved, &partition),
+            "gates: 1 derived from package.json"
         );
     }
 }
