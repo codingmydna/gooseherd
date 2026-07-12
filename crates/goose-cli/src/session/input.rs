@@ -26,6 +26,7 @@ pub enum InputResult {
     GooseMode(String),
     Model(Option<String>),
     Orchestrate(String),
+    Chat(String),
     Status,
     UsageInfo,
     Btw(String),
@@ -166,9 +167,13 @@ pub(super) fn terminal_input_box_width() -> usize {
     input_box_width(columns.into())
 }
 
-pub(super) fn boxed_prompt(width: usize) -> String {
+pub(super) fn boxed_prompt(width: usize, mode_label: Option<&str>) -> String {
     let width = width.max(MIN_INPUT_BOX_WIDTH);
-    format!("╭{}╮\n│ > ", "─".repeat(width.saturating_sub(2)))
+    let prefix = match mode_label {
+        Some(label) => format!("│ {label} > "),
+        None => "│ > ".to_string(),
+    };
+    format!("╭{}╮\n{}", "─".repeat(width.saturating_sub(2)), prefix)
 }
 
 pub(super) fn box_bottom(width: usize) -> String {
@@ -187,6 +192,7 @@ pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     conversation_messages: Option<&Vec<String>>,
     initial: Option<&str>,
+    mode_label: Option<&str>,
 ) -> Result<InputResult> {
     let config = Config::global();
     let prompt_editor = config.get_goose_prompt_editor().ok().flatten();
@@ -251,9 +257,12 @@ pub fn get_input(
     let use_boxed_prompt = io::stdout().is_terminal();
     let input_box_width = terminal_input_box_width();
     let prompt = if use_boxed_prompt {
-        boxed_prompt(input_box_width)
+        boxed_prompt(input_box_width, mode_label)
     } else {
-        "> ".to_string()
+        match mode_label {
+            Some(label) => format!("{label} > "),
+            None => "> ".to_string(),
+        }
     };
 
     let readline_result = match initial.filter(|s| !s.is_empty()) {
@@ -377,6 +386,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_MODEL: &str = "/model";
     const CMD_MODEL_WITH_SPACE: &str = "/model ";
     const CMD_ORCH: &str = "/orch";
+    const CMD_CHAT: &str = "/chat";
     const CMD_GOAL: &str = "/goal";
     const CMD_LOOP: &str = "/loop";
     const CMD_STATUS: &str = "/status";
@@ -465,6 +475,9 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_ORCH || s.starts_with(&format!("{CMD_ORCH} ")) => Some(
             InputResult::Orchestrate(s.get(CMD_ORCH.len()..).unwrap_or("").trim().to_string()),
         ),
+        s if s == CMD_CHAT || s.starts_with(&format!("{CMD_CHAT} ")) => Some(InputResult::Chat(
+            s.get(CMD_CHAT.len()..).unwrap_or("").trim().to_string(),
+        )),
         s if s == CMD_GOAL || s.starts_with(&format!("{CMD_GOAL} ")) => {
             match goal::parse_goal_command_args(s.get(CMD_GOAL.len()..).unwrap_or("").trim()) {
                 Ok(command) => Some(InputResult::Goal(command)),
@@ -721,10 +734,37 @@ mod tests {
 
     #[test]
     fn boxed_prompt_draws_top_border_and_prompt() {
-        let prompt = boxed_prompt(20);
+        let prompt = boxed_prompt(20, None);
 
         assert_eq!(prompt, "╭──────────────────╮\n│ > ");
         assert!(!prompt.ends_with('\n'));
+    }
+
+    #[test]
+    fn boxed_prompt_shows_mode_label() {
+        let prompt = boxed_prompt(20, Some("herd"));
+
+        assert_eq!(prompt, "╭──────────────────╮\n│ herd > ");
+    }
+
+    #[test]
+    fn chat_command_parses_with_and_without_args() {
+        match handle_slash_command("/chat") {
+            Some(InputResult::Chat(text)) => assert!(text.is_empty()),
+            other => panic!("expected Chat, got {other:?}"),
+        }
+        match handle_slash_command("/chat 이 에러 설명해줘") {
+            Some(InputResult::Chat(text)) => assert_eq!(text, "이 에러 설명해줘"),
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orch_command_with_no_args_parses_as_empty_task() {
+        match handle_slash_command("/orch") {
+            Some(InputResult::Orchestrate(task)) => assert!(task.is_empty()),
+            other => panic!("expected Orchestrate, got {other:?}"),
+        }
     }
 
     #[test]

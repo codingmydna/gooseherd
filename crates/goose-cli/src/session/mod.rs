@@ -204,6 +204,9 @@ pub struct CliSession {
     goal_stop_requested: AtomicBool,
     goal_status: std::sync::Mutex<Option<goal::GoalStatusSnapshot>>,
     context_over_warned: AtomicBool,
+    /// When on, plain input runs the orchestration pipeline instead of a chat
+    /// turn. Toggled with bare `/orch`; `/chat` exits. Session-scoped.
+    herd_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,7 +287,20 @@ impl CliSession {
             goal_stop_requested: AtomicBool::new(false),
             goal_status: std::sync::Mutex::new(None),
             context_over_warned: AtomicBool::new(false),
+            herd_mode: false,
         }
+    }
+
+    /// Switch between herd mode (plain input → orchestration pipeline) and
+    /// chat mode, announcing the change.
+    fn set_herd_mode(&mut self, on: bool) {
+        self.herd_mode = on;
+        let notice = if on {
+            "herd mode on — plain messages run plan → implement → review (/orch toggles, /chat exits)"
+        } else {
+            "herd mode off — plain messages chat with the session model"
+        };
+        println!("{}", console::style(notice).cyan());
     }
 
     pub fn session_id(&self) -> &String {
@@ -557,8 +573,12 @@ impl CliSession {
 
             output::run_status_hook("waiting");
             let prefill = self.input_prefill.lock().unwrap().take();
-            let input =
-                input::get_input(&mut editor, Some(&conversation_strings), prefill.as_deref())?;
+            let input = input::get_input(
+                &mut editor,
+                Some(&conversation_strings),
+                prefill.as_deref(),
+                self.herd_mode.then_some("herd"),
+            )?;
             if matches!(input, InputResult::Exit) {
                 break;
             }
@@ -605,7 +625,14 @@ impl CliSession {
     ) -> Result<()> {
         match input {
             InputResult::Message(content) => {
-                self.handle_message_input(&content, history, editor).await?;
+                if self.herd_mode {
+                    history.save(editor);
+                    if let Err(e) = self.handle_orchestrate(content, None, false, true).await {
+                        output::render_error(&e.to_string());
+                    }
+                } else {
+                    self.handle_message_input(&content, history, editor).await?;
+                }
             }
             InputResult::Exit => unreachable!("Exit is handled in the main loop"),
             InputResult::AddExtension(cmd) => {
@@ -652,8 +679,26 @@ impl CliSession {
             }
             InputResult::Orchestrate(task) => {
                 history.save(editor);
-                if let Err(e) = self.handle_orchestrate(task, None, false, true).await {
+                if task.is_empty() {
+                    let next = !self.herd_mode;
+                    self.set_herd_mode(next);
+                } else if let Err(e) = self.handle_orchestrate(task, None, false, true).await {
                     output::render_error(&e.to_string());
+                }
+            }
+            InputResult::Chat(text) => {
+                if text.is_empty() {
+                    if self.herd_mode {
+                        self.set_herd_mode(false);
+                    } else {
+                        println!(
+                            "{}",
+                            console::style("already in chat mode — bare /orch enters herd mode")
+                                .dim()
+                        );
+                    }
+                } else {
+                    self.handle_message_input(&text, history, editor).await?;
                 }
             }
             InputResult::Loop(command) => {
@@ -2238,7 +2283,8 @@ impl CliSession {
         // Keep the input-line hint status in sync (rendered by GooseCompleter).
         let mode = self.agent.goose_mode().await;
         let status_line = format!(
-            "{}/{} · {} · {}",
+            "{}{}/{} · {} · {}",
+            if self.herd_mode { "herd · " } else { "" },
             provider.get_name(),
             model_config.model_name,
             mode,

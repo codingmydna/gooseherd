@@ -113,8 +113,16 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/orch",
         aliases: &[],
-        args: "<task>",
-        desc: "Plan → implement → review loop across models",
+        args: "[task]",
+        desc: "Plan → implement → review loop; no args toggles herd mode",
+        group: CommandGroup::Orchestration,
+        needs_args: false,
+    },
+    SlashCommand {
+        name: "/chat",
+        aliases: &[],
+        args: "[message]",
+        desc: "Chat one message directly; no args leaves herd mode",
         group: CommandGroup::Orchestration,
         needs_args: false,
     },
