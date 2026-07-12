@@ -1634,10 +1634,10 @@ async fn handle_orch_command(text: String, max_cycles: Option<u32>, merge: bool)
     .await;
 
     let outcome = session
-        .handle_orchestrate(text, max_cycles, merge, false)
+        .handle_orchestrate(text, max_cycles, merge, false, false)
         .await?;
     match outcome {
-        crate::session::OrchOutcome::Approved => {}
+        crate::session::OrchOutcome::Approved | crate::session::OrchOutcome::Answered => {}
         crate::session::OrchOutcome::LimitError => std::process::exit(3),
         _ => std::process::exit(1),
     }

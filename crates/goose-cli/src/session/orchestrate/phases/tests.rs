@@ -2,6 +2,39 @@ use super::super::roles::RoleConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[test]
+fn triage_answer_detects_answer_replies_only() {
+    assert_eq!(
+        super::triage_answer("ANSWER\n에러의 원인은 X입니다."),
+        Some("에러의 원인은 X입니다.".to_string())
+    );
+    assert_eq!(
+        super::triage_answer("  \nANSWER: 짧은 답."),
+        Some("짧은 답.".to_string())
+    );
+    assert_eq!(
+        super::triage_answer("ANSWER: 첫 줄.\n둘째 줄."),
+        Some("첫 줄.\n둘째 줄.".to_string())
+    );
+    // A plan (or anything else) is not an answer.
+    assert_eq!(super::triage_answer("## Files\n- a.rs"), None);
+    assert_eq!(
+        super::triage_answer("The ANSWER is in the plan below\n## Files"),
+        None
+    );
+}
+
+#[test]
+fn planner_prompt_includes_triage_protocol_only_when_enabled() {
+    let with = super::planner_prompt(false, true);
+    let without = super::planner_prompt(false, false);
+    assert!(with.contains("Triage protocol"));
+    assert!(!without.contains("Triage protocol"));
+    // Question protocol composes with triage.
+    let both = super::planner_prompt(true, true);
+    assert!(both.contains("Triage protocol") && both.contains("Planner question protocol"));
+}
+
 #[derive(Debug)]
 struct SilentProvider {
     first_text: Option<&'static str>,
@@ -340,8 +373,8 @@ fn orch_progress_cadence_allows_zero_to_disable() {
 
 #[test]
 fn planner_prompt_omits_question_protocol_when_disabled() {
-    assert!(!super::planner_prompt(false).contains("orch-question"));
-    assert!(super::planner_prompt(true).contains("orch-question"));
+    assert!(!super::planner_prompt(false, false).contains("orch-question"));
+    assert!(super::planner_prompt(true, false).contains("orch-question"));
 }
 
 #[test]

@@ -1,9 +1,7 @@
 use anyhow::Result;
 use goose::conversation::message::Message;
-use goose::providers::base::Provider;
 use std::io::IsTerminal;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 
 use crate::session::{orch_ask, output, plan_exemplars};
@@ -13,8 +11,8 @@ use super::phases::{
     orch_phase_idle_timeout, orch_progress_cadence, partial_completion_text, persist_artifact,
     phase_banner, plan_quality_action, plan_round_action, plan_structure_action,
     plan_structure_reprompt, planner_prompt, record_phase, record_question_round,
-    render_auto_answer_banner, stream_role_completion_status, validate_plan_structure, PhaseMeta,
-    PlanQualityAction, PlanRoundAction, PlanStructureAction,
+    render_auto_answer_banner, stream_role_completion_status, triage_answer,
+    validate_plan_structure, PhaseMeta, PlanQualityAction, PlanRoundAction, PlanStructureAction,
 };
 use super::repo_pack;
 use super::roles::{
@@ -24,9 +22,14 @@ use super::roles::{
 
 pub(super) struct PlanPhaseOutput {
     pub(super) plan_text: String,
-    pub(super) planner: Arc<dyn Provider>,
-    pub(super) planner_model: goose_providers::model::ModelConfig,
     pub(super) planner_context_limit: Option<usize>,
+}
+
+/// A triage-enabled plan phase either produces a plan or answers the input
+/// directly (questions and no-change requests skip the pipeline entirely).
+pub(super) enum PlanPhaseResult {
+    Plan(PlanPhaseOutput),
+    Answered,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -39,11 +42,12 @@ pub(super) async fn run_plan_phase(
     artifact_dir: &Path,
     run_id: &str,
     interactive: bool,
+    triage: bool,
     planner_role: &RoleConfig,
     planner_repo_pack: Option<&str>,
     repo_scope: Option<&str>,
     meta: &PhaseMeta<'_>,
-) -> Result<PlanPhaseOutput> {
+) -> Result<PlanPhaseResult> {
     let role_idle_timeout = if interactive {
         None
     } else {
@@ -77,7 +81,7 @@ pub(super) async fn run_plan_phase(
     let phase_started = Instant::now();
     let (planner, planner_model) = build_role_provider(planner_role, impl_dir).await?;
     let ask_enabled = orch_ask_enabled();
-    let planner_instructions = planner_prompt(ask_enabled);
+    let planner_instructions = planner_prompt(ask_enabled, triage);
     let mut plan_request_text = format!(
         "{}Task:\n{}\n\nWorking directory: {}",
         user_instruction_preamble(&planner_instructions, planner_role),
@@ -163,6 +167,30 @@ pub(super) async fn run_plan_phase(
             parsed.is_some(),
         ) {
             PlanRoundAction::Finalize => {
+                if triage && parsed.is_none() && triage_answer(&planner_text).is_some() {
+                    // The planner judged this a question / no-change request and
+                    // answered it directly (already streamed to the terminal).
+                    // No workspace, gates, implement, or review happen.
+                    let planner_context_limit =
+                        planner.get_context_limit(&planner_model).await.ok();
+                    record_phase(
+                        meta,
+                        "plan",
+                        0,
+                        "planner",
+                        planner_role,
+                        completion.usage.as_ref(),
+                        planner_context_limit,
+                        phase_started.elapsed().as_millis() as u64,
+                        Some("triage: answered directly"),
+                        None,
+                        Some(&plan_exemplar_injection),
+                        None,
+                        None,
+                    );
+                    persist_artifact(artifact_dir, run_id, "answer.md", &planner_text);
+                    return Ok(PlanPhaseResult::Answered);
+                }
                 if let Some(question_set) = parsed {
                     let answers = orch_ask::auto_recommended_answers(&question_set);
                     render_auto_answer_banner(&question_set, &answers, "round limit");
@@ -347,10 +375,8 @@ pub(super) async fn run_plan_phase(
         console::style(format!("artifacts → .goose-orch/{}/", run_id)).dim()
     );
 
-    Ok(PlanPhaseOutput {
+    Ok(PlanPhaseResult::Plan(PlanPhaseOutput {
         plan_text,
-        planner,
-        planner_model,
         planner_context_limit,
-    })
+    }))
 }

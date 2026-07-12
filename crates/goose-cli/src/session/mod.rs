@@ -209,6 +209,21 @@ pub struct CliSession {
     herd_mode: bool,
 }
 
+/// Initial session mode per `GOOSE_DEFAULT_MODE`: `herd` | `chat` | `auto`
+/// (the default). Auto starts in herd mode when a real herd is configured —
+/// the planner or implementer resolves differently from the session default.
+fn default_herd_mode() -> bool {
+    match Config::global()
+        .get_param::<String>("GOOSE_DEFAULT_MODE")
+        .ok()
+        .as_deref()
+    {
+        Some("herd") => true,
+        Some("chat") => false,
+        _ => orchestrate::herd_roles_configured(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HintStatus {
     Default,
@@ -287,7 +302,7 @@ impl CliSession {
             goal_stop_requested: AtomicBool::new(false),
             goal_status: std::sync::Mutex::new(None),
             context_over_warned: AtomicBool::new(false),
-            herd_mode: false,
+            herd_mode: default_herd_mode(),
         }
     }
 
@@ -539,6 +554,16 @@ impl CliSession {
         let history_manager = HistoryManager::new();
         history_manager.load(&mut editor);
 
+        if self.herd_mode {
+            println!(
+                "  {}",
+                console::style(
+                    "herd mode — plain messages run plan → implement → review (/chat for plain chat)"
+                )
+                .dim()
+            );
+        }
+
         loop {
             // Messages typed while the previous turn was streaming go first.
             while let Some(queued) = {
@@ -627,7 +652,10 @@ impl CliSession {
             InputResult::Message(content) => {
                 if self.herd_mode {
                     history.save(editor);
-                    if let Err(e) = self.handle_orchestrate(content, None, false, true).await {
+                    if let Err(e) = self
+                        .handle_orchestrate(content, None, false, true, true)
+                        .await
+                    {
                         output::render_error(&e.to_string());
                     }
                 } else {
@@ -682,7 +710,10 @@ impl CliSession {
                 if task.is_empty() {
                     let next = !self.herd_mode;
                     self.set_herd_mode(next);
-                } else if let Err(e) = self.handle_orchestrate(task, None, false, true).await {
+                } else if let Err(e) = self
+                    .handle_orchestrate(task, None, false, true, false)
+                    .await
+                {
                     output::render_error(&e.to_string());
                 }
             }

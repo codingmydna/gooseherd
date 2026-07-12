@@ -39,6 +39,10 @@ The commands the implementer should run and the expected outcome of each.
 
 Output only the plan."#;
 
+const PLAN_TRIAGE_PROTOCOL_PROMPT: &str = r#"Triage protocol:
+
+The input may not be an implementation task at all. If it is a question, a request for explanation, analysis, or advice, or anything satisfiable without modifying this repository, do NOT produce a plan. Reply with the single word ANSWER on the first line, then your answer, and end your turn. Use the token ANSWER only in that first-line position. When the input does require changing files, produce the structured plan as specified."#;
+
 const PLAN_QUESTION_PROTOCOL_PROMPT: &str = r#"Planner question protocol:
 
 Before writing the plan, ask the user questions only when their answer would materially change the plan: missing requirements from the original task, an important double-check, or multiple sound implementation approaches. To ask, output only a fenced block and end your turn:
@@ -382,12 +386,39 @@ pub(super) fn gate_banner(text: &str) {
     );
 }
 
-pub(super) fn planner_prompt(ask_enabled: bool) -> String {
-    if ask_enabled {
-        format!("{PLAN_SYSTEM_PROMPT}\n\n{PLAN_QUESTION_PROTOCOL_PROMPT}")
-    } else {
-        PLAN_SYSTEM_PROMPT.to_string()
+pub(super) fn planner_prompt(ask_enabled: bool, triage: bool) -> String {
+    let mut prompt = PLAN_SYSTEM_PROMPT.to_string();
+    if triage {
+        prompt.push_str("\n\n");
+        prompt.push_str(PLAN_TRIAGE_PROTOCOL_PROMPT);
     }
+    if ask_enabled {
+        prompt.push_str("\n\n");
+        prompt.push_str(PLAN_QUESTION_PROTOCOL_PROMPT);
+    }
+    prompt
+}
+
+/// If a triage-enabled planner reply is a direct answer instead of a plan,
+/// return the answer body. The contract is the literal token `ANSWER` (or
+/// `ANSWER:`) as the first non-empty line of the reply.
+pub(super) fn triage_answer(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let first_line = trimmed.lines().next()?.trim();
+    let first_line_rest = if first_line == "ANSWER" {
+        ""
+    } else {
+        first_line.strip_prefix("ANSWER:")?.trim_start()
+    };
+    let body_after_line = trimmed.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+    let body = if first_line_rest.is_empty() {
+        body_after_line.trim().to_string()
+    } else if body_after_line.trim().is_empty() {
+        first_line_rest.to_string()
+    } else {
+        format!("{first_line_rest}\n{}", body_after_line.trim())
+    };
+    Some(body)
 }
 
 pub(crate) fn orch_phase_idle_timeout() -> Duration {

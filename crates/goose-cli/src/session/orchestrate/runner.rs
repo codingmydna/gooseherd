@@ -23,7 +23,7 @@ use super::phases::{
     warn_truncated, PendingReviewArchive, PhaseMeta, PhasePolicySummary, EVIDENCE_CHAR_LIMIT,
     REVIEW_SYSTEM_PROMPT,
 };
-use super::planner::run_plan_phase;
+use super::planner::{run_plan_phase, PlanPhaseResult};
 use super::repo_pack;
 use super::roles::{
     build_role_provider, implement_policy_label, is_acp_provider, playbook_banner_fragment,
@@ -56,6 +56,7 @@ impl CliSession {
         max_cycles_override: Option<u32>,
         merge: bool,
         interactive: bool,
+        triage: bool,
     ) -> Result<OrchOutcome> {
         let task = task.trim().to_string();
         if task.is_empty() {
@@ -134,6 +135,7 @@ impl CliSession {
                 max_cycles,
                 auto_merge,
                 interactive,
+                triage,
                 implement_policy,
             )
             .await;
@@ -200,11 +202,88 @@ impl CliSession {
         max_cycles: u32,
         auto_merge: bool,
         interactive: bool,
+        triage: bool,
         implement_policy: OrchImplementPolicy,
     ) -> Result<OrchOutcome> {
         let config = Config::global();
         let original_dir = std::env::current_dir().context("failed to read current directory")?;
         let run_id = format!("{:x}", ledger::now_ms());
+        // The plan phase runs read-only in the original directory
+        // (GOOSE_ACP_PLAN_EXPLORE pins ACP planners); the worktree, gates, and
+        // security banner materialize only once a real plan exists, so
+        // triage-answered runs cause no workspace churn or banner noise.
+        let repo_pack_root =
+            crate::worktree::find_repo_root(&original_dir).unwrap_or_else(|_| original_dir.clone());
+        // Stable per-repo key so exemplars archived here are preferred by future
+        // runs in the same repo (see exemplar store repo scoping).
+        let repo_scope = exemplars::repo_scope_key(&repo_pack_root);
+        let repo_pack = if repo_pack::repo_pack_injects(planner_role)
+            || repo_pack::repo_pack_injects(implementer_role)
+        {
+            repo_pack::cached_repo_pack(&repo_pack_root)
+        } else {
+            None
+        };
+        let planner_repo_pack = repo_pack
+            .as_deref()
+            .filter(|_| repo_pack::repo_pack_injects(planner_role));
+
+        config.set_runtime_override("GOOSE_ACP_PLAN_EXPLORE", true)?;
+
+        let session_id = self.session_id.clone();
+        let meta = PhaseMeta {
+            session_id: &session_id,
+            run_id: &run_id,
+            task,
+        };
+        let role_idle_timeout = if interactive {
+            None
+        } else {
+            Some(orch_phase_idle_timeout())
+        };
+        let plan_working_dir = original_dir.display().to_string();
+        let plan = match run_plan_phase(
+            &self.session_id,
+            self.debug,
+            task,
+            &plan_working_dir,
+            &original_dir,
+            &original_dir,
+            &run_id,
+            interactive,
+            triage,
+            planner_role,
+            planner_repo_pack,
+            Some(&repo_scope),
+            &meta,
+        )
+        .await
+        {
+            Ok(PlanPhaseResult::Plan(plan)) => plan,
+            Ok(PlanPhaseResult::Answered) => {
+                println!(
+                    "{}",
+                    console::style("orchestrate: answered directly — nothing to implement.")
+                        .green()
+                );
+                return Ok(OrchOutcome::Answered);
+            }
+            Err(err) => {
+                return handle_phase_error(
+                    err,
+                    "planner",
+                    planner_role,
+                    &run_id,
+                    task,
+                    reviewer_role,
+                    &[],
+                    Some(&repo_scope),
+                );
+            }
+        };
+        let plan_text = plan.plan_text;
+        let planner_context_limit = plan.planner_context_limit;
+
         let workspace = setup_orch_workspace(&original_dir, &run_id);
         render_workspace_banner(&workspace, auto_merge);
         let resolved_gates = resolve_gates(
@@ -253,75 +332,9 @@ impl CliSession {
         }
         let working_dir = workspace.impl_dir.display().to_string();
 
-        let repo_pack_root = workspace
-            .repo_root
-            .clone()
-            .unwrap_or_else(|| workspace.original_dir.clone());
-        // Stable per-repo key so exemplars archived here are preferred by future
-        // runs in the same repo (see exemplar store repo scoping).
-        let repo_scope = exemplars::repo_scope_key(&repo_pack_root);
-        let repo_pack = if repo_pack::repo_pack_injects(planner_role)
-            || repo_pack::repo_pack_injects(implementer_role)
-        {
-            repo_pack::cached_repo_pack(&repo_pack_root)
-        } else {
-            None
-        };
-        let planner_repo_pack = repo_pack
-            .as_deref()
-            .filter(|_| repo_pack::repo_pack_injects(planner_role));
-
-        config.set_runtime_override("GOOSE_ACP_PLAN_EXPLORE", true)?;
-
-        let session_id = self.session_id.clone();
-        let meta = PhaseMeta {
-            session_id: &session_id,
-            run_id: &run_id,
-            task,
-        };
-        let role_idle_timeout = if interactive {
-            None
-        } else {
-            Some(orch_phase_idle_timeout())
-        };
-        let plan = match run_plan_phase(
-            &self.session_id,
-            self.debug,
-            task,
-            &working_dir,
-            &workspace.impl_dir,
-            &workspace.original_dir,
-            &run_id,
-            interactive,
-            planner_role,
-            planner_repo_pack,
-            Some(&repo_scope),
-            &meta,
-        )
-        .await
-        {
-            Ok(plan) => plan,
-            Err(err) => {
-                return handle_phase_error(
-                    err,
-                    "planner",
-                    planner_role,
-                    &run_id,
-                    task,
-                    reviewer_role,
-                    &[],
-                    Some(&repo_scope),
-                );
-            }
-        };
-        let plan_text = plan.plan_text;
-        let planner = plan.planner;
-        let planner_model = plan.planner_model;
-        let planner_context_limit = plan.planner_context_limit;
-
-        let (reviewer, reviewer_model) = if reviewer_role == planner_role {
-            (Arc::clone(&planner), planner_model.clone())
-        } else {
+        // The reviewer inspects the worktree, so it is always built against
+        // impl_dir — the planner instance (cwd = original dir) is never reused.
+        let (reviewer, reviewer_model) =
             match build_role_provider(reviewer_role, &workspace.impl_dir).await {
                 Ok(reviewer) => reviewer,
                 Err(err) => {
@@ -336,8 +349,7 @@ impl CliSession {
                         Some(&repo_scope),
                     );
                 }
-            }
-        };
+            };
         config.clear_runtime_override("GOOSE_ACP_PLAN_EXPLORE");
 
         let acp_allowlist =

@@ -112,6 +112,7 @@ even for frontier models; `never` disables it.
 | `GOOSE_ARENA_TIMEOUT_SECS` | 900 | Per-contestant timeout |
 | `GOOSE_GOAL_MAX_ATTEMPTS` | 5 | `goose goal` / `/goal` max attempts |
 | `GOOSE_LIVE_INPUT` | on (unix tty) | Live stdin steering + bare-Esc interrupt while a turn streams; set `false` to disable |
+| `GOOSE_DEFAULT_MODE` | `auto` | Initial session mode: `herd` (plain messages run the plan → implement → review pipeline), `chat`, or `auto` — herd when the resolved planner or implementer differs from the session default. Bare `/orch` toggles herd mode in-session; `/chat` exits it. Herd-mode inputs are triaged by the planner: questions and no-change requests get a direct `ANSWER` (no worktree, gates, implement, or review); explicit `/orch <task>` always plans. |
 
 ## UX, rendering & misc
 

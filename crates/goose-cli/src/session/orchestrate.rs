@@ -24,10 +24,22 @@ const DEFAULT_MAX_GATE_RETRIES: u32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrchOutcome {
     Approved,
+    /// Triage judged the input a question / no-change request and the planner
+    /// answered it directly; no worktree, implement, or review ran.
+    Answered,
     MaxCycles,
     GateFailed,
     Aborted,
     LimitError,
+}
+
+/// Whether a real herd is configured — the planner or implementer resolves to
+/// something other than the session default. Drives `GOOSE_DEFAULT_MODE=auto`:
+/// sessions with a configured herd start in herd mode.
+pub(super) fn herd_roles_configured() -> bool {
+    resolve_all_roles()
+        .map(|roles| roles.planner != roles.default || roles.implementer != roles.default)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
