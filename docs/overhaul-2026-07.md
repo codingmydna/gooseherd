@@ -128,6 +128,44 @@ Workstream A lands first (staged commits, `cargo check/clippy/test` green per st
 then B (each item test-covered), then C. A ships as one reviewed branch; B/C as focused
 follow-ups. Nothing here is pushed to the public repo without the owner's go.
 
+## Phase 2 — UX overhaul: the herd is the default (2026-07-12)
+
+Decision of record for the second UX pass. Rationale: the product's reason to
+exist is "state a task, the herd handles it" — yet the default turn was a plain
+chat with the session provider, and the flagship loop hid behind typing
+`/orch <task>` every time. The default should be the product; plain chat is the
+special purpose.
+
+Decisions:
+
+1. **Sticky herd mode (U1)** — `/orch` with no arguments toggles herd mode for
+   the session (previously a usage error). In herd mode every plain input runs
+   the orchestration pipeline; slash commands work unchanged. `/chat` switches
+   back. The input box and the status strip show the active mode. Mode is
+   session-scoped, not persisted.
+2. **Triage-first planning (U2)** — herd-mode inputs must not force a
+   plan/implement/review round on questions. The planner prompt gains a triage
+   protocol: if the input is a question or answerable without modifying the
+   repo, the planner replies `ANSWER` on the first line followed by the answer,
+   and the run ends there — no worktree, no gates, no implement/review. A reply
+   that is neither a structured plan nor an ANSWER hits the existing
+   missing-sections reprompt. Explicit `/orch <task>` keeps today's
+   always-plan contract (triage applies only to herd-mode dispatch).
+3. **Lazy workspace (U2 prerequisite)** — `run_orchestration` reorders: repo
+   root/pack resolution and the plan phase run in the original directory
+   (safe: `GOOSE_ACP_PLAN_EXPLORE` already pins planners read-only); the
+   worktree, gates resolution, and the security banner materialize only after
+   a real plan is produced. Q&A turns therefore print no workspace/gate noise,
+   and every run skips worktree churn until it is needed.
+4. **Default mode = auto (U2)** — `GOOSE_DEFAULT_MODE` = `auto` (default) |
+   `herd` | `chat`. Auto starts sessions in herd mode when the resolved
+   planner or implementer differs from the session default (a real herd is
+   configured — e.g. any preset), otherwise chat. Zero-config first runs are
+   unaffected until `goose herd` sets roles up.
+5. **CLI one-shot (deferred)** — `goose "<task>"` as a positional argument is
+   deferred until the arg-surface conflicts (subcommand names, recipe paths)
+   are mapped; tracked here so it is not forgotten.
+
 ## Post-review backlog
 
 Findings from the adversarial review deferred as backlog (not addressed in the
