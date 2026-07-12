@@ -186,6 +186,7 @@ fn print_box_bottom(width: usize) {
 pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     conversation_messages: Option<&Vec<String>>,
+    initial: Option<&str>,
 ) -> Result<InputResult> {
     let config = Config::global();
     let prompt_editor = config.get_goose_prompt_editor().ok().flatten();
@@ -255,7 +256,10 @@ pub fn get_input(
         "> ".to_string()
     };
 
-    let readline_result = editor.readline(&prompt);
+    let readline_result = match initial.filter(|s| !s.is_empty()) {
+        Some(init) => editor.readline_with_initial(&prompt, (init, "")),
+        None => editor.readline(&prompt),
+    };
     if let Ok(mut cache) = completion_cache.write() {
         cache.flash = None;
     }

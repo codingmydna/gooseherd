@@ -133,15 +133,23 @@ follow-ups. Nothing here is pushed to the public repo without the owner's go.
 Findings from the adversarial review deferred as backlog (not addressed in the
 review-fix pass):
 
-- **[11] Live steer echo vs spinner redraw** — self-echoed steer characters are
-  overwritten by the cliclack spinner's steady-tick/elapsed-label redraw, so
-  typing while a tool call streams looks invisible (the steer still submits).
-- **[12] Termios restore on SIGTERM** — raw-mode/O_NONBLOCK restore relies only
-  on `Drop`; a SIGTERM/SIGQUIT mid-turn leaves the tty in raw no-echo until
+- ~~**[11] Live steer echo vs spinner redraw**~~ — **fixed 2026-07-12**: the
+  parser no longer echoes at the cursor; edits update an owned pending-steer
+  line (inside the spinner message while it spins, on its own `↳` row during
+  streaming, restored around partial lines). Verified live in iTerm.
+- **[12] Termios restore on SIGTERM** — raw-mode restore relies only on
+  `Drop`; a SIGTERM/SIGQUIT mid-turn leaves the tty in raw no-echo until
   `stty sane`. Needs a signal handler that restores the terminal.
-- **[14] Partial steer line dropped at turn end** — an unsubmitted steer line is
-  discarded when the turn ends instead of flowing to the next rustyline prompt
-  as the old canonical-mode reader promised.
+- ~~**[14] Partial steer line dropped at turn end**~~ — **fixed 2026-07-12**:
+  the unsubmitted buffer prefills the next rustyline prompt
+  (`readline_with_initial`).
+- **[post-review] stdout EAGAIN panic under heavy streaming** — **fixed
+  2026-07-12**: `live_input` set `O_NONBLOCK` on fd 0, which shares its open
+  file description with stdout on a tty, so heavy output (orch implementer
+  streams) could hit `EAGAIN` and panic `print!` ("os error 35",
+  `goose-cli main thread panicked`). The flag is gone — `VMIN=0/VTIME=0`
+  already gives non-blocking tty reads. Mechanism reproduced and fix verified
+  in a live pty (XOFF + write flood).
 - **[22] Arena judge can read contestant logs** — `.goose-arena/<LABEL>.log`
   files carry the `goose run` banner with provider/model in cleartext in the
   judge's cwd; an exploring ACP judge could de-blind the lineup. Scrub/relocate

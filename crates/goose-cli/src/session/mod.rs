@@ -192,6 +192,9 @@ pub struct CliSession {
     /// Plain messages that should be sent automatically after the current
     /// turn, including live steers that were not injected before turn end.
     queued_inputs: std::sync::Mutex<Vec<String>>,
+    /// Text the user had typed (but not submitted) when the turn ended;
+    /// prefills the next prompt instead of being discarded.
+    input_prefill: std::sync::Mutex<Option<String>>,
     /// Live steering messages sent to the active turn; queued only if they
     /// are not injected before the turn ends.
     sent_steers: std::sync::Mutex<Vec<String>>,
@@ -273,6 +276,7 @@ impl CliSession {
             output_format,
             stats,
             queued_inputs: std::sync::Mutex::new(Vec::new()),
+            input_prefill: std::sync::Mutex::new(None),
             sent_steers: std::sync::Mutex::new(Vec::new()),
             loop_active: AtomicBool::new(false),
             loop_stop_requested: AtomicBool::new(false),
@@ -552,7 +556,9 @@ impl CliSession {
                 .collect();
 
             output::run_status_hook("waiting");
-            let input = input::get_input(&mut editor, Some(&conversation_strings))?;
+            let prefill = self.input_prefill.lock().unwrap().take();
+            let input =
+                input::get_input(&mut editor, Some(&conversation_strings), prefill.as_deref())?;
             if matches!(input, InputResult::Exit) {
                 break;
             }
@@ -1784,6 +1790,9 @@ impl CliSession {
                                 if is_stream_json_mode {
                                     emit_stream_event(&StreamEvent::Message { message: message.clone() });
                                 } else if !is_json_mode {
+                                    // The pending steer line owns the last row; clear it
+                                    // before streamed output continues there.
+                                    output::steer_line_erase_if_drawn();
                                     if injected_steer {
                                         output::flush_markdown_buffer_current_theme(&mut markdown_buffer);
                                         output::reset_response_bullet();
@@ -1799,6 +1808,7 @@ impl CliSession {
                                     // Streamed output just moved the cursor; keep the periodic
                                     // status refresh from redrawing the spinner over it.
                                     output::note_streamed_output();
+                                    output::steer_line_redraw_if_pending();
                                 }
                             }
                         }
@@ -1850,9 +1860,11 @@ impl CliSession {
                         for event in ls.poll_events() {
                             match event {
                                 live_input::LiveInputEvent::Steer(line) => {
+                                    output::steer_pending_clear();
                                     self.handle_live_command(&line).await;
                                 }
                                 live_input::LiveInputEvent::Interrupt => {
+                                    output::steer_pending_clear();
                                     cancel_token_clone.cancel();
                                     break;
                                 }
@@ -1867,6 +1879,10 @@ impl CliSession {
                     }
                 }
             }
+        }
+        let partial_steer = output::steer_pending_take();
+        if !partial_steer.is_empty() {
+            self.input_prefill.lock().unwrap().replace(partial_steer);
         }
         drop(live_stdin);
         output::finish_live_input_hint();

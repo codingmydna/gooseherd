@@ -3,10 +3,13 @@
 //! When active (interactive tty on unix), the terminal is switched to raw mode
 //! for the duration of the turn so that a bare Esc interrupts it the same way
 //! Ctrl+C does, arrow keys and other CSI escape sequences are swallowed, and
-//! complete lines are delivered as steering input / slash commands. Printable
-//! characters are echoed so the user can see what they type; the terminal is
-//! restored when the reader is dropped. Ctrl+C keeps working because ISIG is
-//! left enabled — only ICANON and ECHO are cleared.
+//! complete lines are delivered as steering input / slash commands. Typed
+//! characters are never echoed at the cursor — that would interleave them with
+//! streamed model output. Instead every edit reports the full pending line to
+//! the caller, which renders it on an owned status line (see
+//! `output::steer_pending_update`). The terminal is restored when the reader
+//! is dropped. Ctrl+C keeps working because ISIG is left enabled — only ICANON
+//! and ECHO are cleared.
 
 use super::looping::{classify_wait_input, escape_sequence_tail_len, WaitInputClass};
 
@@ -33,9 +36,10 @@ pub fn should_enable_live_input(
 }
 
 /// Byte-stream parser shared by the platform reader and unit tests: it turns raw
-/// terminal bytes into [`LiveInputEvent`]s, echoing printable edits through the
-/// supplied callback. Kept separate from the fd handling so it can be tested
-/// without a real terminal.
+/// terminal bytes into [`LiveInputEvent`]s, reporting the full pending line
+/// through `on_edit` after every edit so the caller can repaint its input line.
+/// Kept separate from the fd handling so it can be tested without a real
+/// terminal.
 #[derive(Default)]
 struct LineParser {
     buf: Vec<u8>,
@@ -45,7 +49,7 @@ struct LineParser {
 }
 
 impl LineParser {
-    fn feed(&mut self, bytes: &[u8], echo: &mut dyn FnMut(&str)) -> Vec<LiveInputEvent> {
+    fn feed(&mut self, bytes: &[u8], on_edit: &mut dyn FnMut(&str)) -> Vec<LiveInputEvent> {
         self.buf.extend_from_slice(bytes);
         let mut events = Vec::new();
         loop {
@@ -93,19 +97,18 @@ impl LineParser {
                         b'\n' | b'\r' => {
                             self.buf.remove(0);
                             let line = std::mem::take(&mut self.line).trim().to_string();
-                            echo("\n");
                             events.push(LiveInputEvent::Steer(line));
                         }
                         0x7f | 0x08 => {
                             self.buf.remove(0);
                             if self.line.pop().is_some() {
-                                echo("\u{8} \u{8}");
+                                on_edit(&self.line);
                             }
                         }
                         b' '..=b'~' => {
                             let ch = self.buf.remove(0) as char;
                             self.line.push(ch);
-                            echo(ch.encode_utf8(&mut [0u8; 4]));
+                            on_edit(&self.line);
                         }
                         0x00..=0x1f => {
                             self.buf.remove(0);
@@ -124,7 +127,7 @@ impl LineParser {
                                     let ch = text.chars().next().unwrap();
                                     self.buf.drain(..expected);
                                     self.line.push(ch);
-                                    echo(ch.encode_utf8(&mut [0u8; 4]));
+                                    on_edit(&self.line);
                                 }
                                 Err(_) => {
                                     self.buf.remove(0);
@@ -154,12 +157,11 @@ fn utf8_char_len(lead: u8) -> usize {
 #[cfg(unix)]
 mod imp {
     use super::{LineParser, LiveInputEvent};
-    use std::io::{IsTerminal, Write};
+    use std::io::IsTerminal;
     use std::os::fd::AsRawFd;
 
     pub struct LiveStdin {
         fd: i32,
-        prev_flags: i32,
         prev_termios: libc::termios,
         parser: LineParser,
     }
@@ -171,15 +173,16 @@ mod imp {
                 return None;
             }
             let fd = stdin.as_raw_fd();
-            let prev_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if prev_flags < 0 {
-                return None;
-            }
 
             let mut prev_termios = unsafe { std::mem::zeroed::<libc::termios>() };
             if unsafe { libc::tcgetattr(fd, &mut prev_termios) } < 0 {
                 return None;
             }
+            // VMIN=0/VTIME=0 makes tty reads return immediately when no input
+            // is pending — do NOT reach for O_NONBLOCK here. stdin and stdout
+            // usually share one open file description, so setting O_NONBLOCK
+            // on fd 0 makes stdout writes fail with EAGAIN under heavy
+            // streaming, which panics print! ("os error 35").
             let mut raw = prev_termios;
             raw.c_lflag &= !(libc::ICANON | libc::ECHO);
             raw.c_cc[libc::VMIN] = 0;
@@ -188,14 +191,8 @@ mod imp {
                 return None;
             }
 
-            if unsafe { libc::fcntl(fd, libc::F_SETFL, prev_flags | libc::O_NONBLOCK) } < 0 {
-                let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &prev_termios) };
-                return None;
-            }
-
             Some(Self {
                 fd,
-                prev_flags,
                 prev_termios,
                 parser: LineParser::default(),
             })
@@ -217,18 +214,14 @@ mod imp {
                     break;
                 }
             }
-            let mut out = std::io::stdout();
-            self.parser.feed(&bytes, &mut |s| {
-                let _ = out.write_all(s.as_bytes());
-                let _ = out.flush();
-            })
+            self.parser
+                .feed(&bytes, &mut super::super::output::steer_pending_update)
         }
     }
 
     impl Drop for LiveStdin {
         fn drop(&mut self) {
             unsafe {
-                libc::fcntl(self.fd, libc::F_SETFL, self.prev_flags);
                 libc::tcsetattr(self.fd, libc::TCSANOW, &self.prev_termios);
             }
         }
@@ -319,11 +312,13 @@ mod tests {
     }
 
     #[test]
-    fn printable_edits_are_echoed() {
+    fn edits_report_the_full_pending_line() {
         let mut parser = LineParser::default();
-        let mut echoed = String::new();
-        parser.feed(b"hi", &mut |s| echoed.push_str(s));
-        assert_eq!(echoed, "hi");
+        let mut states: Vec<String> = Vec::new();
+        parser.feed(b"hi", &mut |line| states.push(line.to_string()));
+        assert_eq!(states, vec!["h".to_string(), "hi".to_string()]);
+        parser.feed(&[0x7f], &mut |line| states.push(line.to_string()));
+        assert_eq!(states.last().map(String::as_str), Some("h"));
     }
 
     #[test]

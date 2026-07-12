@@ -89,6 +89,20 @@ thread_local! {
     static THINKING_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
     static LIVE_INPUT_HINT: std::cell::Cell<LiveHintState> =
         const { std::cell::Cell::new(LiveHintState::Idle) };
+    static STEER_PENDING: RefCell<String> = const { RefCell::new(String::new()) };
+    static STEER_LINE_DRAWN: std::cell::Cell<Option<SteerLinePlacement>> =
+        const { std::cell::Cell::new(None) };
+    static STDOUT_LINE_TAIL: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// How the pending steer line was painted, so it can be erased exactly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SteerLinePlacement {
+    /// Painted on its own fresh row (stream cursor was at column 0).
+    OwnRow,
+    /// Painted on an inserted row below a partially streamed line; erasing
+    /// must move the cursor back up to just after that partial text.
+    BelowPartial { tail_width: u16 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,6 +333,161 @@ fn live_input_hint_active() -> bool {
     LIVE_INPUT_HINT.with(|state| state.get() == LiveHintState::Showing)
 }
 
+/// Track the tail of the current partially streamed line (text after the last
+/// newline written to stdout). The pending steer line uses it to paint below
+/// a partial line and put the cursor back exactly where streaming left off.
+fn note_stdout_tail(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    STDOUT_LINE_TAIL.with(|t| {
+        let mut tail = t.borrow_mut();
+        if text.contains('\n') {
+            tail.clear();
+            tail.push_str(text.rsplit('\n').next().unwrap_or(""));
+        } else {
+            tail.push_str(text);
+        }
+    });
+}
+
+fn stdout_line_tail() -> String {
+    STDOUT_LINE_TAIL.with(|t| t.borrow().clone())
+}
+
+fn note_stdout_at_line_start() {
+    STDOUT_LINE_TAIL.with(|t| t.borrow_mut().clear());
+}
+
+/// Fit `text` into `max_width` terminal columns, keeping the tail (the user
+/// cares about what they are typing right now) and prefixing `…` when cut.
+fn tail_fit(text: &str, max_width: usize) -> String {
+    if measure_text_width(text) <= max_width {
+        return text.to_string();
+    }
+    let mut tail = String::new();
+    for ch in text.chars().rev() {
+        let candidate = format!("{ch}{tail}");
+        if measure_text_width(&candidate) + 1 > max_width {
+            break;
+        }
+        tail = candidate;
+    }
+    format!("…{tail}")
+}
+
+/// Update the pending live-steer line after an edit. While the thinking
+/// spinner is up the text rides inside the spinner's status message; while
+/// the model is streaming it is painted on its own line at the next line
+/// boundary. The parser never echoes at the cursor (see `live_input.rs`).
+pub fn steer_pending_update(line: &str) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    STEER_PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        p.clear();
+        p.push_str(line);
+    });
+    let spinner_shown = THINKING.with(|t| t.borrow().is_shown());
+    if spinner_shown {
+        THINKING.with(|t| t.borrow_mut().refresh());
+    } else {
+        steer_line_redraw_if_pending();
+    }
+}
+
+/// Clear the pending steer state and erase its line if painted. Called when
+/// the line is submitted (Enter), abandoned (Esc), or the turn ends.
+pub fn steer_pending_clear() {
+    steer_line_erase_if_drawn();
+    STEER_PENDING.with(|p| p.borrow_mut().clear());
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.is_shown() {
+                t.refresh();
+            }
+        });
+    }
+}
+
+/// Take whatever the user had typed but not submitted when the turn ended,
+/// clearing the display. The caller prefills the next prompt with it so a
+/// half-typed steer is never silently discarded.
+pub fn steer_pending_take() -> String {
+    steer_line_erase_if_drawn();
+    STEER_PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()))
+}
+
+fn steer_pending_text() -> String {
+    STEER_PENDING.with(|p| p.borrow().clone())
+}
+
+/// Erase the painted pending steer line and put the cursor back exactly where
+/// streaming left off — column 0 for a fresh row, or just after the partial
+/// line when the steer line was inserted below one. Must run before anything
+/// else writes to the terminal while a pending line is shown.
+pub fn steer_line_erase_if_drawn() {
+    let Some(placement) = STEER_LINE_DRAWN.with(|c| c.take()) else {
+        return;
+    };
+    match placement {
+        SteerLinePlacement::OwnRow => print!("\r\x1b[2K"),
+        SteerLinePlacement::BelowPartial { tail_width } => {
+            // Clear the inserted row, hop back up onto the partial line, and
+            // park the cursor right after its last visible column.
+            print!("\r\x1b[2K\x1b[1A\x1b[{}G", tail_width as usize + 1);
+        }
+    }
+    let _ = std::io::stdout().flush();
+}
+
+/// Paint (or repaint) the pending steer line. On a line boundary it takes the
+/// current row; mid-line it inserts a row below the partially streamed text
+/// (restored on erase). Skipped while the spinner owns the status area, or
+/// when the partial line has wrapped and the cursor column is unknowable.
+pub fn steer_line_redraw_if_pending() {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    if THINKING.with(|t| t.borrow().is_shown()) {
+        return;
+    }
+    let pending = steer_pending_text();
+    if pending.is_empty() {
+        steer_line_erase_if_drawn();
+        return;
+    }
+    let width = Term::stdout()
+        .size_checked()
+        .map(|(_, w)| w as usize)
+        .unwrap_or(80);
+    let placement = match STEER_LINE_DRAWN.with(|c| c.get()) {
+        Some(existing) => existing,
+        None => {
+            let tail = stdout_line_tail();
+            let tail_width = measure_text_width(&console::strip_ansi_codes(&tail));
+            if tail_width == 0 {
+                SteerLinePlacement::OwnRow
+            } else if tail_width + 1 >= width || tail_width > u16::MAX as usize {
+                // The partial line wrapped (or is unmeasurable); we cannot
+                // restore the cursor reliably, so wait for a line boundary.
+                return;
+            } else {
+                println!();
+                SteerLinePlacement::BelowPartial {
+                    tail_width: tail_width as u16,
+                }
+            }
+        }
+    };
+    let text = tail_fit(&pending, width.saturating_sub(4));
+    print!("\r\x1b[2K{} {}", style("↳").cyan(), style(text).dim());
+    let _ = std::io::stdout().flush();
+    STEER_LINE_DRAWN.with(|c| c.set(Some(placement)));
+}
+
 pub struct ThinkingStatusLabelInput<'a> {
     pub base: &'a str,
     pub elapsed: Duration,
@@ -465,6 +634,7 @@ pub fn render_steer_injected(text: &str) {
         style("↪ steering:").cyan().bold(),
         style(text).dim()
     );
+    note_stdout_tail("\n");
     let _ = std::io::stdout().flush();
 }
 
@@ -474,6 +644,7 @@ fn print_response_bullet_once() {
         if !*shown {
             let color = active_or_default_color(Color::White);
             println!("\n{}", style("●").fg(color).bold());
+            note_stdout_tail("\n");
             *shown = true;
         }
     });
@@ -530,6 +701,7 @@ impl ThinkingIndicator {
         self.dynamic_message = None;
         self.fallback_message = None;
         self.last_message = None;
+        note_stdout_at_line_start();
         clear_running_tools();
     }
 
@@ -564,6 +736,9 @@ impl ThinkingIndicator {
             return;
         }
 
+        // The spinner's status message takes over displaying any pending
+        // steer text, so the standalone line must go first.
+        steer_line_erase_if_drawn();
         let spinner = cliclack::spinner();
         spinner.start(message.clone());
         self.spinner = Some(spinner);
@@ -595,11 +770,18 @@ impl ThinkingIndicator {
             .map(|started| started.elapsed())
             .unwrap_or_default();
         let running_tools = running_tool_summaries();
-        let hint = if live_input_hint_active() {
-            "type to steer · Esc interrupt · /status"
+        let pending = steer_pending_text();
+        let hint_owned = if !pending.is_empty() {
+            format!(
+                "↳ {} · Enter steers · Esc interrupts",
+                tail_fit(&pending, 40)
+            )
+        } else if live_input_hint_active() {
+            "type to steer · Esc interrupt · /status".to_string()
         } else {
-            "(Ctrl+C to interrupt)"
+            "(Ctrl+C to interrupt)".to_string()
         };
+        let hint = hint_owned.as_str();
         let terminal_width = thinking_status_width();
         let hint_width = measure_text_width("  ") + measure_text_width(hint);
         let status_width =
@@ -651,6 +833,8 @@ impl ThinkingIndicator {
     pub fn hide(&mut self) {
         if let Some(spinner) = self.spinner.take() {
             spinner.stop("");
+            // cliclack cleared its own line, so the cursor is back at col 0.
+            note_stdout_at_line_start();
         }
         self.last_message = None;
     }
@@ -881,10 +1065,12 @@ pub fn render_message_streaming(
                 flush_markdown_buffer(buffer, theme);
                 reset_response_bullet();
                 render_tool_request(req, theme, debug);
+                note_stdout_tail("\n");
             }
             MessageContent::ToolResponse(resp) => {
                 flush_markdown_buffer(buffer, theme);
                 render_tool_response(resp, debug);
+                note_stdout_tail("\n");
             }
             MessageContent::ActionRequired(action) => {
                 flush_markdown_buffer(buffer, theme);
@@ -899,10 +1085,12 @@ pub fn render_message_streaming(
                         println!("action_required(elicitation_response): {}", id)
                     }
                 }
+                note_stdout_tail("\n");
             }
             MessageContent::Image(image) => {
                 flush_markdown_buffer(buffer, theme);
                 println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
+                note_stdout_tail("\n");
             }
             MessageContent::Thinking(t) => {
                 render_thinking_streaming(&t.thinking, buffer, thinking_header_shown, theme);
@@ -922,10 +1110,12 @@ pub fn render_message_streaming(
                         flush_markdown_buffer(buffer, theme);
                         hide_thinking();
                         println!("\n{}", style(&notification.msg).yellow());
+                        note_stdout_tail("\n");
                     }
                     SystemNotificationType::CreditsExhausted => {
                         flush_markdown_buffer(buffer, theme);
                         render_credits_exhausted_notification(notification);
+                        note_stdout_tail("\n");
                     }
                 }
             }
@@ -1038,6 +1228,7 @@ fn render_thinking_streaming(
             *header_shown = true;
         }
         print!("{}", style(text).dim());
+        note_stdout_tail(text);
         let _ = std::io::stdout().flush();
     }
 }
@@ -1770,6 +1961,7 @@ fn print_markdown(content: &str, theme: Theme) {
                 print_markdown_raw(&before, theme);
             }
             print_table(&table, theme);
+            note_stdout_tail("\n");
             if !after.is_empty() {
                 print_markdown(after, theme);
             }
@@ -1778,6 +1970,7 @@ fn print_markdown(content: &str, theme: Theme) {
         }
     } else {
         print!("{}", content);
+        note_stdout_tail(content);
     }
 }
 
@@ -1791,6 +1984,7 @@ fn print_markdown_raw(content: &str, theme: Theme) {
         .wrapping_mode(WrappingMode::NoWrapping(true))
         .print()
         .unwrap();
+    note_stdout_tail(content);
 }
 
 fn extract_markdown_table(content: &str) -> Option<(String, Vec<&str>, &str)> {
@@ -2410,6 +2604,19 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::env;
+
+    #[test]
+    fn tail_fit_keeps_the_tail_and_marks_truncation() {
+        assert_eq!(tail_fit("short", 20), "short");
+        let cut = tail_fit("fix the failing login test", 10);
+        assert!(cut.starts_with('…'), "got {cut:?}");
+        assert!(cut.ends_with("test"), "got {cut:?}");
+        assert!(measure_text_width(&cut) <= 10, "got {cut:?}");
+        // CJK characters are two columns wide; the fit must respect that.
+        let korean = tail_fit("먼저 테스트를 고쳐줘", 8);
+        assert!(korean.starts_with('…'), "got {korean:?}");
+        assert!(measure_text_width(&korean) <= 8, "got {korean:?}");
+    }
 
     #[test]
     fn suppresses_status_only_while_output_is_recent() {
